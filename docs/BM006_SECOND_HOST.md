@@ -1,8 +1,13 @@
 # BM-006: installing a second host (for example the Ryzen)
 
-Status: procedure on paper, 2026-11-05. The pieces are tested separately (backup/restore,
-peer sync, schedule runner). The whole chain across two hosts is **not yet exercised**; the
-rehearsal on a copy of the five projects does that before anything touches a real host.
+Status: exercised end to end on 2026-11-07 with synthetic projects (wheel `c3456e5c`): install on the
+second host, `bm git backup` on a copy of the first host, `bm git restore`, peer enabled on both sides,
+sync in both directions, diverged history with `git_sync_merge` off (the project stops, others continue)
+and `auto` (simple merge and a review package). Findings: a restored instance places each project's
+notes in a directory named by its project UUID; the restore leaves `git_sync_remotes` empty;
+`git_sync_remotes` and `git_sync_merge` are read only at service start; a review decision must be
+an object (`{"action": "beide"}`), a bare word is reported as `invalid_incoming`. Real-size restore
+timing on the second host is not yet measured.
 
 ## Order matters
 
