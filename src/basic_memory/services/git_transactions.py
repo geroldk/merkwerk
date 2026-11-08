@@ -2,6 +2,7 @@
 
 import hashlib
 from collections.abc import Mapping
+from datetime import datetime
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
@@ -9,6 +10,7 @@ from uuid import UUID, uuid4
 
 from filelock import Timeout
 from pydantic import ValidationError
+from sqlalchemy import select
 
 from basic_memory.file_utils import ParseError, parse_frontmatter
 from basic_memory.markdown import EntityParser
@@ -34,7 +36,9 @@ from basic_memory.schemas.git_transactions import (
     GitTransactionStatus,
     GitTransactionWrite,
 )
+from basic_memory.models import Entity
 from basic_memory.services.note_preparation import apply_edit_operation
+from basic_memory.services.note_times import stamp_markdown_times, wanted_note_times
 
 if TYPE_CHECKING:  # pragma: no cover
     from collections.abc import Callable
@@ -164,6 +168,30 @@ class GitTransactionService:
                 ),
             )
 
+    async def _entity_times(self, note_id: UUID) -> tuple[datetime | None, datetime | None]:
+        """The indexed times of a note, for one that has no `created`/`modified` yet (BM-010)."""
+        async with self.runtime.pipeline.session_maker() as session:
+            entity = await session.scalar(
+                select(Entity).where(
+                    Entity.external_id == str(note_id),
+                    Entity.project_id == self.runtime.pipeline.project_id,
+                )
+            )
+        return (entity.created_at, entity.updated_at) if entity is not None else (None, None)
+
+    async def _stamp_times(
+        self, content: str, *, current: str | None, note_id: UUID | None, now: datetime
+    ) -> str:
+        created, modified = await self._entity_times(note_id) if note_id else (None, None)
+        wanted = wanted_note_times(
+            content,
+            now=now,
+            current_markdown=current,
+            fallback_created=created,
+            fallback_modified=modified,
+        )
+        return content if wanted is None else stamp_markdown_times(content, wanted)
+
     async def write(
         self,
         identity: UUID,
@@ -180,7 +208,15 @@ class GitTransactionService:
                     if request.path not in files:
                         raise GitTransactionError(404, "Draft note does not exist")
                     content = apply_edit_operation(files[request.path], request.operation, content)
-                files[request.path] = content
+                # Trigger: the draft text is the only durable copy once committed.
+                # Why: without `created`/`modified` in it, a rebuild dates the note anew.
+                # Outcome: both keys are stamped by the same rules as an ordinary write.
+                files[request.path] = await self._stamp_times(
+                    content,
+                    current=files.get(request.path),
+                    note_id=note_ids.get(request.path),
+                    now=datetime.now().astimezone(),
+                )
                 note_ids.setdefault(request.path, uuid4())
             else:
                 if request.path not in files:
@@ -188,7 +224,14 @@ class GitTransactionService:
                 if isinstance(request, GitTransactionMove):
                     if request.destination in files:
                         raise GitTransactionError(409, "Draft destination is already occupied")
-                    files[request.destination] = files[request.path]
+                    # A plain move keeps both times; a note without them gets its indexed ones.
+                    moved = files[request.path]
+                    files[request.destination] = await self._stamp_times(
+                        moved,
+                        current=moved,
+                        note_id=note_ids[request.path],
+                        now=datetime.now().astimezone(),
+                    )
                     note_ids[request.destination] = note_ids[request.path]
                 del files[request.path]
                 del note_ids[request.path]

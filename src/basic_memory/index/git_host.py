@@ -92,7 +92,7 @@ async def run_git_host(
         lookup_repositories=repositories,
         write_repositories=repositories,
         preparer_factory=LocalAcceptedNotePreparerFactory(
-            session_maker=session_maker, app_config=app_config
+            session_maker=session_maker, app_config=app_config, stamp_note_times=True
         ),
         move_policy=AcceptedNoteMutationMovePolicy(
             update_permalinks_on_move=app_config.update_permalinks_on_move

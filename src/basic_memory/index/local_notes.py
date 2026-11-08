@@ -9,8 +9,9 @@ composes its own tenant-scoped equivalents behind the same protocols.
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol, override
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -30,9 +31,10 @@ from basic_memory.indexing.note_file_delete_runner import run_note_file_delete
 from basic_memory.markdown import EntityParser
 from basic_memory.markdown.markdown_processor import MarkdownProcessor
 from basic_memory.markdown.note_lock import LOCKED_NOTE_MESSAGE, note_is_locked
-from basic_memory.models import Project
+from basic_memory.models import Entity, Project
 from basic_memory.repository.accepted_note_repositories import AcceptedNoteRepositories
 from basic_memory.repository.entity_repository import EntityRepository
+from basic_memory.schemas.base import Entity as EntitySchema
 from basic_memory.runtime.cleanup import (
     RuntimeDirectoryFileSnapshot,
     RuntimeFileDeleteResult,
@@ -47,10 +49,131 @@ from basic_memory.runtime.storage import (
 )
 from basic_memory.services.exceptions import FileOperationError
 from basic_memory.services.file_service import FileService
-from basic_memory.services.note_preparation import NotePreparation, NotePreparationDependencies
+from basic_memory.services.note_preparation import (
+    NotePreparation,
+    NotePreparationDependencies,
+    PreparedEntityMove,
+    PreparedEntityWrite,
+)
+from basic_memory.services.note_times import keep_move_times, stamp_note_times
 from basic_memory.services.search_service import SearchService
 
 # --- Accepted-Note Mutations ---
+
+
+@dataclass(frozen=True, slots=True)
+class TimestampedNotePreparation(NotePreparation):
+    """Note preparation that keeps `created`/`modified` in the accepted bytes (BM-010).
+
+    Trigger: Git hosting, where the Markdown bytes are the only durable state.
+    Why: a rebuild from Git otherwise dates every note with the projection time.
+    Outcome: create/replace/edit stamp both keys, a plain move leaves them untouched.
+    """
+
+    @override
+    async def prepare_create_entity_content(
+        self,
+        schema: EntitySchema,
+        *,
+        check_storage_exists: bool = True,
+        skip_conflict_check: bool = False,
+        session: AsyncSession | None = None,
+    ) -> PreparedEntityWrite:
+        prepared = await super().prepare_create_entity_content(
+            schema,
+            check_storage_exists=check_storage_exists,
+            skip_conflict_check=skip_conflict_check,
+            session=session,
+        )
+        return stamp_note_times(prepared, now=datetime.now().astimezone(), current_markdown=None)
+
+    @override
+    async def prepare_update_entity_content(
+        self,
+        entity: Entity,
+        schema: EntitySchema,
+        existing_content: str,
+        *,
+        skip_conflict_check: bool = False,
+        replace_frontmatter: bool = False,
+        session: AsyncSession | None = None,
+    ) -> PreparedEntityWrite:
+        prepared = await super().prepare_update_entity_content(
+            entity,
+            schema,
+            existing_content,
+            skip_conflict_check=skip_conflict_check,
+            replace_frontmatter=replace_frontmatter,
+            session=session,
+        )
+        return stamp_note_times(
+            prepared,
+            now=datetime.now().astimezone(),
+            current_markdown=existing_content,
+            fallback_created=entity.created_at,
+            fallback_modified=entity.updated_at,
+        )
+
+    @override
+    async def prepare_edit_entity_content(
+        self,
+        entity: Entity,
+        current_content: str,
+        *,
+        operation: str,
+        content: str,
+        section: str | None = None,
+        find_text: str | None = None,
+        expected_replacements: int = 1,
+        replace_subsections: bool = True,
+        metadata: dict[str, Any] | None = None,
+        skip_conflict_check: bool = False,
+        session: AsyncSession | None = None,
+    ) -> PreparedEntityWrite:
+        prepared = await super().prepare_edit_entity_content(
+            entity,
+            current_content,
+            operation=operation,
+            content=content,
+            section=section,
+            find_text=find_text,
+            expected_replacements=expected_replacements,
+            replace_subsections=replace_subsections,
+            metadata=metadata,
+            skip_conflict_check=skip_conflict_check,
+            session=session,
+        )
+        return stamp_note_times(
+            prepared,
+            now=datetime.now().astimezone(),
+            current_markdown=current_content,
+            fallback_created=entity.created_at,
+            fallback_modified=entity.updated_at,
+        )
+
+    @override
+    async def prepare_move_entity_content(
+        self,
+        entity: Entity,
+        current_content: str,
+        destination_path: str,
+        *,
+        should_update_permalink: bool | None = None,
+        session: AsyncSession | None = None,
+    ) -> PreparedEntityMove:
+        prepared = await super().prepare_move_entity_content(
+            entity,
+            current_content,
+            destination_path,
+            should_update_permalink=should_update_permalink,
+            session=session,
+        )
+        return keep_move_times(
+            prepared,
+            current_markdown=current_content,
+            entity_created_at=entity.created_at,
+            entity_updated_at=entity.updated_at,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,6 +182,7 @@ class LocalAcceptedNotePreparerFactory:
 
     session_maker: async_sessionmaker[AsyncSession]
     app_config: BasicMemoryConfig
+    stamp_note_times: bool = False
 
     def _create_file_service(self, project: Project) -> tuple[EntityParser, FileService]:
         entity_parser = EntityParser(Path(project.path))
@@ -75,15 +199,16 @@ class LocalAcceptedNotePreparerFactory:
     def create_note_preparer(self, project: Project) -> AcceptedNoteMutationPreparer:
         entity_parser, file_service = self._create_file_service(project)
         entity_repository = EntityRepository(project_id=project.id)
-        return NotePreparation(
-            NotePreparationDependencies(
-                entity_parser=entity_parser,
-                entity_repository=entity_repository,
-                file_service=file_service,
-                session_maker=self.session_maker,
-                app_config=self.app_config,
-            )
+        dependencies = NotePreparationDependencies(
+            entity_parser=entity_parser,
+            entity_repository=entity_repository,
+            file_service=file_service,
+            session_maker=self.session_maker,
+            app_config=self.app_config,
         )
+        if self.stamp_note_times:
+            return TimestampedNotePreparation(dependencies)
+        return NotePreparation(dependencies)
 
     async def load_current_file_checksum(
         self,
