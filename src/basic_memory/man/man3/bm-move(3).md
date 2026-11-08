@@ -42,10 +42,16 @@ in that project. The note is written there and then deleted here, so it is a
 new note: it gets a new id and its own version history, and links in either
 project are not rewritten. Its permalink is formed again from its new path, as
 for a note created there (a permalink that carried the source project's prefix
-would point into the wrong project); every other frontmatter key, including
-`created` and `modified`, travels unchanged. The result names the old and the
-new permalink (`previous_permalink`, `permalink`; for a directory, one entry
-each in `moved_notes`). The original is deleted only after the copy is
+would point into the wrong project). Every other frontmatter key, including
+`created` and `modified`, keeps its value; the copy is written like any new
+note, so the frontmatter is re-serialised and the body's outer blank lines are
+trimmed. In the JSON form the result names the old and the new permalink and
+the identity of the new note (`previous_permalink`, `permalink`,
+`previous_external_id`, `external_id`; for a directory, one entry each in
+`moved_notes`); the text form names the permalinks only. If some notes of a
+directory fail, the `PARTIAL_FAILURE` refusal lists what did move (in the JSON
+form as `details.moved_notes`), because those notes are already gone from the
+source. The original is deleted only after the copy is
 written, and only if it is still the revision that was copied; if that delete
 is refused, the copy is removed again and nothing has moved. A note already at
 the destination is never replaced, and a locked note is refused. A directory

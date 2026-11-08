@@ -10,6 +10,7 @@ instead.
 
 import json
 from collections.abc import Iterator
+from typing import Any
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Literal
@@ -53,20 +54,29 @@ class Refusal(ToolError):
         *,
         try_instead: str | None,
         output_format: OutputFormat,
+        details: dict[str, Any] | None = None,
     ) -> None:
         self.code: RefusalCode = code
         self.message = message
         self.try_instead = try_instead
-        super().__init__(_render(code, message, try_instead, output_format))
+        self.details = details
+        super().__init__(_render(code, message, try_instead, output_format, details))
 
 
 def _render(
-    code: RefusalCode, message: str, try_instead: str | None, output_format: OutputFormat
+    code: RefusalCode,
+    message: str,
+    try_instead: str | None,
+    output_format: OutputFormat,
+    details: dict[str, Any] | None = None,
 ) -> str:
     if output_format == "json":
-        payload: dict[str, str] = {"error": code, "message": message}
+        payload: dict[str, Any] = {"error": code, "message": message}
         if try_instead is not None:
             payload["try_instead"] = try_instead
+        # Structured facts the caller must be able to read without parsing the message.
+        if details is not None:
+            payload["details"] = details
         return json.dumps(payload)
     if try_instead is None:
         return f"{code}: {message}"
@@ -79,13 +89,17 @@ def refusal(
     *,
     try_instead: str | None = None,
     output_format: OutputFormat = "text",
+    details: dict[str, Any] | None = None,
 ) -> Refusal:
     """Build the error a tool raises to refuse a call.
 
     Returns the exception rather than raising it, so the call site reads
-    `raise refusal(...)` and the type checker sees the branch end.
+    `raise refusal(...)` and the type checker sees the branch end. `details` rides along in the
+    JSON form only.
     """
-    return Refusal(code, message, try_instead=try_instead, output_format=output_format)
+    return Refusal(
+        code, message, try_instead=try_instead, output_format=output_format, details=details
+    )
 
 
 # --- API refusals ---

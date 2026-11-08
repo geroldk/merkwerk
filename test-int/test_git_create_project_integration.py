@@ -217,3 +217,30 @@ async def test_a_termination_signal_in_the_middle_rolls_everything_back(
     async with db.scoped_session(factory) as session:
         names = list(await session.scalars(select(Project.name)))
     assert names == ["test-project"]
+
+
+@pytest.mark.asyncio
+async def test_an_existing_empty_root_stays_but_loses_the_control_directory_on_a_failure(
+    host_setup, config_manager, tmp_path, monkeypatch
+):
+    root = tmp_path / "bm" / "haus"
+    root.mkdir(parents=True)  # the plan accepts an existing, empty root
+
+    def broken(path: Path, data: dict[str, Any]) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(git_project_create, "_write_config_atomically", broken)
+    with pytest.raises(OSError, match="disk full"):
+        await create(host_setup, tmp_path, NewGitProject("haus"), config_manager=config_manager)
+    assert root.is_dir() and not any(root.iterdir())  # still there, still empty
+    assert not (tmp_path / "bm" / "repositories" / "haus.git").exists()
+
+
+@pytest.mark.asyncio
+async def test_rolling_back_an_id_without_a_row_is_harmless(host_setup, tmp_path):
+    from uuid import uuid4
+
+    _, factory = await db.get_or_create_db(host_setup.config.database_path)
+    await git_project_create._roll_back(factory, [uuid4()], [])
+    async with db.scoped_session(factory) as session:
+        assert list(await session.scalars(select(Project.name))) == ["test-project"]

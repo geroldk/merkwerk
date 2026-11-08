@@ -3,6 +3,7 @@
 These run the real ASGI stack through the shared `client` fixture.
 """
 
+import json
 from pathlib import Path
 from typing import Any, override
 
@@ -544,3 +545,33 @@ async def test_the_listing_reads_every_page(client, test_project):
         "drafts/b.md",
         "drafts/c.md",
     ]
+
+
+@pytest.mark.asyncio
+async def test_a_partial_directory_move_in_json_carries_what_moved_as_data(
+    client, test_project, second_project
+):
+    await _write(test_project, "drafts/a.md", "# A\n")
+    await _write(test_project, "drafts/b.md", "# B\n")
+    await _write(second_project, "drafts/b.md", "# Taken\n")
+
+    with pytest.raises(ToolError) as error:
+        await bm_move(
+            path="drafts",
+            destination="drafts",
+            destination_project=second_project.name,
+            project=test_project.name,
+            output_format="json",
+        )
+
+    payload = json.loads(str(error.value))
+    assert payload["error"] == "PARTIAL_FAILURE" and "Moved:" not in payload["message"]
+    details = payload["details"]
+    assert details["total_files"] == 2
+    assert [note["file_path"] for note in details["moved_notes"]] == ["drafts/a.md"]
+    assert details["moved_notes"][0]["permalink"] == f"{second_project.permalink}/drafts/a"
+    assert (
+        details["moved_notes"][0]["previous_external_id"]
+        != details["moved_notes"][0]["external_id"]
+    )
+    assert [failure["path"] for failure in details["failed"]] == ["drafts/b.md"]

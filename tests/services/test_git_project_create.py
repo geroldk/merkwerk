@@ -123,11 +123,10 @@ def test_a_service_holding_the_locks_blocks_creation(tmp_path):
 # --- The configuration is replaced without losing its rights ---
 
 
-def test_replacing_the_configuration_keeps_a_private_file_private(tmp_path, monkeypatch):
+def test_replacing_the_configuration_keeps_a_private_file_private(tmp_path):
     from basic_memory.services.git_project_create import write_config_text_atomically
 
-    monkeypatch.setattr("os.umask", lambda mask: 0o022, raising=False)
-    previous = os.umask(0o022)  # the usual umask, under which a plain write_text gives 0644
+    previous = os.umask(0o077)  # strict: os.open alone would give 0600, the chmod must give 0640
     try:
         config = tmp_path / "config.json"
         config.write_text("old")
@@ -140,7 +139,8 @@ def test_replacing_the_configuration_keeps_a_private_file_private(tmp_path, monk
         assert stat.S_IMODE(fresh.stat().st_mode) == 0o600  # a new file starts private
         config.chmod(0o640)
         write_config_text_atomically(config, "again")
-        assert stat.S_IMODE(config.stat().st_mode) == 0o640  # whatever the owner set stays
+        # whatever the owner set stays, also a bit the umask would have taken away
+        assert stat.S_IMODE(config.stat().st_mode) == 0o640
     finally:
         os.umask(previous)
 
@@ -161,15 +161,34 @@ def test_a_failed_replacement_leaves_the_old_file_and_no_temporary(tmp_path, mon
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("number", [signal.SIGTERM, signal.SIGHUP])
+@pytest.mark.parametrize("number", [signal.SIGTERM, signal.SIGHUP, signal.SIGINT])
 async def test_a_termination_signal_cancels_the_task_instead_of_ending_the_process(number):
     from basic_memory.services.git_project_create import cancel_on_termination
 
+    before = signal.getsignal(number)
     with cancel_on_termination():
         with pytest.raises(asyncio.CancelledError):
             os.kill(os.getpid(), number)
             await asyncio.sleep(5)
-    # The handler is gone again: the default disposition is back for a later signal.
-    assert signal.getsignal(number) in {signal.SIG_DFL, signal.default_int_handler} or callable(
-        signal.getsignal(number)
-    )
+    assert signal.getsignal(number) == before  # the handler is gone again
+
+
+@pytest.mark.asyncio
+async def test_a_second_signal_does_not_cancel_the_rollback():
+    from basic_memory.services.git_project_create import cancel_on_termination
+
+    steps: list[str] = []
+    with cancel_on_termination():
+        with pytest.raises(asyncio.CancelledError):
+            try:
+                os.kill(os.getpid(), signal.SIGTERM)
+                await asyncio.sleep(5)
+            except asyncio.CancelledError:
+                os.kill(os.getpid(), signal.SIGHUP)  # an impatient second signal, mid-rollback
+                os.kill(os.getpid(), signal.SIGINT)
+                await asyncio.sleep(0.2)  # a rollback step: must not be cancelled again
+                steps.append("rollback step 1")
+                await asyncio.sleep(0)
+                steps.append("rollback step 2")
+                raise
+    assert steps == ["rollback step 1", "rollback step 2"]

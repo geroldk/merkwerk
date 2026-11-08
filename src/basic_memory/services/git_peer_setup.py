@@ -46,28 +46,33 @@ def _peer_url(base: str, name: str) -> str:
     return f"{base.rstrip('/')}/{name}.git"
 
 
-def _create_local_peer(url: str) -> bool:
-    """Create an empty bare repository at a local path; True when it was created.
+def _create_local_peer(url: str) -> Path | None:
+    """Create an empty bare repository at a local path.
 
-    A failed `git init` removes what this call made, the directory and the parents it created.
+    Returns the topmost directory this call made (so a rollback removes the parents it created
+    too), or None when the path already existed. Any failure, also a timeout or a cancellation,
+    removes what the call made.
     """
     path = Path(url)
     if path.exists():
-        return False
+        return None
     topmost = path
     while not topmost.parent.exists():
         topmost = topmost.parent
     path.mkdir(mode=0o700, parents=True)
-    result = subprocess.run(
-        ["git", "init", "--bare", "--initial-branch=main", str(path)],
-        capture_output=True,
-        check=False,
-        timeout=30,
-    )
-    if result.returncode != 0:
+    try:
+        result = subprocess.run(
+            ["git", "init", "--bare", "--initial-branch=main", str(path)],
+            capture_output=True,
+            check=False,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            raise GitProjectCreateError(result.stderr.decode("utf-8", errors="replace"))
+    except BaseException:
         shutil.rmtree(topmost, ignore_errors=True)
-        raise GitProjectCreateError(result.stderr.decode("utf-8", errors="replace"))
-    return True
+        raise
+    return topmost
 
 
 def _require_peer_apart_from_projects(
@@ -145,8 +150,8 @@ async def _setup_git_peers(
                     [r.resolve() for r in config.git_repositories.values()],
                     name,
                 )
-                if _create_local_peer(url):
-                    made.append(Path(url))
+                if (created_root := _create_local_peer(url)) is not None:
+                    made.append(created_root)
             remotes[project_id] = remote
             if merge == "auto":
                 merges[project_id] = "auto"

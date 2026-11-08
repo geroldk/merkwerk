@@ -231,3 +231,41 @@ async def test_a_failure_after_the_configuration_write_restores_it(
 
     assert config_manager.config_file.read_bytes() == before
     assert await project_names(host_setup) == ["test-project", "haus"]
+
+
+@pytest.mark.asyncio
+async def test_the_configuration_follows_the_database_when_the_commit_landed_or_not(
+    host_setup, config_manager, tmp_path
+):
+    """A cancellation while the commit is awaited cannot stop the database thread: the
+    configuration written after such a failure must match the rows, whichever way it went."""
+    created = await create(tmp_path, config_manager, "haus")
+    await db.shutdown_db()
+    old_text = config_manager.config_file.read_text()
+    _, maker = await db.get_or_create_db(host_setup.config.database_path)
+    removed = [
+        git_project_remove.RemovedGitProject(
+            "haus", created[0].project_id, created[0].path, created[0].repository, False
+        )
+    ]
+    new_raw = json.loads(old_text)
+    new_raw["projects"].pop("haus")
+    new_raw["git_repositories"].pop(str(created[0].project_id))
+
+    # The deletion did not commit: the rows are there, the new text was already written.
+    config_manager.config_file.write_text(json.dumps(new_raw, indent=2))
+    await git_project_remove._settle_configuration(
+        maker, removed, config_manager.config_file, new_raw, old_text
+    )
+    assert config_manager.config_file.read_text() == old_text
+
+    # The deletion committed: the rows are gone, the old text was (wrongly) put back.
+    await db.shutdown_db()
+    await remove_empty_git_projects(["haus"], manager=config_manager)
+    config_manager.config_file.write_text(old_text)
+    await db.shutdown_db()
+    _, maker = await db.get_or_create_db(host_setup.config.database_path)
+    await git_project_remove._settle_configuration(
+        maker, removed, config_manager.config_file, new_raw, old_text
+    )
+    assert json.loads(config_manager.config_file.read_text()) == new_raw

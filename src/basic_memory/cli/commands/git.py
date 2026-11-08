@@ -86,6 +86,7 @@ def create_project(
     """Create new, empty Git projects. The service must be stopped; restart it afterwards."""
     import asyncio
 
+    from basic_memory.repository.git_projection_repository import GitProjectionConflict
     from basic_memory.services.git_project_create import (
         GitProjectCreateError,
         NewGitProject,
@@ -102,9 +103,12 @@ def create_project(
                 requests, base_dir=root, repositories_dir=repositories or root / "repositories"
             )
         )
-    except (GitProjectCreateError, ValueError) as error:  # ValueError: GitProjectionConflict
+    except (GitProjectCreateError, GitProjectionConflict) as error:
         typer.echo(f"Refused: {error}", err=True)
         raise typer.Exit(1) from error
+    except asyncio.CancelledError:
+        typer.echo("Cancelled by a signal; the changes were rolled back.", err=True)
+        raise typer.Exit(130) from None
     for item in created:
         typer.echo(f"{item.name}: {item.project_id} root={item.path} repository={item.repository}")
     typer.echo(
@@ -120,14 +124,18 @@ def remove_project(
     """Remove empty Git projects again (the way back for create-project). Service stopped."""
     import asyncio
 
+    from basic_memory.repository.git_projection_repository import GitProjectionConflict
     from basic_memory.services.git_project_create import GitProjectCreateError
     from basic_memory.services.git_project_remove import remove_empty_git_projects
 
     try:
         removed = asyncio.run(remove_empty_git_projects(projects))
-    except (GitProjectCreateError, ValueError) as error:  # ValueError: GitProjectionConflict
+    except (GitProjectCreateError, GitProjectionConflict) as error:
         typer.echo(f"Refused: {error}", err=True)
         raise typer.Exit(1) from error
+    except asyncio.CancelledError:
+        typer.echo("Cancelled by a signal; the changes were rolled back.", err=True)
+        raise typer.Exit(130) from None
     for item in removed:
         typer.echo(f"{item.name}: removed ({item.project_id})")
         if item.had_peer:
@@ -166,6 +174,9 @@ def peer_setup(
     except (GitProjectCreateError, ValueError) as error:
         typer.echo(f"Refused: {error}", err=True)
         raise typer.Exit(1) from error
+    except asyncio.CancelledError:
+        typer.echo("Cancelled by a signal; the changes were rolled back.", err=True)
+        raise typer.Exit(130) from None
     for change in changes:
         target = f"{change.url} merge={change.merge}" if change.url else "no peer"
         typer.echo(f"{change.name}: {target}")

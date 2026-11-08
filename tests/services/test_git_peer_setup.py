@@ -52,5 +52,22 @@ def test_a_failed_git_init_removes_what_the_call_made(tmp_path, monkeypatch):
 def test_an_existing_peer_is_left_alone(tmp_path):
     existing = tmp_path / "peer" / "main.git"
     existing.mkdir(parents=True)
-    assert _create_local_peer(str(existing)) is False
+    assert _create_local_peer(str(existing)) is None
     assert existing.exists()
+
+
+def test_creating_a_peer_reports_the_topmost_directory_it_made(tmp_path):
+    (tmp_path / "peer").mkdir()
+    made = _create_local_peer(str(tmp_path / "peer" / "side" / "deeper" / "main.git"))
+    assert made == tmp_path / "peer" / "side"
+    assert (tmp_path / "peer" / "side" / "deeper" / "main.git" / "HEAD").exists()
+
+
+def test_a_timeout_of_git_init_also_removes_what_the_call_made(tmp_path, monkeypatch):
+    def hangs(*args, **kwargs):
+        raise subprocess.TimeoutExpired("git init", 30)
+
+    monkeypatch.setattr(git_peer_setup.subprocess, "run", hangs)
+    with pytest.raises(subprocess.TimeoutExpired):
+        _create_local_peer(str(tmp_path / "new" / "main.git"))
+    assert not (tmp_path / "new").exists()

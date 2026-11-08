@@ -17,9 +17,11 @@ import shutil
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 from uuid import UUID
 
 from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from basic_memory import db
 from basic_memory.config import BasicMemoryConfig, ConfigManager
@@ -207,12 +209,35 @@ async def _remove_empty_git_projects(
             _write_config_atomically(config_file, raw)
         # leaving the block committed the deletion
     except BaseException:
-        # The rows roll back by themselves; the configuration is put back whenever it differs
-        # from what it was, wherever in the write or the commit the failure happened.
-        if config_file.read_text() != raw_text:
-            write_config_text_atomically(config_file, raw_text)
+        # The database decides which configuration is right. An exception before the commit
+        # rolls the rows back by itself, so the old configuration goes back. But a cancellation
+        # while the commit is awaited cannot stop aiosqlite's thread from finishing it: then
+        # the rows are gone and the new configuration must stay (or be written again), else
+        # the service would find projects in the configuration that have no row.
+        await _settle_configuration(maker, removed, config_file, raw, raw_text)
         raise
     return [await asyncio.to_thread(_remove_directories, item) for item in removed]
+
+
+async def _settle_configuration(
+    maker: async_sessionmaker[AsyncSession],
+    removed: list[RemovedGitProject],
+    config_file: Path,
+    raw: dict[str, Any],
+    raw_text: str,
+) -> None:
+    """Make the configuration agree with what the database ended up as (all or none removed)."""
+    async with maker() as session:
+        left = await session.scalar(
+            select(func.count())
+            .select_from(Project)
+            .where(Project.external_id.in_([str(item.project_id) for item in removed]))
+        )
+    if left == len(removed):  # nothing was deleted
+        if config_file.read_text() != raw_text:
+            write_config_text_atomically(config_file, raw_text)
+    else:  # the deletion committed
+        _write_config_atomically(config_file, raw)
 
 
 def _remove_directories(item: RemovedGitProject) -> RemovedGitProject:

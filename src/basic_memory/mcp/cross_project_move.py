@@ -7,7 +7,8 @@ own version history, and links in either project are not rewritten.
 Its permalink is formed again from its new path, as for a note created there: a permalink
 that still carried the source project's prefix would point into the wrong project, and a
 gateway refuses addresses that start with another project's name. The result names the
-old and the new permalink. Everything else in the frontmatter travels unchanged.
+old and the new permalink and the identity of the new note. Every other frontmatter key keeps
+its value; the copy is written like any new note (frontmatter re-serialised, body trimmed).
 
 The source is deleted only after the copy is written, and only while it is still
 the revision that was copied. If that delete is refused (the note changed, or the
@@ -372,25 +373,32 @@ async def move_directory_across(
     # Outcome: an error listing what stayed, so the caller can decide what to retry.
     if failed:
         # What did move is part of the answer: the caller has to log it and cannot ask again,
-        # because each moved note is already gone from the source.
+        # because each moved note is already gone from the source. The JSON form carries it as
+        # data (details.moved_notes); the text form lists it in the message.
         done = "; ".join(
             f"{note['previous_file_path']} -> {note['file_path']} "
             f"(permalink {note['previous_permalink']} -> {note['permalink']}, "
             f"id {note['previous_external_id']} -> {note['external_id']})"
             for note in result["moved_notes"]
         )
+        listed = f". Moved: {done}" if done and output_format != "json" else ""
         raise refusal(
             "PARTIAL_FAILURE",
             f"Moved {len(moved)} of {len(files)} files from '{result['path']}' "
             f"(project {source.project.name}) to '{result['destination']}' "
             f"(project {target.project.name}); {len(failed)} stayed: "
             + "; ".join(f"{failure['path']}: {failure['error']}" for failure in failed)
-            + (f". Moved: {done}" if done else ""),
+            + listed,
             try_instead=(
                 f"bm_list(path={result['path']!r}, project={source.project_ref!r}) "
                 "to see what stayed"
             ),
             output_format=output_format,
+            details={
+                "moved_notes": result["moved_notes"],
+                "failed": failed,
+                "total_files": len(files),
+            },
         )
     if output_format == "json":
         return result

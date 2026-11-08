@@ -20,6 +20,7 @@ from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 from uuid import UUID, uuid4
 
 from filelock import FileLock, Timeout
@@ -167,19 +168,32 @@ def _write_config_atomically(path: Path, data: dict[str, object]) -> None:
 
 @contextmanager
 def cancel_on_termination() -> Iterator[None]:
-    """Turn SIGTERM and SIGHUP into a cancellation of the running task.
+    """Turn SIGTERM, SIGHUP and SIGINT into one cancellation of the running task.
 
     Without it a closed terminal or a `kill` ends the process between two steps, past the
     `except BaseException` rollback, and leaves database rows the configuration does not know:
     the service then refuses to start. A cancelled task reaches its rollback.
+
+    Only the first signal cancels. A second one (an impatient Ctrl-C, a repeated `kill`) is
+    ignored, because it would cancel the awaits of the rollback itself and leave it half done.
+    Handlers are removed when the block ends; SIGKILL, a power cut and an out-of-memory kill
+    cannot be caught at all.
     """
     loop = asyncio.get_running_loop()
     task = asyncio.current_task()
     installed: list[signal.Signals] = []
+    previous: dict[signal.Signals, Any] = {}  # asyncio.run keeps its own SIGINT handler
+
+    def cancel_once() -> None:
+        if task is not None and not task.cancelling():
+            task.cancel()
+
     if task is not None:
-        for number in (signal.SIGTERM, signal.SIGHUP):
+        for number in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
             try:
-                loop.add_signal_handler(number, task.cancel)
+                before = signal.getsignal(number)
+                loop.add_signal_handler(number, cancel_once)
+                previous[number] = before
                 installed.append(number)
             except (NotImplementedError, RuntimeError, ValueError):  # not the main thread
                 continue
@@ -188,6 +202,8 @@ def cancel_on_termination() -> Iterator[None]:
     finally:
         for number in installed:
             loop.remove_signal_handler(number)
+            if previous[number] is not None:
+                signal.signal(number, previous[number])
 
 
 async def _alembic_at_head(session: AsyncSession) -> None:
@@ -214,9 +230,9 @@ async def create_git_projects(
 ) -> list[CreatedGitProject]:
     """Create the requested projects, or leave the installation exactly as it was.
 
-    A SIGTERM or SIGHUP cancels the work and reaches the rollback like any other failure;
-    only SIGKILL, a power cut or an out-of-memory kill can leave a half-made state (the
-    runbook takes a backup first for that).
+    A SIGTERM, SIGHUP or SIGINT cancels the work and reaches the rollback like any other
+    failure (a second signal is ignored while it runs); only SIGKILL, a power cut or an
+    out-of-memory kill can leave a half-made state (the runbook takes a backup first for that).
     """
     with cancel_on_termination():
         return await _create_git_projects(
@@ -240,7 +256,7 @@ async def _create_git_projects(
         config.database_path, ensure_migrations=False, config=config
     )
     created: list[CreatedGitProject] = []
-    registered_ids: list[UUID] = []  # rows committed so far, also before the project is "created"
+    registered_ids: list[UUID] = []  # ids that may have a committed row
     made_paths: list[Path] = []
     try:
         async with maker() as session:
@@ -271,12 +287,19 @@ async def _create_git_projects(
             repository = GitProjectRepository.create(
                 repository_path, project_external_id=project_id
             )
+            if root.exists():
+                # The plan accepts an existing empty root, which stays; the control directory
+                # `_bind` puts into it is ours and goes on a rollback.
+                made_paths.append(root / ".basic-memory")
             _make_directory(root, made_paths)
+            # Noted before the transaction: a cancellation while the commit is awaited cannot
+            # stop aiosqlite's thread from finishing it, and `_roll_back` only deletes a row
+            # that exists.
+            registered_ids.append(project_id)
             async with maker() as session, session.begin():
                 project = await register_git_project(
                     session, repository.snapshot().manifest, name=name, path=root
                 )
-            registered_ids.append(project_id)
             # Writes the same binding markers the service would, so a backup taken before
             # the first start finds them.
             await _bind(repository, project, root, maker)

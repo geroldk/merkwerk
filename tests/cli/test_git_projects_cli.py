@@ -136,3 +136,34 @@ def test_create_and_remove_report_a_start_rule_refusal_instead_of_a_traceback(mo
         assert (
             "Refused: Every configured and registered project must be Git-managed" in result.output
         )
+
+
+def test_a_plain_value_error_is_not_dressed_up_as_a_refusal(monkeypatch):
+    async def bug(*args, **kwargs):
+        raise ValueError("too many values to unpack")
+
+    monkeypatch.setattr("basic_memory.services.git_project_create.create_git_projects", bug)
+    result = CliRunner().invoke(app, ["git", "create-project", "haus"])
+    assert result.exit_code == 1 and isinstance(result.exception, ValueError)
+    assert "Refused" not in result.output
+
+
+def test_a_cancellation_by_signal_says_that_the_changes_were_rolled_back(monkeypatch):
+    import asyncio
+
+    async def cancelled(*args, **kwargs):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr("basic_memory.services.git_project_create.create_git_projects", cancelled)
+    monkeypatch.setattr(
+        "basic_memory.services.git_project_remove.remove_empty_git_projects", cancelled
+    )
+    monkeypatch.setattr("basic_memory.services.git_peer_setup.setup_git_peers", cancelled)
+    for arguments in (
+        ["create-project", "haus"],
+        ["remove-project", "haus"],
+        ["peer-setup", "haus", "--peer", "/p"],
+    ):
+        result = CliRunner().invoke(app, ["git", *arguments])
+        assert result.exit_code == 130, arguments
+        assert "Cancelled by a signal; the changes were rolled back." in result.output

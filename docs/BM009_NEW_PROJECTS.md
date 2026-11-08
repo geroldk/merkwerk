@@ -23,8 +23,11 @@ commit, the binding markers a backup needs, and the `projects` / `git_repositori
 * **Rights of `config.json`:** the file is replaced through a temporary file that gets the rights
   of the old one (a new file starts at 0600), also when `remove-project` puts the old text back
   and for `peer-setup`. The configuration can hold credentials.
-* **Signals:** SIGTERM and SIGHUP (a `kill`, a closed terminal) cancel the work and reach the
-  rollback like any other failure. Only SIGKILL, a power cut or an out-of-memory kill can leave a
+* **Signals:** SIGTERM, SIGHUP and SIGINT (a `kill`, a closed terminal, Ctrl-C) cancel the work and
+  reach the rollback like any other failure; a second signal is ignored while the rollback runs. The
+  command then prints `Cancelled by a signal; the changes were rolled back.` and exits 130. `remove-project`
+  decides which configuration is right by the database (a cancellation during the commit cannot stop
+  the commit). Only SIGKILL, a power cut or an out-of-memory kill can leave a
   half-made state: database rows the configuration does not know make the service refuse to
   start. Take a backup first (the move-day runbook does) and run the tool in tmux.
 * Not touched: `sync-projects.json`, peers, and the gateway project lists. The gateway lists
@@ -83,8 +86,10 @@ note could not be reached remotely.
   (`previous_external_id`, `external_id`); a directory move lists one entry per note in
   `moved_notes` (`previous_file_path`, `file_path`, `previous_permalink`, `permalink`,
   `previous_external_id`, `external_id`). If some notes of a directory fail, the `PARTIAL_FAILURE`
-  message ends with `Moved: ...` listing exactly what did move, because those notes are already gone
-  from the source. The text form ends with `; permalink OLD -> NEW`.
+  refusal lists exactly what did move (JSON form: `details.moved_notes`, `details.failed`; text form: the
+  message ends with `Moved: ...`), because those notes are already gone from the source. Use
+  `output_format="json"` for a move you want to log: the text form of a single note names the permalinks
+  only, the identities are in the JSON form. The text form ends with `; permalink OLD -> NEW`.
 * A move inside one project is untouched: it keeps the permalink unless
   `update_permalinks_on_move` is on (production: off).
 * Links in other notes that name the old permalink are not rewritten (as before); the move
