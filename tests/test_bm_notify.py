@@ -4,12 +4,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import stat
 import sys
+from typing import override
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-import bm_host_settings as hs  # noqa: E402
-import bm_notify as bn  # noqa: E402
+import bm_host_settings as hs  # noqa: E402  # ty: ignore[unresolved-import]
+import bm_notify as bn  # noqa: E402  # ty: ignore[unresolved-import]
 
 NOW = datetime(2026, 11, 8, 12, 51, 10, tzinfo=timezone(timedelta(hours=1)))
 REPORT = "[BM sync] main: needs_review (outcome=needs_review review=r1 content=1 [a.md])"
@@ -50,6 +51,7 @@ class Service:
 class Away(Service):
     """The service cannot even be opened."""
 
+    @override
     async def __aenter__(self):
         raise bn.Unreachable("connection refused")
 

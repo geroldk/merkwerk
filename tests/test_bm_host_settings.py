@@ -6,7 +6,7 @@ import sys
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-import bm_host_settings as hs  # noqa: E402
+import bm_host_settings as hs  # noqa: E402  # ty: ignore[unresolved-import]
 
 
 @pytest.fixture(autouse=True)

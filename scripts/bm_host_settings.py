@@ -104,7 +104,7 @@ def _section(data: dict[str, Any], key: str, allowed: set[str], where: str) -> d
         return {}
     if not isinstance(value, dict):
         raise SettingsError(f"{where}{key} must be an object")
-    unknown = sorted(set(value) - allowed)
+    unknown = sorted(str(key) for key in set(value) - allowed)
     if unknown:
         raise SettingsError(f"unknown key(s) in {where}{key}: {', '.join(unknown)}")
     return value
@@ -159,7 +159,7 @@ def parse_settings(data: Any, *, source: Path | None = None) -> HostSettings:
     """Validate the decoded JSON and fill the defaults."""
     if not isinstance(data, dict):
         raise SettingsError("the settings file must hold a JSON object")
-    unknown = sorted(set(data) - {"host_name", "bm_url", "notify", "sync"})
+    unknown = sorted(str(key) for key in set(data) - {"host_name", "bm_url", "notify", "sync"})
     if unknown:
         raise SettingsError(f"unknown key(s): {', '.join(unknown)}")
     notify = _section(
