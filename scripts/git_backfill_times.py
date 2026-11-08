@@ -9,6 +9,10 @@ Source of the times, per note UUID: first the given TSV files (columns ``externa
 ``created_at_db``, ``updated_at_db``; naive values are local time), else the indexed entity row
 in the active profile's database. A note that already has both keys is left alone.
 
+``--clamp-created`` makes ``created`` never later than ``modified`` (``created = min(created,
+modified)``). The TSV ``created`` of most imported notes is the time they were first indexed here,
+which is later than the note's old file time; without the flag the values are written as they are.
+
 ``--edited-since TIME`` (with a UTC offset) says when the TSV values were taken. A note listed
 there whose bytes changed in the published history after that moment was edited since, so its
 ``modified`` is the time of that change, not the older TSV value. A move (same bytes under a new
@@ -92,6 +96,7 @@ def resolve_times(
     rows: dict[str, tuple[datetime, datetime]],
     changes: dict[str, datetime],
     since: datetime | None,
+    clamp_created: bool = False,
 ) -> tuple[datetime, datetime, bool] | None:
     """(created, modified, edited_since_snapshot) for one note, or None without any source."""
     base = listed.get(key) or rows.get(key)
@@ -99,9 +104,13 @@ def resolve_times(
         return None
     created, modified = base
     changed = changes.get(key)
-    if key in listed and since is not None and changed is not None and changed > since:
-        return created, changed.astimezone(), True
-    return created, modified, False
+    edited = key in listed and since is not None and changed is not None and changed > since
+    if edited:
+        assert changed is not None
+        modified = changed.astimezone()
+    if clamp_created:
+        created = min(created, modified)
+    return created, modified, edited
 
 
 def backfilled(markdown: str, created: datetime, updated: datetime) -> str | None:
@@ -196,13 +205,27 @@ async def run(args: argparse.Namespace) -> int:
                 changed = missing = edited = from_tsv = 0
                 for path, content in snapshot.files.items():
                     key = str(note_ids[path])
-                    times = resolve_times(key, listed=tsv, rows=rows, changes=changes, since=since)
+                    times = resolve_times(
+                        key,
+                        listed=tsv,
+                        rows=rows,
+                        changes=changes,
+                        since=since,
+                        clamp_created=args.clamp_created,
+                    )
                     if times is None:
                         missing += 1
                         print(f"  no source for {path}")
                         continue
                     created_at, modified_at, edited_since = times
                     from_tsv += key in tsv
+                    new = backfilled(content, created_at, modified_at)
+                    if new is None:
+                        continue
+                    files[path] = new
+                    changed += 1
+                    # Named only when the note is written now: after a first apply the backfill
+                    # commit itself would otherwise show up as an "edit since the snapshot".
                     if edited_since:
                         edited += 1
                         print(
@@ -210,10 +233,6 @@ async def run(args: argparse.Namespace) -> int:
                             f"{modified_at.isoformat(timespec='seconds')} "
                             f"(TSV had {tsv[key][1].isoformat(timespec='seconds')})"
                         )
-                    new = backfilled(content, created_at, modified_at)
-                    if new is not None:
-                        files[path] = new
-                        changed += 1
                 print(
                     f"{project.name}: {len(files)} notes, {changed} to change, "
                     f"{missing} without a source, {from_tsv} timed by the TSV files, "
@@ -244,6 +263,11 @@ def main() -> int:
     )
     parser.add_argument("--tsv", action="append", help="repeatable; later files win")
     parser.add_argument("--project", action="append", help="repeatable; default: all")
+    parser.add_argument(
+        "--clamp-created",
+        action="store_true",
+        help="never write a created time later than the modified time",
+    )
     parser.add_argument(
         "--edited-since",
         metavar="TIME",

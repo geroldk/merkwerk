@@ -302,3 +302,31 @@ async def test_the_history_tells_an_edit_from_a_move_and_from_an_untouched_note(
     assert set(changes) == {str(edited)}  # the move and the untouched note are no changes
     assert changes[str(edited)] > before_edit
     assert changes[str(edited)] > repository.committed_at(first_commit)
+
+
+def test_clamping_keeps_created_from_being_later_than_modified():
+    later_created = (ROW[1] + timedelta(days=40), ROW[1])
+    kept = backfill.resolve_times("n", listed={"n": later_created}, rows={}, changes={}, since=None)
+    assert kept == (*later_created, False)  # as written when not asked to clamp
+    clamped = backfill.resolve_times(
+        "n", listed={"n": later_created}, rows={}, changes={}, since=None, clamp_created=True
+    )
+    assert clamped == (ROW[1], ROW[1], False)
+    ordinary = backfill.resolve_times(
+        "n", listed={"n": LISTED}, rows={}, changes={}, since=None, clamp_created=True
+    )
+    assert ordinary == (*LISTED, False)  # a sane pair is left alone
+
+
+def test_clamping_follows_an_edit_made_after_the_snapshot():
+    edit = SNAPSHOT + timedelta(hours=6)
+    later_created = (SNAPSHOT + timedelta(days=1), SNAPSHOT)
+    resolved = backfill.resolve_times(
+        "n",
+        listed={"n": later_created},
+        rows={},
+        changes={"n": edit},
+        since=SNAPSHOT,
+        clamp_created=True,
+    )
+    assert resolved == (edit, edit, True)  # created is clamped to the time of the edit
