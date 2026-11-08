@@ -193,7 +193,7 @@ async def run(args: argparse.Namespace) -> int:
                     if since is not None
                     else {}
                 )
-                changed = missing = edited = 0
+                changed = missing = edited = from_tsv = 0
                 for path, content in snapshot.files.items():
                     key = str(note_ids[path])
                     times = resolve_times(key, listed=tsv, rows=rows, changes=changes, since=since)
@@ -202,6 +202,7 @@ async def run(args: argparse.Namespace) -> int:
                         print(f"  no source for {path}")
                         continue
                     created_at, modified_at, edited_since = times
+                    from_tsv += key in tsv
                     if edited_since:
                         edited += 1
                         print(
@@ -215,7 +216,8 @@ async def run(args: argparse.Namespace) -> int:
                         changed += 1
                 print(
                     f"{project.name}: {len(files)} notes, {changed} to change, "
-                    f"{missing} without a source, {edited} edited since the snapshot"
+                    f"{missing} without a source, {from_tsv} timed by the TSV files, "
+                    f"{edited} edited since the snapshot"
                 )
                 if missing:
                     raise ValueError("notes without a source; nothing published")
