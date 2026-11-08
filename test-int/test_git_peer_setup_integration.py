@@ -1,6 +1,7 @@
 """BM-009: peers are set by project name, offline, and the host starts and syncs with them."""
 
 import asyncio
+import stat
 from pathlib import Path
 from typing import Any
 
@@ -121,3 +122,20 @@ async def test_a_profile_that_is_not_a_git_host_is_refused(host_setup, config_ma
     config_manager.config_file.write_bytes(raw.model_dump_json().encode())
     with pytest.raises(GitProjectCreateError, match="not a Git host"):
         await stopped_setup(config_manager, ["test-project"], peer_base=str(tmp_path / "peer"))
+
+
+@pytest.mark.asyncio
+async def test_a_peer_inside_a_project_place_is_refused_and_the_rights_of_the_file_stay(
+    host_setup, config_manager, tmp_path
+):
+    config_manager.config_file.chmod(0o600)
+    before = config_manager.config_file.read_bytes()
+    root = Path(host_setup.project.path)
+    for base in (root / "peers", host_setup.repository.path):
+        with pytest.raises(GitProjectCreateError, match="overlaps"):
+            await stopped_setup(config_manager, ["test-project"], peer_base=str(base))
+    assert config_manager.config_file.read_bytes() == before
+    assert not (root / "peers").exists()
+    # A good peer works, and the configuration keeps its owner-only rights.
+    await stopped_setup(config_manager, ["test-project"], peer_base=str(tmp_path / "peerside"))
+    assert stat.S_IMODE(config_manager.config_file.stat().st_mode) == 0o600

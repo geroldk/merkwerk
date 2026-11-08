@@ -68,6 +68,7 @@ async def test_a_note_moves_into_another_project(client, test_project, second_pr
         output_format="json",
     )
 
+    new_id = await _note_id(client, second_project, "inbox/plan.md")
     assert result == {
         "action": "moved",
         "previous_project": test_project.name,
@@ -76,6 +77,8 @@ async def test_a_note_moves_into_another_project(client, test_project, second_pr
         "file_path": "inbox/plan.md",
         "previous_permalink": f"{test_project.permalink}/notes/plan",
         "permalink": f"{second_project.permalink}/inbox/plan",
+        "previous_external_id": source_id,
+        "external_id": new_id,
     }
     moved = await _read(second_project, "inbox/plan.md")
     assert "- [goal] ship it" in moved["content"]
@@ -402,7 +405,9 @@ async def test_a_directory_moves_note_by_note(client, test_project, second_proje
     assert result["destination"] == "imported/drafts"
     assert sorted(result["moved_files"]) == ["imported/drafts/a.md", "imported/drafts/deep/b.md"]
     assert result["failed"] == []
-    assert sorted(result["moved_notes"], key=lambda note: note["file_path"]) == [
+    entries = sorted(result["moved_notes"], key=lambda note: note["file_path"])
+    ids = [(e.pop("previous_external_id"), e.pop("external_id")) for e in entries]
+    assert entries == [
         {
             "previous_file_path": "drafts/a.md",
             "file_path": "imported/drafts/a.md",
@@ -416,6 +421,8 @@ async def test_a_directory_moves_note_by_note(client, test_project, second_proje
             "permalink": f"{second_project.permalink}/imported/drafts/deep/b",
         },
     ]
+    assert all(old_id and new_id and old_id != new_id for old_id, new_id in ids)
+    assert ids[1][1] == await _note_id(client, second_project, "imported/drafts/deep/b.md")
     assert "# B" in (await _read(second_project, "imported/drafts/deep/b.md"))["content"]
     assert await _missing(test_project, "drafts/a.md")
     assert await _missing(test_project, "drafts/deep/b.md")
@@ -427,13 +434,23 @@ async def test_a_directory_move_reports_what_stayed(client, test_project, second
     await _write(test_project, "drafts/b.md", "# B\n")
     await _write(second_project, "drafts/b.md", "# Taken\n")
 
-    with pytest.raises(ToolError, match=r"^PARTIAL_FAILURE: Moved 1 of 2 files .*drafts/b.md"):
+    with pytest.raises(
+        ToolError, match=r"^PARTIAL_FAILURE: Moved 1 of 2 files .*drafts/b.md"
+    ) as error:
         await bm_move(
             path="drafts",
             destination="drafts",
             destination_project=second_project.name,
             project=test_project.name,
         )
+    # What did move is reported, with both permalinks and both ids: the note is gone from the source.
+    moved_part = str(error.value).split("Moved: ", 1)[1]
+    assert "drafts/a.md -> drafts/a.md" in moved_part
+    assert (
+        f"permalink {test_project.permalink}/drafts/a -> {second_project.permalink}/drafts/a"
+        in moved_part
+    )
+    assert " id " in moved_part and " -> " in moved_part.split(" id ", 1)[1]
 
     assert await _missing(test_project, "drafts/a.md")
     assert not await _missing(test_project, "drafts/b.md")

@@ -2,6 +2,9 @@
 
 import asyncio
 import json
+import os
+import signal
+import stat
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -176,3 +179,41 @@ async def test_a_profile_that_is_not_a_git_host_is_refused(host_setup, config_ma
     with pytest.raises(GitProjectCreateError, match="not a Git host"):
         await create(host_setup, tmp_path, NewGitProject("haus"), config_manager=config_manager)
     assert isinstance(UUID(host_setup.project.external_id), UUID)
+
+
+@pytest.mark.asyncio
+async def test_the_configuration_keeps_its_rights_after_creating_a_project(
+    host_setup, config_manager, tmp_path
+):
+    config_manager.config_file.chmod(0o600)
+    await create(host_setup, tmp_path, NewGitProject("haus"), config_manager=config_manager)
+    assert stat.S_IMODE(config_manager.config_file.stat().st_mode) == 0o600
+
+
+@pytest.mark.asyncio
+async def test_a_termination_signal_in_the_middle_rolls_everything_back(
+    host_setup, config_manager, tmp_path, monkeypatch
+):
+    before = config_manager.config_file.read_bytes()
+    real_bind = git_project_create._bind
+
+    async def bind_then_get_terminated(*args: Any, **kwargs: Any) -> None:
+        await real_bind(*args, **kwargs)
+        os.kill(os.getpid(), signal.SIGTERM)  # e.g. the terminal closes (SIGHUP) or `kill`
+        await asyncio.sleep(5)  # the next await point receives the cancellation
+
+    monkeypatch.setattr(git_project_create, "_bind", bind_then_get_terminated)
+    with pytest.raises(asyncio.CancelledError):
+        await create(
+            host_setup,
+            tmp_path,
+            NewGitProject("haus"),
+            NewGitProject("ake"),
+            config_manager=config_manager,
+        )
+    assert config_manager.config_file.read_bytes() == before
+    assert not (tmp_path / "bm").exists() or not any((tmp_path / "bm").iterdir())
+    _, factory = await db.get_or_create_db(host_setup.config.database_path)
+    async with db.scoped_session(factory) as session:
+        names = list(await session.scalars(select(Project.name)))
+    assert names == ["test-project"]

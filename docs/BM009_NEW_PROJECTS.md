@@ -20,6 +20,13 @@ commit, the binding markers a backup needs, and the `projects` / `git_repositori
 * All or nothing: the future profile is checked with the host's own start rules before the
   configuration is replaced (atomically, last). On any failure the database rows and the
   directories this call made are removed.
+* **Rights of `config.json`:** the file is replaced through a temporary file that gets the rights
+  of the old one (a new file starts at 0600), also when `remove-project` puts the old text back
+  and for `peer-setup`. The configuration can hold credentials.
+* **Signals:** SIGTERM and SIGHUP (a `kill`, a closed terminal) cancel the work and reach the
+  rollback like any other failure. Only SIGKILL, a power cut or an out-of-memory kill can leave a
+  half-made state: database rows the configuration does not know make the service refuse to
+  start. Take a backup first (the move-day runbook does) and run the tool in tmux.
 * Not touched: `sync-projects.json`, peers, and the gateway project lists. The gateway lists
   (`read_projects`, `write_projects`, `known_projects`) are changed by whoever owns the gateway.
 
@@ -28,7 +35,9 @@ commit, the binding markers a backup needs, and the `projects` / `git_repositori
 The way back for `create-project`: removes empty projects again. Service stopped, as above.
 
 * Only a project that is still what `create-project` made: no entity rows, a repository that
-  holds nothing but its initialization commit (a note that was written and deleted counts as
+  holds nothing but its initialization commit **and no other reference** (drafts under
+  `refs/bm/candidates`, receipts, fetched peer references) **and no transaction pointer** in
+  `bm-transactions` (a note that was written and deleted counts as
   used, because its history would go with the repository), a note root that holds nothing but the
   control directory `.basic-memory`. Everything else is refused before anything changes.
 * Also refused: an unknown name, the default project, removing every project (the host needs at
@@ -48,7 +57,9 @@ The way back for `create-project`: removes empty projects again. Service stopped
 Sets the sync peer of named projects to `BASE/NAME.git` (BASE: an absolute directory, whose
 bare repositories are created if missing, or `ssh://host/dir`). `--merge auto` also enables
 automatic merging for them. A project not named keeps its settings, and a project may have no
-peer at all. `--remove` removes peer and merge setting of the named projects.
+peer at all. `--remove` removes peer and merge setting of the named projects. A local peer may
+not be a note root or a project's own repository (nor over or inside one): the project would be
+its own peer. A failed creation of a local peer removes the directories this call made.
 
 ## `bm_move` across projects: the permalink is formed again
 
@@ -58,17 +69,22 @@ included, so a note moved from `main` into `cobol-ana` kept `personal/main/tasks
 gateway refuses addresses that start with another project's name (or `personal`), so such a
 note could not be reached remotely.
 
-* The copy is written **without** its `permalink` key (removed by deleting that one line; no
-  YAML round trip). The target forms the permalink from the new path, exactly as for a note
-  created there: `cobol-ana/aufgaben/jek-...`. An already owned permalink gets a `-1` suffix.
-  Works the same whether the old permalink began with `personal/main/`, `main/` or anything else.
+* The copy is written **without** its `permalink` key (the one line is removed from the text before
+  the write). The target forms the permalink from the new path, exactly as for a note created
+  there: `cobol-ana/aufgaben/jek-...`. An already owned permalink gets a `-1` suffix. Works the same
+  whether the old permalink began with `personal/main/`, `main/` or anything else.
 * This is part of the move, so `created` and `modified` stay as they were (BM-010 rule 4); a
-  later `set_metadata` would renew `modified` on every moved note. Every other frontmatter key
-  and the body travel unchanged. Precondition on the Git host: the note already carries the
-  two keys (the BM-010 backfill), else the copy is dated with the move.
-* The result names both: `previous_permalink` and `permalink`; a directory move lists one entry
-  per note in `moved_notes` (`previous_file_path`, `file_path`, `previous_permalink`,
-  `permalink`). The text form ends with `; permalink OLD -> NEW`.
+  later `set_metadata` would renew `modified` on every moved note. Every other frontmatter key keeps
+  its value and the body its text; the copy is written like any new note, so the frontmatter is
+  re-serialised (key order and quoting may change) and leading/trailing blank lines of the body
+  are trimmed. Precondition on the Git host: the note already carries the two keys (the BM-010
+  backfill), else the copy is dated with the move.
+* The result names both: `previous_permalink` and `permalink`, and the identity of the new note
+  (`previous_external_id`, `external_id`); a directory move lists one entry per note in
+  `moved_notes` (`previous_file_path`, `file_path`, `previous_permalink`, `permalink`,
+  `previous_external_id`, `external_id`). If some notes of a directory fail, the `PARTIAL_FAILURE`
+  message ends with `Moved: ...` listing exactly what did move, because those notes are already gone
+  from the source. The text form ends with `; permalink OLD -> NEW`.
 * A move inside one project is untouched: it keeps the permalink unless
   `update_permalinks_on_move` is on (production: off).
 * Links in other notes that name the old permalink are not rewritten (as before); the move

@@ -8,6 +8,7 @@ project that is not named here keeps whatever it had, and a project may have non
 """
 
 import json
+import shutil
 import subprocess
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -24,7 +25,9 @@ from basic_memory.index.git_host import require_git_peer_settings
 from basic_memory.models import Project
 from basic_memory.services.git_project_create import (
     GitProjectCreateError,
+    _overlaps,
     _write_config_atomically,
+    cancel_on_termination,
     require_host_stopped,
 )
 
@@ -44,10 +47,16 @@ def _peer_url(base: str, name: str) -> str:
 
 
 def _create_local_peer(url: str) -> bool:
-    """Create an empty bare repository at a local path; True when it was created."""
+    """Create an empty bare repository at a local path; True when it was created.
+
+    A failed `git init` removes what this call made, the directory and the parents it created.
+    """
     path = Path(url)
     if path.exists():
         return False
+    topmost = path
+    while not topmost.parent.exists():
+        topmost = topmost.parent
     path.mkdir(mode=0o700, parents=True)
     result = subprocess.run(
         ["git", "init", "--bare", "--initial-branch=main", str(path)],
@@ -56,8 +65,22 @@ def _create_local_peer(url: str) -> bool:
         timeout=30,
     )
     if result.returncode != 0:
+        shutil.rmtree(topmost, ignore_errors=True)
         raise GitProjectCreateError(result.stderr.decode("utf-8", errors="replace"))
     return True
+
+
+def _require_peer_apart_from_projects(
+    url: str, roots: list[Path], repositories: list[Path], name: str
+) -> None:
+    """A local peer must be a place of its own: not a note root and not a project's own
+    repository (nor over or inside one). Otherwise a project would be its own peer, every
+    sync "equal", or the peer's history would end up among the notes."""
+    peer = Path(url).resolve()
+    if any(_overlaps(peer, other) for other in roots + repositories):
+        raise GitProjectCreateError(
+            f"Peer path {peer} for {name!r} overlaps a project root or a project repository"
+        )
 
 
 async def setup_git_peers(
@@ -71,6 +94,17 @@ async def setup_git_peers(
 
     `peer_base=None` removes the peers (and any merge setting) of the named projects.
     """
+    with cancel_on_termination():
+        return await _setup_git_peers(names, peer_base=peer_base, merge=merge, manager=manager)
+
+
+async def _setup_git_peers(
+    names: Iterable[str],
+    *,
+    peer_base: str | None,
+    merge: MergeMode,
+    manager: ConfigManager | None,
+) -> list[PeerChange]:
     manager = manager or ConfigManager()
     config_file = Path(manager.config_file)
     config = BasicMemoryConfig.model_validate_json(config_file.read_bytes())
@@ -104,8 +138,15 @@ async def setup_git_peers(
                 continue
             url = _peer_url(peer_base, name)
             remote = GitSyncRemote(url=url)  # validates the endpoint
-            if Path(url).is_absolute() and _create_local_peer(url):
-                made.append(Path(url))
+            if Path(url).is_absolute():
+                _require_peer_apart_from_projects(
+                    url,
+                    [Path(p.path).resolve() for p in projects.values()],
+                    [r.resolve() for r in config.git_repositories.values()],
+                    name,
+                )
+                if _create_local_peer(url):
+                    made.append(Path(url))
             remotes[project_id] = remote
             if merge == "auto":
                 merges[project_id] = "auto"

@@ -118,3 +118,21 @@ def test_remove_project_reports_a_refusal(monkeypatch):
     result = CliRunner().invoke(app, ["git", "remove-project", "haus"])
     assert result.exit_code == 1
     assert "Refused: Project(s) with notes are not removed: haus" in result.output
+
+
+def test_create_and_remove_report_a_start_rule_refusal_instead_of_a_traceback(monkeypatch):
+    from basic_memory.repository.git_projection_repository import GitProjectionConflict
+
+    async def conflict(*args, **kwargs):
+        raise GitProjectionConflict("Every configured and registered project must be Git-managed")
+
+    monkeypatch.setattr("basic_memory.services.git_project_create.create_git_projects", conflict)
+    monkeypatch.setattr(
+        "basic_memory.services.git_project_remove.remove_empty_git_projects", conflict
+    )
+    for arguments in (["create-project", "haus"], ["remove-project", "haus"]):
+        result = CliRunner().invoke(app, ["git", *arguments])
+        assert result.exit_code == 1, arguments
+        assert (
+            "Refused: Every configured and registered project must be Git-managed" in result.output
+        )

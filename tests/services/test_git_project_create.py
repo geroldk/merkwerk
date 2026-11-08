@@ -1,5 +1,9 @@
 """BM-009: the plan for new Git projects rejects everything that could confuse the host."""
 
+import asyncio
+import os
+import signal
+import stat
 from pathlib import Path
 
 import pytest
@@ -58,8 +62,8 @@ def test_names_differing_only_in_case_or_repeated_are_refused():
 @pytest.mark.parametrize(
     ("path", "message"),
     [
-        (BASE, "new directory below"),
-        (BASE.parent, "new directory below"),
+        (BASE, "must not be the base directory"),
+        (BASE.parent, "must not be the base directory"),
         (BASE / "main" / "sub", "overlaps"),
         (BASE / "PKM", "overlaps"),
         (BASE / "repositories" / "x", "reserved"),
@@ -114,3 +118,58 @@ def test_a_service_holding_the_locks_blocks_creation(tmp_path):
     with FileLock(root / ".basic-memory" / "git-projection.lock", thread_local=False):
         with pytest.raises(GitProjectCreateError, match="stop it first"):
             require_host_stopped([(root, repository)])
+
+
+# --- The configuration is replaced without losing its rights ---
+
+
+def test_replacing_the_configuration_keeps_a_private_file_private(tmp_path, monkeypatch):
+    from basic_memory.services.git_project_create import write_config_text_atomically
+
+    monkeypatch.setattr("os.umask", lambda mask: 0o022, raising=False)
+    previous = os.umask(0o022)  # the usual umask, under which a plain write_text gives 0644
+    try:
+        config = tmp_path / "config.json"
+        config.write_text("old")
+        config.chmod(0o600)
+        write_config_text_atomically(config, "new")
+        assert config.read_text() == "new" and stat.S_IMODE(config.stat().st_mode) == 0o600
+        assert not (tmp_path / ".config.json.new").exists()
+        fresh = tmp_path / "fresh.json"
+        write_config_text_atomically(fresh, "x")
+        assert stat.S_IMODE(fresh.stat().st_mode) == 0o600  # a new file starts private
+        config.chmod(0o640)
+        write_config_text_atomically(config, "again")
+        assert stat.S_IMODE(config.stat().st_mode) == 0o640  # whatever the owner set stays
+    finally:
+        os.umask(previous)
+
+
+def test_a_failed_replacement_leaves_the_old_file_and_no_temporary(tmp_path, monkeypatch):
+    from basic_memory.services.git_project_create import write_config_text_atomically
+
+    config = tmp_path / "config.json"
+    config.write_text("old")
+
+    def broken(source, target):
+        raise OSError("disk full")
+
+    monkeypatch.setattr("os.replace", broken)
+    with pytest.raises(OSError, match="disk full"):
+        write_config_text_atomically(config, "new")
+    assert config.read_text() == "old" and not (tmp_path / ".config.json.new").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("number", [signal.SIGTERM, signal.SIGHUP])
+async def test_a_termination_signal_cancels_the_task_instead_of_ending_the_process(number):
+    from basic_memory.services.git_project_create import cancel_on_termination
+
+    with cancel_on_termination():
+        with pytest.raises(asyncio.CancelledError):
+            os.kill(os.getpid(), number)
+            await asyncio.sleep(5)
+    # The handler is gone again: the default disposition is back for a later signal.
+    assert signal.getsignal(number) in {signal.SIG_DFL, signal.default_int_handler} or callable(
+        signal.getsignal(number)
+    )

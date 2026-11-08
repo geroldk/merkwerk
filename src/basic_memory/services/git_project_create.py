@@ -9,11 +9,15 @@ repositories, the note roots and the configuration entries. The configuration is
 last, atomically, and only after the future profile passed the host's own start rules.
 """
 
+import asyncio
 import json
 import os
 import re
 import shutil
-from collections.abc import Iterable
+import signal
+import stat
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -97,7 +101,9 @@ def plan_new_projects(
             raise GitProjectCreateError(f"Project root {request.path} must be an absolute path")
         root = (request.path or base / name).resolve()
         if root == base or base.is_relative_to(root):
-            raise GitProjectCreateError(f"Project root {root} must be a new directory below {base}")
+            raise GitProjectCreateError(
+                f"Project root {root} must not be the base directory {base} or contain it"
+            )
         if any(_overlaps(root, other) for other in roots):
             raise GitProjectCreateError(f"Project root {root} overlaps another project root")
         if any(_overlaps(root, other) for other in reserved) or _overlaps(root, repositories):
@@ -134,10 +140,54 @@ def require_host_stopped(roots_and_repositories: Iterable[tuple[Path, Path]]) ->
                 ) from error
 
 
-def _write_config_atomically(path: Path, data: dict[str, object]) -> None:
+def write_config_text_atomically(path: Path, text: str) -> None:
+    """Replace `path` with `text`, keeping the rights it had (a new file gets 0600).
+
+    The configuration can hold credentials; a plain write_text under umask 0022 would turn
+    a 0600 file into 0644 for good.
+    """
+    mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o600
     temporary = path.with_name(f".{path.name}.new")
-    temporary.write_text(json.dumps(data, indent=2))
-    os.replace(temporary, path)
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    try:
+        with os.fdopen(descriptor, "w") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, mode)  # os.open honours the umask; this does not
+        os.replace(temporary, path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _write_config_atomically(path: Path, data: dict[str, object]) -> None:
+    write_config_text_atomically(path, json.dumps(data, indent=2))
+
+
+@contextmanager
+def cancel_on_termination() -> Iterator[None]:
+    """Turn SIGTERM and SIGHUP into a cancellation of the running task.
+
+    Without it a closed terminal or a `kill` ends the process between two steps, past the
+    `except BaseException` rollback, and leaves database rows the configuration does not know:
+    the service then refuses to start. A cancelled task reaches its rollback.
+    """
+    loop = asyncio.get_running_loop()
+    task = asyncio.current_task()
+    installed: list[signal.Signals] = []
+    if task is not None:
+        for number in (signal.SIGTERM, signal.SIGHUP):
+            try:
+                loop.add_signal_handler(number, task.cancel)
+                installed.append(number)
+            except (NotImplementedError, RuntimeError, ValueError):  # not the main thread
+                continue
+    try:
+        yield
+    finally:
+        for number in installed:
+            loop.remove_signal_handler(number)
 
 
 async def _alembic_at_head(session: AsyncSession) -> None:
@@ -162,7 +212,25 @@ async def create_git_projects(
     repositories_dir: Path,
     manager: ConfigManager | None = None,
 ) -> list[CreatedGitProject]:
-    """Create the requested projects, or leave the installation exactly as it was."""
+    """Create the requested projects, or leave the installation exactly as it was.
+
+    A SIGTERM or SIGHUP cancels the work and reaches the rollback like any other failure;
+    only SIGKILL, a power cut or an out-of-memory kill can leave a half-made state (the
+    runbook takes a backup first for that).
+    """
+    with cancel_on_termination():
+        return await _create_git_projects(
+            requests, base_dir=base_dir, repositories_dir=repositories_dir, manager=manager
+        )
+
+
+async def _create_git_projects(
+    requests: Iterable[NewGitProject],
+    *,
+    base_dir: Path,
+    repositories_dir: Path,
+    manager: ConfigManager | None,
+) -> list[CreatedGitProject]:
     manager = manager or ConfigManager()
     config_file = Path(manager.config_file)
     config = BasicMemoryConfig.model_validate_json(config_file.read_bytes())
@@ -172,6 +240,7 @@ async def create_git_projects(
         config.database_path, ensure_migrations=False, config=config
     )
     created: list[CreatedGitProject] = []
+    registered_ids: list[UUID] = []  # rows committed so far, also before the project is "created"
     made_paths: list[Path] = []
     try:
         async with maker() as session:
@@ -196,15 +265,18 @@ async def create_git_projects(
         future = config.model_copy(deep=True)
         for name, root, repository_path in planned:
             project_id = uuid4()
+            # Noted before the call: the plan guarantees the path is free, and a failure inside
+            # `create` (git init, first commit) must not leave a half-made repository behind.
+            made_paths.append(repository_path)
             repository = GitProjectRepository.create(
                 repository_path, project_external_id=project_id
             )
-            made_paths.append(repository_path)
             _make_directory(root, made_paths)
             async with maker() as session, session.begin():
                 project = await register_git_project(
                     session, repository.snapshot().manifest, name=name, path=root
                 )
+            registered_ids.append(project_id)
             # Writes the same binding markers the service would, so a backup taken before
             # the first start finds them.
             await _bind(repository, project, root, maker)
@@ -224,7 +296,7 @@ async def create_git_projects(
         BasicMemoryConfig.model_validate(raw)  # the profile that will be written must load
         _write_config_atomically(config_file, raw)
     except BaseException:
-        await _roll_back(maker, created, made_paths)
+        await _roll_back(maker, registered_ids, made_paths)
         raise
     return created
 
@@ -258,14 +330,14 @@ async def _bind(
 
 async def _roll_back(
     maker: async_sessionmaker[AsyncSession],
-    created: list[CreatedGitProject],
+    registered_ids: list[UUID],
     made_paths: list[Path],
 ) -> None:
     """Undo what this call made: database rows, then only the directories it created."""
     async with maker() as session, session.begin():
-        for item in created:
+        for project_id in registered_ids:
             row = await session.scalar(
-                select(Project).where(Project.external_id == str(item.project_id))
+                select(Project).where(Project.external_id == str(project_id))
             )
             if row is not None:
                 await session.delete(row)

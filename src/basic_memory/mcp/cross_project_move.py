@@ -58,6 +58,8 @@ class MovedNote:
     file_path: str
     previous_permalink: str | None
     permalink: str | None
+    previous_external_id: str
+    external_id: str
 
 
 # --- One note ---
@@ -104,6 +106,8 @@ async def move_note_across(
         "file_path": target.paths.path(moved.file_path),
         "previous_permalink": moved.previous_permalink,
         "permalink": moved.permalink,
+        "previous_external_id": moved.previous_external_id,
+        "external_id": moved.external_id,
     }
     if output_format == "json":
         return result
@@ -167,7 +171,8 @@ async def _move_one(
     # Trigger: the note carries a permalink formed in the source project.
     # Why: a permalink in the frontmatter is kept as written, so it would keep the source
     #      project's prefix; without it the target forms one from the new path.
-    # Outcome: the copy has the target's own permalink; every other byte is the source's.
+    # Outcome: the copy has the target's own permalink; every other key keeps its value. (The
+    #          note is written again as for any new note: frontmatter re-serialised, body trimmed.)
     content = drop_frontmatter_key(content, "permalink")
     copy = await _write_copy(target, destination_path, entity.title, content, output_format)
 
@@ -209,6 +214,8 @@ async def _move_one(
         file_path=copy.file_path,
         previous_permalink=entity.permalink,
         permalink=copy.permalink,
+        previous_external_id=external_id,
+        external_id=copy.external_id,
     )
 
 
@@ -352,6 +359,8 @@ async def move_directory_across(
                 "file_path": target.paths.path(note.file_path),
                 "previous_permalink": note.previous_permalink,
                 "permalink": note.permalink,
+                "previous_external_id": note.previous_external_id,
+                "external_id": note.external_id,
             }
             for note in moved
         ],
@@ -362,12 +371,21 @@ async def move_directory_across(
     # Why: each note moved or stayed whole, but the directory did neither.
     # Outcome: an error listing what stayed, so the caller can decide what to retry.
     if failed:
+        # What did move is part of the answer: the caller has to log it and cannot ask again,
+        # because each moved note is already gone from the source.
+        done = "; ".join(
+            f"{note['previous_file_path']} -> {note['file_path']} "
+            f"(permalink {note['previous_permalink']} -> {note['permalink']}, "
+            f"id {note['previous_external_id']} -> {note['external_id']})"
+            for note in result["moved_notes"]
+        )
         raise refusal(
             "PARTIAL_FAILURE",
             f"Moved {len(moved)} of {len(files)} files from '{result['path']}' "
             f"(project {source.project.name}) to '{result['destination']}' "
             f"(project {target.project.name}); {len(failed)} stayed: "
-            + "; ".join(f"{failure['path']}: {failure['error']}" for failure in failed),
+            + "; ".join(f"{failure['path']}: {failure['error']}" for failure in failed)
+            + (f". Moved: {done}" if done else ""),
             try_instead=(
                 f"bm_list(path={result['path']!r}, project={source.project_ref!r}) "
                 "to see what stayed"

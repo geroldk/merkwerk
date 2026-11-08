@@ -102,7 +102,7 @@ def create_project(
                 requests, base_dir=root, repositories_dir=repositories or root / "repositories"
             )
         )
-    except GitProjectCreateError as error:
+    except (GitProjectCreateError, ValueError) as error:  # ValueError: GitProjectionConflict
         typer.echo(f"Refused: {error}", err=True)
         raise typer.Exit(1) from error
     for item in created:
@@ -125,7 +125,7 @@ def remove_project(
 
     try:
         removed = asyncio.run(remove_empty_git_projects(projects))
-    except GitProjectCreateError as error:
+    except (GitProjectCreateError, ValueError) as error:  # ValueError: GitProjectionConflict
         typer.echo(f"Refused: {error}", err=True)
         raise typer.Exit(1) from error
     for item in removed:

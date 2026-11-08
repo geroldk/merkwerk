@@ -82,3 +82,18 @@ def test_a_directory_that_cannot_be_removed_is_reported(tmp_path, monkeypatch):
 
     monkeypatch.setattr("basic_memory.services.git_project_remove.shutil.rmtree", refuse)
     assert _remove_directories(item).leftovers == (repository,)
+
+
+def test_drafts_and_transaction_pointers_count_as_work(tmp_path):
+    repository = GitProjectRepository.create(tmp_path / "haus.git")
+    _require_unused_repository("haus", repository.path)  # untouched: fine
+    head = repository.snapshot().commit_id
+    repository._git("update-ref", f"refs/bm/candidates/{uuid4()}/{head}", head)
+    with pytest.raises(GitProjectCreateError, match="1 extra reference"):
+        _require_unused_repository("haus", repository.path)
+
+    other = GitProjectRepository.create(tmp_path / "ake.git")
+    (other.path / "bm-transactions").mkdir()
+    (other.path / "bm-transactions" / f"{uuid4()}.json").write_text("{}")
+    with pytest.raises(GitProjectCreateError, match="1 transaction pointer"):
+        _require_unused_repository("ake", other.path)

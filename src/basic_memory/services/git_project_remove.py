@@ -13,7 +13,6 @@ removed after that; a directory that cannot be removed is reported, not hidden.
 
 import asyncio
 import json
-import os
 import shutil
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -35,7 +34,9 @@ from basic_memory.services.git_project_create import (
     _alembic_at_head,
     _overlaps,
     _write_config_atomically,
+    cancel_on_termination,
     require_host_stopped,
+    write_config_text_atomically,
 )
 
 CONTROL_DIRECTORY = ".basic-memory"
@@ -52,13 +53,27 @@ class RemovedGitProject:
 
 
 def _require_unused_repository(name: str, repository_path: Path) -> None:
-    """The repository must still be exactly what `create-project` made."""
+    """The repository must still be exactly what `create-project` made.
+
+    Not only the published branch: drafts (``refs/bm/candidates``), receipts, fetched peer
+    references and the durable transaction pointers in ``bm-transactions`` also belong to a
+    project that has been worked in.
+    """
     try:
-        GitProjectRepository(repository_path).initial_snapshot()
+        repository = GitProjectRepository(repository_path)
+        repository.initial_snapshot()
+        references = repository._git("for-each-ref", "--format=%(refname)").decode().split()
     except (GitPublicationError, ValueError, OSError) as error:
         raise GitProjectCreateError(
             f"Project {name!r} has been used or its repository is unreadable ({error}); not removed"
         ) from error
+    extra = [ref for ref in references if ref != "refs/heads/main"]
+    pointers = list((repository_path / "bm-transactions").glob("*.json"))
+    if extra or pointers:
+        raise GitProjectCreateError(
+            f"Project {name!r} has been worked in ({len(extra)} extra reference(s), "
+            f"{len(pointers)} transaction pointer(s)); not removed"
+        )
 
 
 def _require_empty_root(name: str, root: Path) -> None:
@@ -84,6 +99,13 @@ async def remove_empty_git_projects(
     manager: ConfigManager | None = None,
 ) -> list[RemovedGitProject]:
     """Remove the named, still empty projects, or leave the installation as it was."""
+    with cancel_on_termination():
+        return await _remove_empty_git_projects(names, manager=manager)
+
+
+async def _remove_empty_git_projects(
+    names: Iterable[str], *, manager: ConfigManager | None
+) -> list[RemovedGitProject]:
     manager = manager or ConfigManager()
     config_file = Path(manager.config_file)
     config = BasicMemoryConfig.model_validate_json(config_file.read_bytes())
@@ -188,15 +210,9 @@ async def remove_empty_git_projects(
         # The rows roll back by themselves; the configuration is put back whenever it differs
         # from what it was, wherever in the write or the commit the failure happened.
         if config_file.read_text() != raw_text:
-            _write_text_atomically(config_file, raw_text)
+            write_config_text_atomically(config_file, raw_text)
         raise
     return [await asyncio.to_thread(_remove_directories, item) for item in removed]
-
-
-def _write_text_atomically(path: Path, text: str) -> None:
-    temporary = path.with_name(f".{path.name}.restore")
-    temporary.write_text(text)
-    os.replace(temporary, path)
 
 
 def _remove_directories(item: RemovedGitProject) -> RemovedGitProject:

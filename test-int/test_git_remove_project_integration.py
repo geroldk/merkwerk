@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import stat
 from pathlib import Path
 from typing import Any
 
@@ -58,6 +59,7 @@ def profile(config_manager) -> dict[str, Any]:
 
 @pytest.mark.asyncio
 async def test_create_then_remove_restores_the_installation(host_setup, config_manager, tmp_path):
+    config_manager.config_file.chmod(0o600)
     before = profile(config_manager)
     created = await create(tmp_path, config_manager, "haus", "meldungen")
     assert profile(config_manager) != before
@@ -68,6 +70,7 @@ async def test_create_then_remove_restores_the_installation(host_setup, config_m
     assert [r.name for r in removed] == ["haus", "meldungen"]
     assert all(not r.leftovers and not r.had_peer for r in removed)
     assert profile(config_manager) == before
+    assert stat.S_IMODE(config_manager.config_file.stat().st_mode) == 0o600
     assert await project_names(host_setup) == ["test-project"]
     for item in created:
         assert not item.path.exists()
