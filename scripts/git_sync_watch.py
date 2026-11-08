@@ -60,6 +60,8 @@ class Verdict:
     project: str
     problem: str | None  # None = fine
     detail: str = ""
+    # A tolerated failure says nothing about the earlier problem: keep it as it was.
+    keep_previous: bool = False
 
 
 def classify(project: str, result: dict[str, Any], failures: int, tolerate: int) -> Verdict:
@@ -81,10 +83,18 @@ def classify(project: str, result: dict[str, Any], failures: int, tolerate: int)
             return Verdict(project, reason, f"reason={reason}")
         if failures + 1 >= tolerate:
             return Verdict(project, f"unreachable:{reason}", f"{failures + 1} failures in a row")
-        return Verdict(project, None, f"tolerated {reason} ({failures + 1}/{tolerate})")
+        return Verdict(
+            project, None, f"tolerated {reason} ({failures + 1}/{tolerate})", keep_previous=True
+        )
     if result.get("relationship") == "diverged":
         return Verdict(project, "diverged", "relationship=diverged")
     return Verdict(project, None, f"kind={kind}")
+
+
+def is_busy(error_text: str) -> bool:
+    """Another sync of the same project is running (HTTP 409 or the service's own wording)."""
+    lowered = error_text.lower()
+    return "409" in lowered or "busy" in lowered or "already running" in lowered
 
 
 def load_state(path: Path) -> dict[str, Any]:
@@ -127,6 +137,13 @@ async def run_once(
         failed = (result.get("last_attempt") or {}).get("kind") == "failed"
         entry["failures"] = entry["failures"] + 1 if failed else 0
         previous = entry["problem"]
+        if verdict.keep_previous:
+            # Trigger: an offline hiccup while a person-needed problem (needs_review,
+            #   diverged) is open.
+            # Why: reporting "wieder in Ordnung" would be false, and the next run would
+            #   report the same problem again.
+            # Outcome: the open problem stays open and nothing is reported.
+            continue
         if verdict.problem != previous:
             if verdict.problem is not None:
                 messages.append(f"[BM sync] {project}: {verdict.problem} ({verdict.detail})")
@@ -171,7 +188,7 @@ class McpTransport:  # pragma: no cover
             text = str(error)
             if "No Git peer" in text or "not owned by this Git host" in text:
                 raise NotConfigured from error
-            if "409" in text or "busy" in text.lower():
+            if is_busy(text):
                 raise Busy from error
             raise
         if out.data is not None:

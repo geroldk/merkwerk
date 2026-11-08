@@ -112,6 +112,11 @@ def test_history_drafts_source_pins_noop_receipts_and_working_edits_survive(sour
     )
     (source.repository.path / "bm-adoption.json").write_text('{"audit": "adopted"}')
     backup, restored = tmp_path / "backup.bm.zip", tmp_path / "restored"
+    # A profile with a peer and automatic merging must restore with both switched off.
+    with_peer = BasicMemoryConfig.model_validate_json(source.config.read_bytes())
+    with_peer.git_sync_remotes = {source.identity: {"url": str(tmp_path / "peer.git")}}
+    with_peer.git_sync_merge = {source.identity: "auto"}
+    source.config.write_bytes(with_peer.model_dump_json().encode())
     manifest = create_git_backup(source.config, backup)
     assert backup.stat().st_mode & 0o777 == 0o600
     assert manifest.projects[0].published_commit == published.published_commit
@@ -123,6 +128,7 @@ def test_history_drafts_source_pins_noop_receipts_and_working_edits_survive(sour
     assert (
         config.skip_initialization_sync and not config.git_sync_remotes and not config.auto_update
     )
+    assert config.git_sync_merge == {}
     repository = GitProjectRepository(config.git_repositories[source.identity])
     assert repository.head() == source.repository.head()
     assert repository.snapshot().manifest.note_ids == {"published.md": identity}

@@ -40,33 +40,20 @@ class GitHost:
         return runtime
 
 
-@asynccontextmanager
-async def run_git_host(
-    app_config: BasicMemoryConfig,
-    session_maker: async_sessionmaker[AsyncSession],
-    *,
-    read_cache: ReadCacheInvalidator | None = None,
-) -> AsyncIterator[GitHost | None]:
-    """Open adopted repositories and recover SQL before admitting any requests.
-
-    A mixed legacy/Git host could change a referenced target without invalidating
-    its Git source. Refuse that topology until every legacy path can participate.
-    This context does not stop external processes, editors or Cloud sync jobs.
-    """
+def require_git_peer_settings(app_config: BasicMemoryConfig) -> None:
+    """Peers and automatic merging may only name configured Git projects."""
     if not set(app_config.git_sync_remotes) <= set(app_config.git_repositories):
         raise GitProjectionConflict("Git peers must refer to configured Git project UUIDs")
     if not set(app_config.git_sync_merge) <= set(app_config.git_sync_remotes):
         raise GitProjectionConflict("Git merge settings must refer to projects with a Git peer")
-    if not app_config.git_repositories:
-        yield None
-        return
-    if (
-        app_config.database_backend is not DatabaseBackend.SQLITE
-        or app_config.skip_local_initialization
-    ):
-        raise GitProjectionConflict("Git hosting currently requires standalone local SQLite")
-    async with session_maker() as session:
-        projects = list(await session.scalars(select(Project).order_by(Project.id)))
+
+
+def require_git_project_roots(app_config: BasicMemoryConfig, projects: list[Project]) -> None:
+    """Every registered project is configured, local, active and Git-managed (host start rule).
+
+    Shared with the offline project tools so that nothing they write can leave a host that
+    refuses to start.
+    """
     if (
         not projects
         or {UUID(project.external_id) for project in projects} != set(app_config.git_repositories)
@@ -86,6 +73,33 @@ async def run_git_host(
             or not repository_path.is_absolute()
         ):
             raise GitProjectionConflict("Git host requires matching active local project roots")
+
+
+@asynccontextmanager
+async def run_git_host(
+    app_config: BasicMemoryConfig,
+    session_maker: async_sessionmaker[AsyncSession],
+    *,
+    read_cache: ReadCacheInvalidator | None = None,
+) -> AsyncIterator[GitHost | None]:
+    """Open adopted repositories and recover SQL before admitting any requests.
+
+    A mixed legacy/Git host could change a referenced target without invalidating
+    its Git source. Refuse that topology until every legacy path can participate.
+    This context does not stop external processes, editors or Cloud sync jobs.
+    """
+    require_git_peer_settings(app_config)
+    if not app_config.git_repositories:
+        yield None
+        return
+    if (
+        app_config.database_backend is not DatabaseBackend.SQLITE
+        or app_config.skip_local_initialization
+    ):
+        raise GitProjectionConflict("Git hosting currently requires standalone local SQLite")
+    async with session_maker() as session:
+        projects = list(await session.scalars(select(Project).order_by(Project.id)))
+    require_git_project_roots(app_config, projects)
     repositories = AcceptedNoteRepositories()
     dependencies = AcceptedNoteMutationDependencies(
         project_repository=ProjectRepository(),

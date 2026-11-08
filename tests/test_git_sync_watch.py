@@ -147,3 +147,27 @@ def test_notify_pipes_the_report_to_the_command(tmp_path: Path, capsys) -> None:
     assert "one" in capsys.readouterr().err
     watch.notify(f"cat > {out}", [])  # nothing to say: the command is not run
     assert out.read_text() == "one\ntwo"
+
+
+async def test_an_offline_hiccup_keeps_an_open_review_open() -> None:
+    state: dict[str, Any] = {}
+    messages, _ = await watch.run_once(["a"], Peer({"a": completed("needs_review")}), state)
+    assert "needs_review" in messages[0]
+    messages, attention = await watch.run_once(["a"], Peer({"a": failed("transport")}), state)
+    assert messages == [] and attention == 1 and state["a"]["problem"] == "needs_review"
+    # Back online with the review still open: no repeated report either.
+    messages, attention = await watch.run_once(["a"], Peer({"a": completed("needs_review")}), state)
+    assert messages == [] and attention == 1
+
+
+@pytest.mark.parametrize(
+    ("text", "busy"),
+    [
+        ("409 Conflict", True),
+        ("sync is busy", True),
+        ("A sync attempt is already running for this project", True),
+        ("connection refused", False),
+    ],
+)
+def test_the_services_busy_wording_is_recognized(text: str, busy: bool) -> None:
+    assert watch.is_busy(text) is busy

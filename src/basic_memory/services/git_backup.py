@@ -354,7 +354,10 @@ def restore_git_backup(backup: Path, destination: Path) -> GitBackupManifest:
             p.project_id: destination / "repositories" / f"{p.project_id}.git"
             for p in manifest.projects
         }
+        # The merge settings must go with the peers: a host refuses `git_sync_merge` for a
+        # project that has no peer, so a restore of a merge-enabled profile would not start.
         config.git_sync_remotes = {}
+        config.git_sync_merge = {}
         config.cloud_api_key = None
         config.skip_initialization_sync = True
         config.auto_update = False
