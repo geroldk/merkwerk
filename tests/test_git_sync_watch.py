@@ -214,3 +214,16 @@ def test_the_projects_to_visit_fall_back_to_what_was_seen_before() -> None:
     assert watch.projects_to_visit(None, ["x", "y"], state) == ["x", "y"]  # what the service lists
     assert watch.projects_to_visit(None, None, state) == ["main"]  # service down: the history
     assert watch.projects_to_visit(None, None, {}) == [watch.SERVICE]  # nothing known at all
+
+
+def test_entries_of_names_that_are_not_visited_any_more_are_retired() -> None:
+    state: dict[str, Any] = {
+        "main": {"problem": None, "failures": 0},
+        watch.SERVICE: {"problem": "unreachable:transport", "failures": 3},
+        "gone": {"problem": None, "failures": 0},
+        "junk": "not an entry",
+    }
+    messages = watch.retire_unvisited(state, ["main"])
+    assert messages == [f"[BM sync] {watch.SERVICE}: wieder in Ordnung (wird nicht mehr geprüft)"]
+    assert set(state) == {"main", "junk"}
+    assert watch.retire_unvisited(state, ["main"]) == []

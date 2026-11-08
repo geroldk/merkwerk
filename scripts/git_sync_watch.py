@@ -240,6 +240,20 @@ def projects_to_visit(
     return [name for name, entry in state.items() if isinstance(entry, dict)] or [SERVICE]
 
 
+def retire_unvisited(state: dict[str, Any], projects: list[str]) -> list[str]:
+    """Drop state entries of names that are not visited any more; say so if one had a problem.
+
+    Needed because the service pseudo-project (``dienst``) is only reported while the service
+    does not answer, and a project taken out of the settings must not keep a problem open.
+    """
+    messages = []
+    for name in [n for n, entry in state.items() if isinstance(entry, dict) and n not in projects]:
+        entry = state.pop(name)
+        if entry.get("problem"):
+            messages.append(f"[BM sync] {name}: wieder in Ordnung (wird nicht mehr geprüft)")
+    return messages
+
+
 async def main_async(args: argparse.Namespace) -> int:  # pragma: no cover
     from contextlib import AsyncExitStack
 
@@ -263,12 +277,11 @@ async def main_async(args: argparse.Namespace) -> int:  # pragma: no cover
             call = transport.sync
         except Exception as error:  # the service itself does not answer: a failure per project
             print(f"git_sync_watch: service not reachable: {error}", file=sys.stderr)
-        messages, attention = await run_once(
-            projects_to_visit(options.projects, listed, state),
-            call,
-            state,
-            tolerate=options.tolerate,
-        )
+        visited = projects_to_visit(options.projects, listed, state)
+        messages, _ = await run_once(visited, call, state, tolerate=options.tolerate)
+        if call is not service_down:  # the real list of projects is known
+            messages += retire_unvisited(state, visited)
+        attention = sum(1 for e in state.values() if isinstance(e, dict) and e.get("problem"))
     save_state(options.state, state)
     notify(args.notify_cmd, messages, always=args.notify_always)
     return 3 if attention else 0

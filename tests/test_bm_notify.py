@@ -99,7 +99,9 @@ def test_the_note_names_host_time_project_and_id_and_is_safe_to_store(tmp_path):
     assert bn.note_for(message, notify) == note  # a replay builds the very same note
 
 
-@pytest.mark.parametrize("line", ["---", "--- title: x", "[[Other Note]]", "x [[a]] y"])
+@pytest.mark.parametrize(
+    "line", ["---", "--- title: x", "[[Other Note]]", "x [[a]] y", "[[[Geheim]]]", "a]]] b [[[c"]
+)
 def test_a_report_line_cannot_open_frontmatter_or_make_a_link(tmp_path, line):
     message = bn.make_messages([line], "ryzen", NOW)[0]
     content = bn.note_for(message, settings_for(tmp_path).notify).content
@@ -141,6 +143,37 @@ def test_an_unreadable_spool_file_is_set_aside_not_retried_forever(tmp_path, cap
     ]
     assert "REJECTED" in capsys.readouterr().err
     assert bn.pending(tmp_path / "missing") == []
+
+
+def test_a_spool_entry_without_a_utc_offset_is_set_aside_and_status_only_looks(tmp_path):
+    spool = tmp_path / "spool"
+    bn.enqueue(spool, bn.make_messages(["ok"], "ryzen", NOW))
+    naive = spool / "20261108T000000Z-000-naive.json"
+    naive.write_text(
+        '{"id": "n", "host": "h", "at": "2026-11-08T12:00:00", "text": "t", "attempts": 0}'
+    )
+    assert [e["text"] for _, e in bn.pending(spool, reject=False)] == ["ok"]
+    assert naive.exists()  # looking changes nothing
+    assert bn.status(hs.parse_settings({"notify": {"project": "m", "spool": str(spool)}}), NOW) == 0
+    assert naive.exists()
+    assert [e["text"] for _, e in bn.pending(spool)] == ["ok"]  # a delivery run sets it aside
+    assert (spool / bn.REJECTED / naive.name).exists()
+
+
+def test_setting_aside_a_file_that_is_already_gone_is_not_an_error(tmp_path):
+    bn._reject(tmp_path / "spool", tmp_path / "spool" / "gone.json", "another run took it")
+
+
+def test_file_names_follow_utc_time_across_the_change_of_summer_time(tmp_path):
+    spool = tmp_path / "spool"
+    summer = datetime(2026, 10, 25, 2, 40, tzinfo=timezone(timedelta(hours=2)))  # 00:40 UTC
+    winter = datetime(2026, 10, 25, 2, 10, tzinfo=timezone(timedelta(hours=1)))  # 01:10 UTC
+    bn.enqueue(spool, bn.make_messages(["later by the clock"], "ryzen", winter))
+    bn.enqueue(spool, bn.make_messages(["earlier by the clock"], "ryzen", summer))
+    assert [e["text"] for _, e in bn.pending(spool)] == [
+        "earlier by the clock",
+        "later by the clock",
+    ]
 
 
 def test_stale_messages_are_those_older_than_the_limit(tmp_path):
@@ -225,14 +258,23 @@ async def test_a_cut_off_run_does_not_create_a_second_note(tmp_path):
     ("text", "verdict"),
     [
         ("ALREADY_EXISTS: A note already exists at 'x'. Nothing was written.", None),
-        ("A note already exists", None),
+        ('{"error": "ALREADY_EXISTS", "message": "A note already exists"}', None),
+        ('{"error": "OUTCOME_UNKNOWN", "message": "the delete may have happened"}', bn.Unreachable),
+        ("UNAVAILABLE: the service that would answer did not", bn.Unreachable),
+        ('{"error": "LOCKED", "message": "the note is locked"}', bn.Unreachable),
         ("HTTP 409 conflict", bn.Unreachable),
         ("another sync is busy", bn.Unreachable),
         ("NOT_FOUND: project 'meldungen' does not exist", bn.Rejected),
-        ("FORBIDDEN: project is read-only", bn.Rejected),
+        ('{"error": "FORBIDDEN", "message": "read-only"}', bn.Rejected),
+        # The words inside a refusal never decide: its try_instead names the note's own path.
+        (
+            '{"error": "FORBIDDEN", "message": "no", "try_instead": "bm_read(identifier=\'Abgleich 20261108-123409 busy\')"}',
+            bn.Rejected,
+        ),
+        ("INVALID_ARGUMENTS: Folder 'x' has 409 characters", bn.Rejected),
     ],
 )
-def test_tool_errors_are_sorted_into_delivered_busy_and_refused(text, verdict):
+def test_tool_errors_are_sorted_by_their_code_not_by_words_in_the_message(text, verdict):
     assert bn.classify_error(text) is verdict
 
 

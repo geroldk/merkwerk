@@ -97,7 +97,8 @@ once.
 
 ## Installation (later, with Gerold's word)
 
-Fixed copies, like `git_sync_watch.py` today: `~/bm/bin/` holds `git_sync_watch.py`,
+Fixed copies, as `git_sync_watch.py` is kept today in `~/bm/vendor/fork-c3456e5c/` (nothing of the
+schedule is installed yet: `bm-git-sync.service` does not exist, `~/bm/bin/` has none of these): `~/bm/bin/` receives `git_sync_watch.py`,
 `bm_host_settings.py`, `bm_notify.py` and `bm-notify` (mode 755, with a SHA256 line). The
 template `deploy/systemd/bm-git-sync.service` already points there. The wrapper `bm-notify`
 starts `bm_notify.py` with the Python of the BM uv tool (`BM_PYTHON` overrides), which has

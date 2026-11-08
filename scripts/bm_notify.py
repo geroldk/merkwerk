@@ -30,7 +30,7 @@ import argparse
 import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
@@ -126,18 +126,25 @@ def make_messages(lines: list[str], host: str, now: datetime) -> list[Message]:
     ]
 
 
+def _defuse(text: str) -> str:
+    """Break up every "[[" and "]]", also nested ones ("[[[x]]]"), so nothing becomes a link."""
+    while "[[" in text or "]]" in text:
+        text = text.replace("[[", "[ [").replace("]]", "] ]")
+    return text
+
+
 def note_for(message: Message, notify: NotifySettings) -> NoteRequest:
     """The note for one message. The title carries the id, so a replay finds its own note."""
     stamp = datetime.fromisoformat(message.at).strftime("%Y%m%d-%H%M%S")
     scope = re.sub(r"[^\w.-]+", "-", message.project or "meldung").strip("-") or "meldung"
     title = f"Abgleich {message.host} {stamp} {scope} {message.id[:6]}"
     # "Meldung:" first, so a report line can never open frontmatter ("---") or a link ("[[").
-    shown = message.text.replace("[[", "[ [").replace("]]", "] ]")
-    body = [f"Meldung: {shown}", "", f"- [host] {message.host}", f"- [zeit] {message.at}"]
+    body = [f"Meldung: {_defuse(message.text)}", "", f"- [host] {message.host}"]
+    body.append(f"- [zeit] {message.at}")
     if message.project:
-        body.append(f"- [projekt] {message.project}")
+        body.append(f"- [projekt] {_defuse(message.project)}")
     if message.problem:
-        body.append(f"- [problem] {message.problem}")
+        body.append(f"- [problem] {_defuse(message.problem)}")
     body.append("- [status] offen")
     return NoteRequest(
         title=title,
@@ -175,7 +182,10 @@ def enqueue(spool: Path, messages: list[Message]) -> None:
     """Make every message durable before anything else is tried."""
     _ensure_directory(spool)
     for index, message in enumerate(messages):
-        stamp = datetime.fromisoformat(message.at).strftime("%Y%m%dT%H%M%S")
+        # UTC, so that file-name order is time order across the change of summer time.
+        stamp = (
+            datetime.fromisoformat(message.at).astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        )
         entry = {
             "id": message.id,
             "host": message.host,
@@ -190,8 +200,9 @@ def enqueue(spool: Path, messages: list[Message]) -> None:
         )
 
 
-def pending(spool: Path) -> list[tuple[Path, dict[str, Any]]]:
-    """Waiting messages, oldest first. A file that cannot be read goes to ``rejected/``."""
+def pending(spool: Path, *, reject: bool = True) -> list[tuple[Path, dict[str, Any]]]:
+    """Waiting messages, oldest first. A file that cannot be read goes to ``rejected/``
+    (not with ``reject=False``, which only looks: ``--status`` changes nothing)."""
     if not spool.is_dir():
         return []
     found: list[tuple[Path, dict[str, Any]]] = []
@@ -200,9 +211,11 @@ def pending(spool: Path) -> list[tuple[Path, dict[str, Any]]]:
             entry = json.loads(path.read_text())
             if not all(isinstance(entry.get(key), str) for key in ("id", "host", "at", "text")):
                 raise ValueError("incomplete spool entry")
-            datetime.fromisoformat(entry["at"])
+            if datetime.fromisoformat(entry["at"]).tzinfo is None:
+                raise ValueError("'at' has no UTC offset")
         except (OSError, ValueError, AttributeError) as error:
-            _reject(spool, path, f"unreadable spool file: {error}")
+            if reject:
+                _reject(spool, path, f"unreadable spool file: {error}")
             continue
         found.append((path, entry))
     return found
@@ -210,13 +223,20 @@ def pending(spool: Path) -> list[tuple[Path, dict[str, Any]]]:
 
 def _reject(spool: Path, path: Path, reason: str) -> None:
     _ensure_directory(spool / REJECTED)
-    os.replace(path, spool / REJECTED / path.name)
+    try:
+        os.replace(path, spool / REJECTED / path.name)
+    except FileNotFoundError:  # another run already delivered or set it aside
+        return
     print(f"bm-notify: REJECTED {path.name}: {reason}", file=sys.stderr)
 
 
-def stale(spool: Path, now: datetime, hours: int) -> list[Path]:
+def stale(spool: Path, now: datetime, hours: int, *, reject: bool = True) -> list[Path]:
     limit = now.astimezone() - timedelta(hours=hours)
-    return [path for path, entry in pending(spool) if datetime.fromisoformat(entry["at"]) < limit]
+    return [
+        path
+        for path, entry in pending(spool, reject=reject)
+        if datetime.fromisoformat(entry["at"]) < limit
+    ]
 
 
 # --- Delivery ---
@@ -252,11 +272,32 @@ async def deliver(
     return DeliveryReport(delivered, rejected, len(pending(spool)))
 
 
+# Codes of `bm_write` that say "not now" rather than "no": the service is away, busy or locked.
+TRANSIENT_CODES = {"OUTCOME_UNKNOWN", "UNAVAILABLE", "LOCKED"}
+LEADING_CODE = re.compile(r"([A-Z][A-Z_]+):")
+
+
 def classify_error(text: str) -> type[Exception] | None:
-    """Sort a tool error: None = the note exists (delivered), else Unreachable or Rejected."""
-    lowered = text.lower()
-    if "already_exists" in lowered or "already exists" in lowered:
+    """Sort a tool error: None = the note exists (delivered), else Unreachable or Rejected.
+
+    The code of a refusal decides, never words inside the message: its ``try_instead`` names
+    the note's own path, and a time stamp or id in a title can contain "409".
+    """
+    code: str | None = None
+    try:
+        payload = json.loads(text)
+    except ValueError:
+        payload = None
+    if isinstance(payload, dict) and isinstance(payload.get("error"), str):
+        code = payload["error"]
+    elif found := LEADING_CODE.match(text):
+        code = found[1]
+    if code == "ALREADY_EXISTS":
         return None
+    if code is not None:
+        return Unreachable if code in TRANSIENT_CODES else Rejected
+    # No code at all: an error from below the tool (transport, HTTP).
+    lowered = text.lower()
     if "409" in lowered or "busy" in lowered or "already running" in lowered:
         return Unreachable
     return Rejected
@@ -320,8 +361,8 @@ def summary(report: DeliveryReport) -> str:
 
 def status(settings: HostSettings, now: datetime) -> int:
     spool = settings.notify.spool
-    waiting = pending(spool)
-    old = stale(spool, now, settings.notify.stale_hours)
+    waiting = pending(spool, reject=False)
+    old = stale(spool, now, settings.notify.stale_hours, reject=False)
     refused = sorted((spool / REJECTED).glob("*.json")) if (spool / REJECTED).is_dir() else []
     print(
         f"host {settings.host_name}: {len(waiting)} waiting "

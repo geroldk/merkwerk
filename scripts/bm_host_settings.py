@@ -132,13 +132,27 @@ def _project_name(value: Any, name: str) -> str:
     return text
 
 
+FOLDER_PART = re.compile(r"[\w][\w .-]*")
+
+
 def _folder(value: Any, name: str) -> str:
-    """A folder inside the notify project: relative, no '..', no control characters."""
+    """A folder inside the notify project, one `bm_write` accepts: relative, plain names."""
     text = _text(value, name).strip("/")
-    parts = text.split("/")
-    if not text or any(p in {"", ".", ".."} or re.search(r"[\\\x00-\x1f]", p) for p in parts):
-        raise SettingsError(f"{name} {value!r} must be a relative folder without '..'")
+    # Letters, digits, space, '.', '-', '_' (what bm_write keeps unchanged); no dot-first part,
+    # no '..': a name that gets sanitized would make every note be refused.
+    if not text or not all(FOLDER_PART.fullmatch(part) for part in text.split("/")):
+        raise SettingsError(
+            f"{name} {value!r} must be a relative folder of letters, digits, spaces, '.', '-', '_' "
+            "that does not start with a dot"
+        )
     return text
+
+
+def _absolute(value: Any, name: str) -> Path:
+    path = Path(_text(value, name)).expanduser()
+    if not path.is_absolute():
+        raise SettingsError(f"{name} {value!r} must be an absolute path (or start with ~)")
+    return path
 
 
 def parse_settings(data: Any, *, source: Path | None = None) -> HostSettings:
@@ -171,9 +185,7 @@ def parse_settings(data: Any, *, source: Path | None = None) -> HostSettings:
             directory=_folder(
                 notify.get("directory", defaults_notify.directory), "notify.directory"
             ),
-            spool=Path(
-                _text(notify.get("spool", str(defaults_notify.spool)), "notify.spool")
-            ).expanduser(),
+            spool=_absolute(notify.get("spool", str(defaults_notify.spool)), "notify.spool"),
             stale_hours=_whole(
                 notify.get("stale_hours", defaults_notify.stale_hours),
                 "notify.stale_hours",
@@ -190,9 +202,7 @@ def parse_settings(data: Any, *, source: Path | None = None) -> HostSettings:
             tolerate=_whole(
                 sync.get("tolerate", defaults_sync.tolerate), "sync.tolerate", minimum=1
             ),
-            state=Path(
-                _text(sync.get("state", str(defaults_sync.state)), "sync.state")
-            ).expanduser(),
+            state=_absolute(sync.get("state", str(defaults_sync.state)), "sync.state"),
         ),
         source=source,
     )
