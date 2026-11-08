@@ -42,7 +42,8 @@ from basic_memory.utils import generate_permalink, validate_project_path
         "its file extension ('.markdown' may become '.md'). Pass `expected_checksum` (from "
         "bm_read) to move a note only if it is still the revision you read. "
         "`destination_project` moves into another project: the note is written there as a "
-        "new note (new id, its own history, links not rewritten) and deleted here; a "
+        "new note (new id, its own history, a permalink formed from its new path, links not "
+        "rewritten) and deleted here; the result names the old and the new permalink. A "
         "directory moves note by note."
     ),
     tags={"notes"},

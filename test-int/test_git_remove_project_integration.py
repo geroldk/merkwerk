@@ -1,5 +1,6 @@
 """BM-009: the way back for create-project removes an empty project and nothing else."""
 
+import asyncio
 import json
 from pathlib import Path
 from typing import Any
@@ -10,6 +11,7 @@ from filelock import FileLock
 from sqlalchemy import select
 
 from basic_memory import db
+from basic_memory.api.container import resolve_container
 from basic_memory.config import BasicMemoryConfig
 from basic_memory.models import Project
 from basic_memory.services import git_project_remove
@@ -22,7 +24,16 @@ from basic_memory.services.git_project_create import (
 from basic_memory.services.git_project_remove import remove_empty_git_projects
 
 from tests.git_host_support import host_setup as host_setup
-from test_git_create_project_integration import caught_up
+
+
+async def caught_up(project_id: str) -> None:
+    async with asyncio.timeout(60):
+        host = resolve_container().git_host
+        assert host is not None
+        worker = host.runtime_for(project_id).worker
+        while not (await worker.status()).caught_up:
+            worker.notify()
+            await asyncio.sleep(0.05)
 
 
 async def create(tmp_path: Path, config_manager, *names: str):

@@ -40,7 +40,12 @@ revision you read.
 `destination_project` moves into another project; `destination` is then a path
 in that project. The note is written there and then deleted here, so it is a
 new note: it gets a new id and its own version history, and links in either
-project are not rewritten. The original is deleted only after the copy is
+project are not rewritten. Its permalink is formed again from its new path, as
+for a note created there (a permalink that carried the source project's prefix
+would point into the wrong project); every other frontmatter key, including
+`created` and `modified`, travels unchanged. The result names the old and the
+new permalink (`previous_permalink`, `permalink`; for a directory, one entry
+each in `moved_notes`). The original is deleted only after the copy is
 written, and only if it is still the revision that was copied; if that delete
 is refused, the copy is removed again and nothing has moved. A note already at
 the destination is never replaced, and a locked note is refused. A directory

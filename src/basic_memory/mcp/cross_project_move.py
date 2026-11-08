@@ -4,6 +4,11 @@ A move across projects is a write in the target project followed by a delete in
 the source project. The moved note is a new note there: it gets a new id and its
 own version history, and links in either project are not rewritten.
 
+Its permalink is formed again from its new path, as for a note created there: a permalink
+that still carried the source project's prefix would point into the wrong project, and a
+gateway refuses addresses that start with another project's name. The result names the
+old and the new permalink. Everything else in the frontmatter travels unchanged.
+
 The source is deleted only after the copy is written, and only while it is still
 the revision that was copied. If that delete is refused (the note changed, or the
 caller cannot delete in the source project), the copy is removed again, so a
@@ -16,6 +21,7 @@ from typing import Any, assert_never
 
 from fastmcp.exceptions import ToolError
 
+from basic_memory.file_utils import drop_frontmatter_key
 from basic_memory.markdown.note_lock import LOCKED_NOTE_MESSAGE, note_is_locked
 from basic_memory.mcp.clients import DirectoryClient, KnowledgeClient
 from basic_memory.mcp.note_targets import ProjectTarget, resolve_note
@@ -50,6 +56,8 @@ class MovedNote:
 
     previous_file_path: str
     file_path: str
+    previous_permalink: str | None
+    permalink: str | None
 
 
 # --- One note ---
@@ -94,13 +102,18 @@ async def move_note_across(
         "previous_file_path": source.paths.path(moved.previous_file_path),
         "project": target.project.name,
         "file_path": target.paths.path(moved.file_path),
+        "previous_permalink": moved.previous_permalink,
+        "permalink": moved.permalink,
     }
     if output_format == "json":
         return result
-    return (
+    text = (
         f"Moved {result['previous_file_path']} (project {result['previous_project']}) to "
         f"{result['file_path']} (project {result['project']})"
     )
+    if moved.previous_permalink and moved.permalink:
+        text += f"; permalink {moved.previous_permalink} -> {moved.permalink}"
+    return text
 
 
 async def _move_one(
@@ -151,6 +164,11 @@ async def _move_one(
         raise refusal("LOCKED", LOCKED_NOTE_MESSAGE, output_format=output_format)
 
     # --- Write the copy ---
+    # Trigger: the note carries a permalink formed in the source project.
+    # Why: a permalink in the frontmatter is kept as written, so it would keep the source
+    #      project's prefix; without it the target forms one from the new path.
+    # Outcome: the copy has the target's own permalink; every other byte is the source's.
+    content = drop_frontmatter_key(content, "permalink")
     copy = await _write_copy(target, destination_path, entity.title, content, output_format)
 
     # --- Delete the source ---
@@ -186,7 +204,12 @@ async def _move_one(
             output_format=output_format,
             project=source.project.external_id,
         ) from error
-    return MovedNote(previous_file_path=file_path, file_path=copy.file_path)
+    return MovedNote(
+        previous_file_path=file_path,
+        file_path=copy.file_path,
+        previous_permalink=entity.permalink,
+        permalink=copy.permalink,
+    )
 
 
 async def _write_copy(
@@ -323,6 +346,15 @@ async def move_directory_across(
         "destination": target.paths.path(destination),
         "total_files": len(files),
         "moved_files": [target.paths.path(note.file_path) for note in moved],
+        "moved_notes": [
+            {
+                "previous_file_path": source.paths.path(note.previous_file_path),
+                "file_path": target.paths.path(note.file_path),
+                "previous_permalink": note.previous_permalink,
+                "permalink": note.permalink,
+            }
+            for note in moved
+        ],
         "failed": failed,
     }
     # Trigger: some notes moved and some did not (a file that is not a note, a name

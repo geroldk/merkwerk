@@ -17,6 +17,7 @@ from basic_memory.file_utils import (
     FileWriteError,
     ParseError,
     compute_checksum,
+    drop_frontmatter_key,
     file_created_timestamp,
     has_frontmatter,
     parse_frontmatter,
@@ -431,3 +432,45 @@ def test_created_timestamp_without_birthtime_takes_the_earlier_of_ctime_and_mtim
 
     edited_after_chmod = os.stat_result((0,) * 7 + (1.0, 9.0, 5.0))
     assert file_created_timestamp(edited_after_chmod) == 5.0
+
+
+NOTE_WITH_PERMALINK = (
+    "---\ntitle: 'KI-Boom: Reise'\npermalink: personal/main/tasks/x\ntags:\n- a\n"
+    "created: '2026-05-01T08:00:00+02:00'\n---\n\n# Body\npermalink: not a key\n"
+)
+
+
+def test_drop_frontmatter_key_removes_only_that_line():
+    assert drop_frontmatter_key(NOTE_WITH_PERMALINK, "permalink") == (
+        "---\ntitle: 'KI-Boom: Reise'\ntags:\n- a\n"
+        "created: '2026-05-01T08:00:00+02:00'\n---\n\n# Body\npermalink: not a key\n"
+    )
+
+
+def test_drop_frontmatter_key_takes_continuation_lines_and_keeps_crlf_and_bom():
+    note = "\ufeff---\r\ntitle: T\r\npermalink: >-\r\n  a\r\n  b\r\ntype: note\r\n---\r\nBody\r\n"
+    assert drop_frontmatter_key(note, "permalink") == (
+        "\ufeff---\r\ntitle: T\r\ntype: note\r\n---\r\nBody\r\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "# No frontmatter\npermalink: x\n",
+        "---\ntitle: T\n---\nBody\n",  # no such key
+        "---\npermalink: x\nBody without a closing fence\n",
+        "\n\n---\ntitle: T\n---\n",
+        "",
+    ],
+)
+def test_drop_frontmatter_key_leaves_other_content_alone(content):
+    assert drop_frontmatter_key(content, "permalink") == content
+
+
+def test_drop_frontmatter_key_matches_whole_keys_at_the_first_column_only():
+    note = "---\nmy_permalink: a\n  permalink: nested\npermalink : b\n---\n"
+    assert (
+        drop_frontmatter_key(note, "permalink")
+        == "---\nmy_permalink: a\n  permalink: nested\n---\n"
+    )

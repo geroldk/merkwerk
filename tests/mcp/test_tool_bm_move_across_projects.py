@@ -74,6 +74,8 @@ async def test_a_note_moves_into_another_project(client, test_project, second_pr
         "previous_file_path": "notes/plan.md",
         "project": second_project.name,
         "file_path": "inbox/plan.md",
+        "previous_permalink": f"{test_project.permalink}/notes/plan",
+        "permalink": f"{second_project.permalink}/inbox/plan",
     }
     moved = await _read(second_project, "inbox/plan.md")
     assert "- [goal] ship it" in moved["content"]
@@ -81,6 +83,66 @@ async def test_a_note_moves_into_another_project(client, test_project, second_pr
     # A new note there: its own id; the source project no longer has it.
     assert await _note_id(client, second_project, "inbox/plan.md") != source_id
     assert await _missing(test_project, "notes/plan.md")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "source_permalink",
+    ["personal/main/tasks/plan", "main/tasks/plan", "elsewhere/plan"],
+    ids=["personal-main-prefix", "main-prefix", "other-prefix"],
+)
+async def test_the_permalink_is_formed_again_from_the_new_path(
+    client, test_project, second_project, source_permalink
+):
+    note = (
+        f"---\ntitle: Plan\npermalink: {source_permalink}\ntags: [launch]\n"
+        "created: '2026-05-01T08:00:00+02:00'\nmodified: '2026-06-02T09:30:00+02:00'\n---\n\n"
+        "# Plan\n\n- [goal] ship it\n"
+    )
+    written = await _write(test_project, "tasks/plan.md", note)
+    assert written["permalink"] == source_permalink  # the premise: an explicit permalink holds
+
+    result = await bm_move(
+        identifier="tasks/plan.md",
+        destination="aufgaben/plan.md",
+        destination_project=second_project.name,
+        project=test_project.name,
+        output_format="json",
+    )
+
+    assert isinstance(result, dict)
+    new_permalink = f"{second_project.permalink}/aufgaben/plan"
+    assert result["previous_permalink"] == source_permalink
+    assert result["permalink"] == new_permalink
+    content = (await _read(second_project, "aufgaben/plan.md"))["content"]
+    assert f"permalink: {new_permalink}" in content
+    assert source_permalink not in content
+    # Everything else travels as it was written: dates, tags, title and body.
+    assert "created: '2026-05-01T08:00:00+02:00'" in content
+    assert "modified: '2026-06-02T09:30:00+02:00'" in content
+    assert "tags:" in content and "title: Plan" in content
+    assert "# Plan\n\n- [goal] ship it" in content
+
+
+@pytest.mark.asyncio
+async def test_a_permalink_already_owned_in_the_target_gets_a_suffix(
+    client, test_project, second_project
+):
+    wanted = f"{second_project.permalink}/aufgaben/plan"
+    await _write(second_project, "andere/x.md", f"---\ntitle: X\npermalink: {wanted}\n---\n\n# X\n")
+    await _write(test_project, "tasks/plan.md")
+
+    result = await bm_move(
+        identifier="tasks/plan.md",
+        destination="aufgaben/plan.md",
+        destination_project=second_project.name,
+        project=test_project.name,
+        output_format="json",
+    )
+
+    assert isinstance(result, dict)
+    assert result["permalink"] == f"{wanted}-1"
+    assert result["file_path"] == "aufgaben/plan.md"
 
 
 @pytest.mark.asyncio
@@ -111,7 +173,8 @@ async def test_a_trailing_slash_keeps_the_file_name(client, test_project, second
 
     assert text == (
         f"Moved notes/plan.md (project {test_project.name}) to inbox/plan.md "
-        f"(project {second_project.name})"
+        f"(project {second_project.name}); permalink {test_project.permalink}/notes/plan -> "
+        f"{second_project.permalink}/inbox/plan"
     )
     assert (Path(second_project.path) / "inbox/plan.md").exists()
 
@@ -339,6 +402,20 @@ async def test_a_directory_moves_note_by_note(client, test_project, second_proje
     assert result["destination"] == "imported/drafts"
     assert sorted(result["moved_files"]) == ["imported/drafts/a.md", "imported/drafts/deep/b.md"]
     assert result["failed"] == []
+    assert sorted(result["moved_notes"], key=lambda note: note["file_path"]) == [
+        {
+            "previous_file_path": "drafts/a.md",
+            "file_path": "imported/drafts/a.md",
+            "previous_permalink": f"{test_project.permalink}/drafts/a",
+            "permalink": f"{second_project.permalink}/imported/drafts/a",
+        },
+        {
+            "previous_file_path": "drafts/deep/b.md",
+            "file_path": "imported/drafts/deep/b.md",
+            "previous_permalink": f"{test_project.permalink}/drafts/deep/b",
+            "permalink": f"{second_project.permalink}/imported/drafts/deep/b",
+        },
+    ]
     assert "# B" in (await _read(second_project, "imported/drafts/deep/b.md"))["content"]
     assert await _missing(test_project, "drafts/a.md")
     assert await _missing(test_project, "drafts/deep/b.md")

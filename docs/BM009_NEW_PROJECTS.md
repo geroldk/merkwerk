@@ -50,6 +50,30 @@ bare repositories are created if missing, or `ssh://host/dir`). `--merge auto` a
 automatic merging for them. A project not named keeps its settings, and a project may have no
 peer at all. `--remove` removes peer and merge setting of the named projects.
 
+## `bm_move` across projects: the permalink is formed again
+
+A note moved with `destination_project` is written in the target project as a new note, then
+deleted in the source. Until now the copy carried the source's frontmatter verbatim, permalink
+included, so a note moved from `main` into `cobol-ana` kept `personal/main/tasks/...`. A
+gateway refuses addresses that start with another project's name (or `personal`), so such a
+note could not be reached remotely.
+
+* The copy is written **without** its `permalink` key (removed by deleting that one line; no
+  YAML round trip). The target forms the permalink from the new path, exactly as for a note
+  created there: `cobol-ana/aufgaben/jek-...`. An already owned permalink gets a `-1` suffix.
+  Works the same whether the old permalink began with `personal/main/`, `main/` or anything else.
+* This is part of the move, so `created` and `modified` stay as they were (BM-010 rule 4); a
+  later `set_metadata` would renew `modified` on every moved note. Every other frontmatter key
+  and the body travel unchanged. Precondition on the Git host: the note already carries the
+  two keys (the BM-010 backfill), else the copy is dated with the move.
+* The result names both: `previous_permalink` and `permalink`; a directory move lists one entry
+  per note in `moved_notes` (`previous_file_path`, `file_path`, `previous_permalink`,
+  `permalink`). The text form ends with `; permalink OLD -> NEW`.
+* A move inside one project is untouched: it keeps the permalink unless
+  `update_permalinks_on_move` is on (production: off).
+* Links in other notes that name the old permalink are not rewritten (as before); the move
+  procedure lists them (`verweise-*.tsv`).
+
 ## Restore
 
 `bm git restore` now clears `git_sync_merge` together with `git_sync_remotes`; a host refuses
@@ -69,6 +93,13 @@ start.
   history stays (also when it was requested together with an empty one), the default project, the
   last project, foreign files and a running service are refused, and a failure while replacing
   the configuration, or after it, leaves rows, directories and configuration as they were.
+* `tests/mcp/test_tool_bm_move_across_projects.py` and
+  `test-int/test_git_cross_project_move_integration.py`: one case per source prefix
+  (`personal/main/`, `main/`, other); the data stay the same (both times, every other key, the
+  body, SQL instants); a taken permalink gets a suffix; a move inside a project keeps the
+  permalink with `update_permalinks_on_move` off and forms it again with it on. Without the
+  change seven of these fail.
+* `tests/utils/test_file_utils.py`: `drop_frontmatter_key`.
 * `tests/cli/test_git_projects_cli.py`: arguments and refusals of the three commands.
 * Rehearsal on a copy of the real data (7 projects after `create-project haus meldungen`):
   the host starts, all projects `caught_up`, a write in each new project, `haus` syncs to its new

@@ -355,6 +355,46 @@ def remove_frontmatter(content: str, *, strip: bool = True) -> str:
     return body.strip() if strip else body
 
 
+def drop_frontmatter_key(content: str, key: str) -> str:
+    """Remove one top-level key from the frontmatter by deleting its own lines.
+
+    Every other byte of the note stays as it was; a YAML round trip could re-quote or reflow
+    unrelated keys. The key's continuation lines (indented) go with it. Content without
+    frontmatter, with an unclosed fence, or without the key is returned unchanged.
+    """
+    bom = content[: len(content) - len(strip_bom(content))]
+    lines = strip_bom(content).splitlines(keepends=True)
+    start = 0
+    while start < len(lines) and lines[start].strip() == "":
+        start += 1
+    if start >= len(lines) or not _FENCE_RE.match(lines[start].rstrip("\r\n")):
+        return content
+    closing = next(
+        (
+            index
+            for index in range(start + 1, len(lines))
+            if _FENCE_RE.match(lines[index].rstrip("\r\n"))
+        ),
+        None,
+    )
+    if closing is None:
+        return content
+    found = next(
+        (
+            index
+            for index in range(start + 1, closing)
+            if re.match(rf"{re.escape(key)}[ \t]*:", lines[index])
+        ),
+        None,
+    )
+    if found is None:
+        return content
+    end = found + 1
+    while end < closing and lines[end][:1] in {" ", "\t"}:
+        end += 1
+    return bom + "".join(lines[:found] + lines[end:])
+
+
 def _is_frontmatter_mapping(yaml_block: str) -> bool:
     """Whether a fenced block is what every frontmatter reader here accepts: a YAML
     mapping, or empty. The same rule `parse_frontmatter` enforces by raising."""
