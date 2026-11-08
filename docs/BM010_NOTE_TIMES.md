@@ -26,6 +26,12 @@ and, for notes not listed, from the entity row. Without `--apply` it only report
 note it proves that nothing but the two lines was added; an existing value is never
 overwritten; one commit per project.
 
+`--edited-since TIME` (ISO 8601 with offset) says when the TSV values were taken. A note listed
+in a TSV whose bytes changed in the published history after that moment was edited since; its
+`modified` is the time of that change (the commit), not the older TSV value, and the report names
+it. A move (same bytes under a new path) is not a change, so a reorganisation after the snapshot
+cannot re-date a note. `created` always stays the TSV value.
+
 ## Evidence
 
 * `tests/services/test_note_times.py` (rules, text insertion, backfill proof).

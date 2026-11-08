@@ -9,6 +9,11 @@ Source of the times, per note UUID: first the given TSV files (columns ``externa
 ``created_at_db``, ``updated_at_db``; naive values are local time), else the indexed entity row
 in the active profile's database. A note that already has both keys is left alone.
 
+``--edited-since TIME`` (with a UTC offset) says when the TSV values were taken. A note listed
+there whose bytes changed in the published history after that moment was edited since, so its
+``modified`` is the time of that change, not the older TSV value. A move (same bytes under a new
+path) is not a change. Every such note is named in the report.
+
 For every changed note the script proves that nothing but the two keys differs from the
 published bytes. With ``--apply`` it publishes one commit per project; the next service start
 projects it (the SQL times stay the same instants, now taken from the frontmatter).
@@ -21,9 +26,13 @@ import asyncio
 import csv
 import difflib
 from datetime import datetime
+import os
 from pathlib import Path
+import subprocess
 import sys
 from uuid import UUID, uuid4
+
+from typing import Any
 
 from sqlalchemy import select
 
@@ -40,6 +49,59 @@ def read_tsv_times(paths: list[Path]) -> dict[str, tuple[datetime, datetime]]:
                 updated = datetime.fromisoformat(row["updated_at_db"]).astimezone()
                 out[row["external_id"]] = (created, updated)
     return out
+
+
+def last_content_changes(repository: Any) -> dict[str, datetime]:
+    """When the bytes of each note last changed in the published history (first parent).
+
+    Only a note that already existed in the previous commit and has other bytes now counts.
+    A note that first appears (the adoption, or a note created later) and a note moved to
+    another path with the same bytes are not changes.
+    """
+    head = repository.snapshot().commit_id
+    environment = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull}
+    listing = subprocess.run(
+        ["git", "--git-dir", str(repository.path), "rev-list", "--first-parent", "--reverse", head],
+        capture_output=True,
+        check=True,
+        env=environment,
+        timeout=60,
+    ).stdout.decode("ascii")
+    changes: dict[str, datetime] = {}
+    previous: dict[str, str] | None = None
+    for commit in listing.split():
+        snapshot = repository.read_snapshot(commit)
+        committed = repository.committed_at(commit)
+        current = {
+            str(identity): snapshot.files[path]
+            for path, identity in snapshot.manifest.note_ids.items()
+            if path in snapshot.files
+        }
+        if previous is not None:
+            for identity, content in current.items():
+                if identity in previous and previous[identity] != content:
+                    changes[identity] = committed
+        previous = current
+    return changes
+
+
+def resolve_times(
+    key: str,
+    *,
+    listed: dict[str, tuple[datetime, datetime]],
+    rows: dict[str, tuple[datetime, datetime]],
+    changes: dict[str, datetime],
+    since: datetime | None,
+) -> tuple[datetime, datetime, bool] | None:
+    """(created, modified, edited_since_snapshot) for one note, or None without any source."""
+    base = listed.get(key) or rows.get(key)
+    if base is None:
+        return None
+    created, modified = base
+    changed = changes.get(key)
+    if key in listed and since is not None and changed is not None and changed > since:
+        return created, changed.astimezone(), True
+    return created, modified, False
 
 
 def backfilled(markdown: str, created: datetime, updated: datetime) -> str | None:
@@ -93,6 +155,9 @@ async def run(args: argparse.Namespace) -> int:
 
     config = ConfigManager().config
     tsv = read_tsv_times([Path(p) for p in args.tsv or []])
+    since = datetime.fromisoformat(args.edited_since) if args.edited_since else None
+    if since is not None and since.tzinfo is None:
+        raise SystemExit("--edited-since needs a UTC offset, e.g. 2026-11-08T06:44:29+01:00")
     engine, maker = await db.get_or_create_db(
         config.database_path, ensure_migrations=False, config=config
     )
@@ -123,21 +188,34 @@ async def run(args: argparse.Namespace) -> int:
                 snapshot = await asyncio.to_thread(repository.snapshot)
                 files = dict(snapshot.files)
                 note_ids = dict(snapshot.manifest.note_ids)
-                changed = missing = 0
+                changes = (
+                    await asyncio.to_thread(last_content_changes, repository)
+                    if since is not None
+                    else {}
+                )
+                changed = missing = edited = 0
                 for path, content in snapshot.files.items():
                     key = str(note_ids[path])
-                    times = tsv.get(key) or rows.get(key)
+                    times = resolve_times(key, listed=tsv, rows=rows, changes=changes, since=since)
                     if times is None:
                         missing += 1
                         print(f"  no source for {path}")
                         continue
-                    new = backfilled(content, *times)
+                    created_at, modified_at, edited_since = times
+                    if edited_since:
+                        edited += 1
+                        print(
+                            f"  edited since the snapshot: {path} -> modified "
+                            f"{modified_at.isoformat(timespec='seconds')} "
+                            f"(TSV had {tsv[key][1].isoformat(timespec='seconds')})"
+                        )
+                    new = backfilled(content, created_at, modified_at)
                     if new is not None:
                         files[path] = new
                         changed += 1
                 print(
                     f"{project.name}: {len(files)} notes, {changed} to change, "
-                    f"{missing} without a source"
+                    f"{missing} without a source, {edited} edited since the snapshot"
                 )
                 if missing:
                     raise ValueError("notes without a source; nothing published")
@@ -164,6 +242,11 @@ def main() -> int:
     )
     parser.add_argument("--tsv", action="append", help="repeatable; later files win")
     parser.add_argument("--project", action="append", help="repeatable; default: all")
+    parser.add_argument(
+        "--edited-since",
+        metavar="TIME",
+        help="when the TSV values were taken (ISO 8601 with offset); later edits keep their time",
+    )
     parser.add_argument("--apply", action="store_true", help="publish (default: report only)")
     return asyncio.run(run(parser.parse_args()))
 

@@ -1,9 +1,11 @@
 """BM-010: the rules for `created`/`modified` in accepted frontmatter."""
 
 import importlib.util
+from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sys
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -211,3 +213,92 @@ def test_backfill_reads_tsv_with_later_files_winning(tmp_path):
     second.write_text(head + "x\t2026-02-01 10:00:00\t2026-02-02 10:00:00\n")
     times = backfill.read_tsv_times([first, second])
     assert times["x"][0].month == 2 and times["x"][1].day == 2
+
+
+# --- A note edited after the TSV snapshot keeps the time of its edit ---
+
+SNAPSHOT = datetime(2026, 11, 8, 6, 44, 29, tzinfo=timezone(timedelta(hours=1)))
+LISTED = (
+    datetime(2026, 9, 1, 10, tzinfo=timezone.utc),
+    datetime(2026, 9, 23, 11, tzinfo=timezone.utc),
+)
+ROW = (
+    datetime(2026, 11, 1, tzinfo=timezone.utc),
+    datetime(2026, 11, 8, 6, 33, tzinfo=timezone.utc),
+)
+
+
+def test_a_listed_note_edited_after_the_snapshot_takes_the_time_of_the_edit():
+    edit = SNAPSHOT + timedelta(hours=6)
+    resolved = backfill.resolve_times(
+        "n", listed={"n": LISTED}, rows={"n": ROW}, changes={"n": edit}, since=SNAPSHOT
+    )
+    assert resolved == (LISTED[0], edit, True)  # created stays the TSV value
+
+
+@pytest.mark.parametrize(
+    ("changes", "since"),
+    [
+        ({}, SNAPSHOT),  # never changed: a move leaves the TSV value standing
+        ({"n": SNAPSHOT - timedelta(hours=1)}, SNAPSHOT),  # changed before the snapshot
+        ({"n": SNAPSHOT + timedelta(hours=1)}, None),  # no snapshot time given: TSV as before
+    ],
+)
+def test_otherwise_the_tsv_value_stands(changes, since):
+    resolved = backfill.resolve_times(
+        "n", listed={"n": LISTED}, rows={"n": ROW}, changes=changes, since=since
+    )
+    assert resolved == (*LISTED, False)
+
+
+def test_a_note_that_is_not_listed_takes_the_row_even_if_it_changed():
+    later = {"n": SNAPSHOT + timedelta(hours=1)}
+    resolved = backfill.resolve_times(
+        "n", listed={}, rows={"n": ROW}, changes=later, since=SNAPSHOT
+    )
+    assert resolved == (*ROW, False)
+    assert backfill.resolve_times("n", listed={}, rows={}, changes=later, since=SNAPSHOT) is None
+
+
+@pytest.mark.asyncio
+async def test_the_history_tells_an_edit_from_a_move_and_from_an_untouched_note(tmp_path):
+    import time
+
+    from basic_memory.repository.git_project_repository import (
+        GitProjectRepository,
+        settle_git_publication,
+    )
+
+    repository = GitProjectRepository.create(tmp_path / "p.git")
+    edited, moved, untouched = uuid4(), uuid4(), uuid4()
+
+    async def publish(files: Mapping[str, str], ids: Mapping[str, UUID], message: str) -> None:
+        prepared = repository.prepare(
+            transaction_id=uuid4(),
+            base_commit=repository.snapshot().commit_id,
+            files=files,
+            note_ids=ids,
+            message=message,
+        )
+        await settle_git_publication(repository, prepared)
+
+    ids = {"a.md": edited, "b.md": moved, "c.md": untouched}
+    files = {"a.md": "# a\n", "b.md": "# b\n", "c.md": "# c\n"}
+    await publish(files, ids, "adopt")
+    first_commit = repository.snapshot().commit_id
+    time.sleep(1.1)
+    before_edit = datetime.now(timezone.utc)
+    time.sleep(1.1)
+    await publish({**files, "a.md": "# a changed\n"}, ids, "edit")
+    time.sleep(1.1)
+    await publish(
+        {"a.md": "# a changed\n", "folder/b.md": "# b\n", "c.md": "# c\n"},
+        {"a.md": edited, "folder/b.md": moved, "c.md": untouched},
+        "move",
+    )
+
+    changes = backfill.last_content_changes(repository)
+
+    assert set(changes) == {str(edited)}  # the move and the untouched note are no changes
+    assert changes[str(edited)] > before_edit
+    assert changes[str(edited)] > repository.committed_at(first_commit)
