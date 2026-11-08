@@ -1,0 +1,6 @@
+#!/bin/sh
+# Starts bm_notify.py (next to this file) with the Python of Basic Memory's own uv tool, which
+# has fastmcp. BM_PYTHON overrides the interpreter. Reads the report on standard input.
+here=$(cd "$(dirname "$0")" && pwd)
+python="${BM_PYTHON:-$HOME/.local/share/uv/tools/basic-memory/bin/python}"
+exec "$python" "$here/bm_notify.py" "$@"

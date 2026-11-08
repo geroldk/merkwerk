@@ -17,8 +17,11 @@ What counts as needing attention:
 * The service itself not answering counts as a transport failure for every project.
 
 A problem is reported once when it appears and once when it clears, not on every run.
-The report goes to stdout/stderr and, if given, to ``--notify-cmd`` on its standard input.
+The report goes to stderr and, if given, to ``--notify-cmd`` on its standard input.
 Exit status: 0 nothing to do, 3 at least one project needs attention.
+
+What differs from machine to machine (service URL, projects to visit, tolerance, state file) is
+read from the host settings file (``bm_host_settings.py``); a flag on the command line wins.
 """
 
 from __future__ import annotations
@@ -156,11 +159,17 @@ async def run_once(
     return messages, attention
 
 
-def notify(command: str | None, messages: list[str]) -> None:
+def notify(command: str | None, messages: list[str], *, always: bool = False) -> None:
+    """Print the report and hand it to the notify command.
+
+    With ``always`` the command also runs when there is nothing new to say (empty input), so a
+    command that keeps a queue can deliver what is waiting as soon as its target is back.
+    """
     text = "\n".join(messages)
-    print(text, file=sys.stderr)
-    if command and messages:
-        subprocess.run(command, shell=True, input=text.encode(), check=False, timeout=60)
+    if messages:
+        print(text, file=sys.stderr)
+    if command and (messages or always):
+        subprocess.run(command, shell=True, input=text.encode(), check=False, timeout=120)
 
 
 class McpTransport:  # pragma: no cover
@@ -207,29 +216,87 @@ class McpTransport:  # pragma: no cover
         return [entry["name"] for entry in answer["projects"]]
 
 
+SERVICE = "dienst"  # reported in place of a project when nothing else is known
+
+
+async def service_down(project: str) -> dict[str, Any]:
+    """Stands in for the sync call while the service does not answer at all."""
+    raise ConnectionError("the Basic Memory service does not answer")
+
+
+def projects_to_visit(
+    configured: tuple[str, ...] | None, listed: list[str] | None, state: dict[str, Any]
+) -> list[str]:
+    """The projects to sync: the configured ones, else what the service lists.
+
+    With the service down and nothing configured, the projects seen on earlier passes (the
+    state file) stand in, so their failures are counted; with no history at all the service
+    itself is the one thing to report.
+    """
+    if configured:
+        return list(configured)
+    if listed is not None:
+        return listed
+    return [name for name, entry in state.items() if isinstance(entry, dict)] or [SERVICE]
+
+
 async def main_async(args: argparse.Namespace) -> int:  # pragma: no cover
-    async with McpTransport(args.url) as transport:
-        projects = args.project or await transport.names()
-        state_path = Path(args.state)
-        state = load_state(state_path)
+    from contextlib import AsyncExitStack
+
+    from bm_host_settings import load_host_settings, resolve_sync_options
+
+    settings = load_host_settings(args.settings)
+    options = resolve_sync_options(
+        settings,
+        url=args.url,
+        state=args.state,
+        tolerate=args.tolerate,
+        projects=args.project,
+    )
+    state = load_state(options.state)
+    async with AsyncExitStack() as stack:
+        call: SyncCall = service_down
+        listed: list[str] | None = None
+        try:
+            transport = await stack.enter_async_context(McpTransport(options.url))
+            listed = None if options.projects else await transport.names()
+            call = transport.sync
+        except Exception as error:  # the service itself does not answer: a failure per project
+            print(f"git_sync_watch: service not reachable: {error}", file=sys.stderr)
         messages, attention = await run_once(
-            projects, transport.sync, state, tolerate=args.tolerate
+            projects_to_visit(options.projects, listed, state),
+            call,
+            state,
+            tolerate=options.tolerate,
         )
-        save_state(state_path, state)
-    notify(args.notify_cmd, messages)
+    save_state(options.state, state)
+    notify(args.notify_cmd, messages, always=args.notify_always)
     return 3 if attention else 0
 
 
 def main() -> int:  # pragma: no cover
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from bm_host_settings import SettingsError
+
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawTextHelpFormatter
     )
-    parser.add_argument("--url", default="http://127.0.0.1:8765/mcp")
-    parser.add_argument("--state", default=str(Path.home() / ".local/state/bm-git-sync/state.json"))
-    parser.add_argument("--project", action="append", help="repeatable; default: all projects")
-    parser.add_argument("--tolerate", type=int, default=3, help="failures before 'unreachable'")
+    parser.add_argument("--settings", help="host settings file (see bm_host_settings.py)")
+    parser.add_argument("--url", help="service URL; default from the settings")
+    parser.add_argument("--state", help="state file; default from the settings")
+    parser.add_argument("--project", action="append", help="repeatable; default: from the settings")
+    parser.add_argument("--tolerate", type=int, help="failures before 'unreachable'")
     parser.add_argument("--notify-cmd", help="shell command that reads the report on stdin")
-    return asyncio.run(main_async(parser.parse_args()))
+    parser.add_argument(
+        "--notify-always",
+        action="store_true",
+        help="run the notify command on every pass, with an empty report if nothing is new",
+    )
+    try:
+        return asyncio.run(main_async(parser.parse_args()))
+    except SettingsError as error:
+        print(f"Refused: {error}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

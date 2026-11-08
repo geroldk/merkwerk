@@ -5,9 +5,12 @@ After=basic-memory-mcp.service
 
 [Service]
 Type=oneshot
-# The tool's own Python has fastmcp. REPO is the checkout that holds scripts/git_sync_watch.py.
-ExecStart=%h/.local/share/uv/tools/basic-memory/bin/python %h/bm/code/basic-memory/scripts/git_sync_watch.py \
-  --notify-cmd "%h/bm/bin/bm-notify"
+# The tool's own Python has fastmcp. The scripts are fixed copies in ~/bm/bin (git_sync_watch.py,
+# bm_host_settings.py, bm_notify.py, bm-notify), not the working tree of a checkout. What differs
+# per machine (host name, projects, notify project) is in ~/.config/merkwerk/host.json.
+# --notify-always lets bm-notify deliver queued messages even when nothing new is reported.
+ExecStart=%h/.local/share/uv/tools/basic-memory/bin/python %h/bm/bin/git_sync_watch.py \
+  --notify-cmd "%h/bm/bin/bm-notify" --notify-always
 # Exit status 3 means: at least one project needs a person. Systemd then lists the unit as failed.
 SuccessExitStatus=0
 TimeoutStartSec=300

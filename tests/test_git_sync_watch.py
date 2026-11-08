@@ -171,3 +171,46 @@ async def test_an_offline_hiccup_keeps_an_open_review_open() -> None:
 )
 def test_the_services_busy_wording_is_recognized(text: str, busy: bool) -> None:
     assert watch.is_busy(text) is busy
+
+
+def test_the_notify_command_runs_for_news_and_with_always_also_for_none(tmp_path, capsys) -> None:
+    seen = tmp_path / "seen"
+    command = f"cat > {seen}; echo ran >> {tmp_path}/runs"
+
+    watch.notify(command, [])  # nothing new, no `always`: the command stays quiet
+    assert not (tmp_path / "runs").exists()
+
+    watch.notify(command, ["[BM sync] main: needs_review (x)"])
+    assert seen.read_text() == "[BM sync] main: needs_review (x)"
+    assert capsys.readouterr().err == "[BM sync] main: needs_review (x)\n"
+
+    watch.notify(command, [], always=True)  # a queue-keeping command gets an empty pass
+    assert seen.read_text() == ""
+    assert (tmp_path / "runs").read_text() == "ran\nran\n"
+    assert capsys.readouterr().err == ""
+
+    watch.notify(None, ["[BM sync] pkm: diverged (y)"], always=True)  # no command, nothing runs
+    assert (tmp_path / "runs").read_text() == "ran\nran\n"
+
+
+@pytest.mark.asyncio
+async def test_a_service_that_does_not_answer_is_reported_once_per_project_after_the_limit() -> (
+    None
+):
+    state: dict[str, Any] = {}
+    names = ["main", "pkm"]
+    for expected in (0, 0, 2):
+        messages, attention = await watch.run_once(names, watch.service_down, state, tolerate=3)
+        assert len(messages) == expected
+    assert "[BM sync] main: unreachable:transport (3 failures in a row)" in messages
+    assert attention == 2
+    again, _ = await watch.run_once(names, watch.service_down, state, tolerate=3)
+    assert again == []  # reported once, not on every pass
+
+
+def test_the_projects_to_visit_fall_back_to_what_was_seen_before() -> None:
+    state = {"main": {"problem": None, "failures": 1}, "other": "not a project entry"}
+    assert watch.projects_to_visit(("a", "b"), ["x"], state) == ["a", "b"]  # configured wins
+    assert watch.projects_to_visit(None, ["x", "y"], state) == ["x", "y"]  # what the service lists
+    assert watch.projects_to_visit(None, None, state) == ["main"]  # service down: the history
+    assert watch.projects_to_visit(None, None, {}) == [watch.SERVICE]  # nothing known at all

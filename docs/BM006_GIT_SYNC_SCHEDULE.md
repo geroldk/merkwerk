@@ -10,6 +10,9 @@ schedule. Nothing here is installed automatically.
   by a second process. Projects without a peer (`409 No Git peer`) are skipped, a sync already in
   progress for the project is skipped until the next pass.
 - `deploy/systemd/bm-git-sync.{service,timer}`: templates for a user timer, every 5 minutes.
+- Per-machine settings (host name, projects to visit, notify project) and `bm-notify`, which turns
+  a report into notes and keeps a queue while the service is away: see
+  [BM009_HOST_SETTINGS.md](BM009_HOST_SETTINGS.md).
 
 ## What is reported
 
