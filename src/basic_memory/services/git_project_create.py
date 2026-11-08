@@ -16,8 +16,9 @@ import re
 import shutil
 import signal
 import stat
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -166,8 +167,11 @@ def _write_config_atomically(path: Path, data: dict[str, object]) -> None:
     write_config_text_atomically(path, json.dumps(data, indent=2))
 
 
+_guard_disarm: ContextVar[Callable[[], None] | None] = ContextVar("termination_guard", default=None)
+
+
 @contextmanager
-def cancel_on_termination() -> Iterator[None]:
+def cancel_on_termination() -> Iterator[Callable[[], None]]:
     """Turn SIGTERM, SIGHUP and SIGINT into one cancellation of the running task.
 
     Without it a closed terminal or a `kill` ends the process between two steps, past the
@@ -176,16 +180,28 @@ def cancel_on_termination() -> Iterator[None]:
 
     Only the first signal cancels. A second one (an impatient Ctrl-C, a repeated `kill`) is
     ignored, because it would cancel the awaits of the rollback itself and leave it half done.
-    Handlers are removed when the block ends; SIGKILL, a power cut and an out-of-memory kill
-    cannot be caught at all.
+    The block yields ``disarm``: the code that starts a rollback calls it first, so a signal that
+    is still queued (a Ctrl-C also kills a `git` child of a synchronous step, whose failure then
+    reaches the rollback before the loop has handled the signal) cannot cancel the rollback.
+    Nested use shares the outer guard. Handlers are removed when the block ends and the previous
+    ones put back; SIGKILL, a power cut and an out-of-memory kill cannot be caught at all.
     """
+    outer = _guard_disarm.get()
+    if outer is not None:  # an outer guard owns the handlers
+        yield outer
+        return
     loop = asyncio.get_running_loop()
     task = asyncio.current_task()
     installed: list[signal.Signals] = []
     previous: dict[signal.Signals, Any] = {}  # asyncio.run keeps its own SIGINT handler
+    armed = True
+
+    def disarm() -> None:
+        nonlocal armed
+        armed = False
 
     def cancel_once() -> None:
-        if task is not None and not task.cancelling():
+        if armed and task is not None and not task.cancelling():
             task.cancel()
 
     if task is not None:
@@ -197,9 +213,11 @@ def cancel_on_termination() -> Iterator[None]:
                 installed.append(number)
             except (NotImplementedError, RuntimeError, ValueError):  # not the main thread
                 continue
+    token = _guard_disarm.set(disarm)
     try:
-        yield
+        yield disarm
     finally:
+        _guard_disarm.reset(token)
         for number in installed:
             loop.remove_signal_handler(number)
             if previous[number] is not None:
@@ -234,9 +252,13 @@ async def create_git_projects(
     failure (a second signal is ignored while it runs); only SIGKILL, a power cut or an
     out-of-memory kill can leave a half-made state (the runbook takes a backup first for that).
     """
-    with cancel_on_termination():
+    with cancel_on_termination() as disarm:
         return await _create_git_projects(
-            requests, base_dir=base_dir, repositories_dir=repositories_dir, manager=manager
+            requests,
+            base_dir=base_dir,
+            repositories_dir=repositories_dir,
+            manager=manager,
+            disarm=disarm,
         )
 
 
@@ -246,6 +268,7 @@ async def _create_git_projects(
     base_dir: Path,
     repositories_dir: Path,
     manager: ConfigManager | None,
+    disarm: Callable[[], None],
 ) -> list[CreatedGitProject]:
     manager = manager or ConfigManager()
     config_file = Path(manager.config_file)
@@ -319,6 +342,7 @@ async def _create_git_projects(
         BasicMemoryConfig.model_validate(raw)  # the profile that will be written must load
         _write_config_atomically(config_file, raw)
     except BaseException:
+        disarm()  # a signal still queued must not cancel the rollback
         await _roll_back(maker, registered_ids, made_paths)
         raise
     return created

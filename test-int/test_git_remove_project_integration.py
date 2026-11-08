@@ -269,3 +269,28 @@ async def test_the_configuration_follows_the_database_when_the_commit_landed_or_
         maker, removed, config_manager.config_file, new_raw, old_text
     )
     assert json.loads(config_manager.config_file.read_text()) == new_raw
+
+
+@pytest.mark.asyncio
+async def test_the_directories_are_deleted_outside_the_signal_guard(
+    host_setup, config_manager, tmp_path, monkeypatch
+):
+    """After the commit the projects are gone for good: a signal while the directories are
+    deleted must not be answered with a cancellation that claims a rollback."""
+    from basic_memory.services import git_project_create
+
+    created = await create(tmp_path, config_manager, "haus")
+    await db.shutdown_db()
+    seen: list[object] = []
+    real_remove = git_project_remove._remove_directories
+
+    def watching(
+        item: git_project_remove.RemovedGitProject,
+    ) -> git_project_remove.RemovedGitProject:
+        seen.append(git_project_create._guard_disarm.get())  # None: no guard is active here
+        return real_remove(item)
+
+    monkeypatch.setattr(git_project_remove, "_remove_directories", watching)
+    removed = await remove_empty_git_projects(["haus"], manager=config_manager)
+    assert seen == [None] and not removed[0].leftovers
+    assert not created[0].path.exists()

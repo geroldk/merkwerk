@@ -14,7 +14,7 @@ removed after that; a directory that cannot be removed is reported, not hidden.
 import asyncio
 import json
 import shutil
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -101,12 +101,16 @@ async def remove_empty_git_projects(
     manager: ConfigManager | None = None,
 ) -> list[RemovedGitProject]:
     """Remove the named, still empty projects, or leave the installation as it was."""
-    with cancel_on_termination():
-        return await _remove_empty_git_projects(names, manager=manager)
+    with cancel_on_termination() as disarm:
+        removed = await _remove_empty_git_projects(names, manager=manager, disarm=disarm)
+    # Outside the guard: the projects are gone from the database and the configuration by now,
+    # so a signal here must not claim that "the changes were rolled back". It leaves, at worst,
+    # directories behind (reported by the next run's refusal, removable by hand).
+    return [await asyncio.to_thread(_remove_directories, item) for item in removed]
 
 
 async def _remove_empty_git_projects(
-    names: Iterable[str], *, manager: ConfigManager | None
+    names: Iterable[str], *, manager: ConfigManager | None, disarm: Callable[[], None]
 ) -> list[RemovedGitProject]:
     manager = manager or ConfigManager()
     config_file = Path(manager.config_file)
@@ -214,9 +218,10 @@ async def _remove_empty_git_projects(
         # while the commit is awaited cannot stop aiosqlite's thread from finishing it: then
         # the rows are gone and the new configuration must stay (or be written again), else
         # the service would find projects in the configuration that have no row.
+        disarm()  # a signal still queued must not cancel the settling
         await _settle_configuration(maker, removed, config_file, raw, raw_text)
         raise
-    return [await asyncio.to_thread(_remove_directories, item) for item in removed]
+    return removed
 
 
 async def _settle_configuration(

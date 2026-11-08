@@ -67,8 +67,13 @@ def _create_local_peer(url: str) -> Path | None:
             check=False,
             timeout=30,
         )
+        if result.returncode < 0:  # e.g. the same Ctrl-C that reached us killed the child
+            raise GitProjectCreateError(f"git init was ended by signal {-result.returncode}")
         if result.returncode != 0:
-            raise GitProjectCreateError(result.stderr.decode("utf-8", errors="replace"))
+            raise GitProjectCreateError(
+                result.stderr.decode("utf-8", errors="replace").strip()
+                or f"git init failed with exit code {result.returncode}"
+            )
     except BaseException:
         shutil.rmtree(topmost, ignore_errors=True)
         raise

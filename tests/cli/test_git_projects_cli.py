@@ -167,3 +167,22 @@ def test_a_cancellation_by_signal_says_that_the_changes_were_rolled_back(monkeyp
         result = CliRunner().invoke(app, ["git", *arguments])
         assert result.exit_code == 130, arguments
         assert "Cancelled by a signal; the changes were rolled back." in result.output
+
+
+def test_ctrl_c_outside_the_protected_section_says_that_the_outcome_is_unknown(monkeypatch):
+    async def interrupted(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("basic_memory.services.git_project_create.create_git_projects", interrupted)
+    monkeypatch.setattr(
+        "basic_memory.services.git_project_remove.remove_empty_git_projects", interrupted
+    )
+    monkeypatch.setattr("basic_memory.services.git_peer_setup.setup_git_peers", interrupted)
+    for arguments in (
+        ["create-project", "haus"],
+        ["remove-project", "haus"],
+        ["peer-setup", "haus", "--peer", "/p"],
+    ):
+        result = CliRunner().invoke(app, ["git", *arguments])
+        assert result.exit_code == 130, arguments
+        assert "the outcome is unknown" in result.output

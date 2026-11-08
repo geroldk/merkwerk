@@ -109,6 +109,15 @@ def create_project(
     except asyncio.CancelledError:
         typer.echo("Cancelled by a signal; the changes were rolled back.", err=True)
         raise typer.Exit(130) from None
+    except KeyboardInterrupt:
+        # Ctrl-C outside the protected section (before it started, or while the event loop shut
+        # down): the outcome is not known.
+        typer.echo(
+            "Interrupted outside the protected section; the outcome is unknown. "
+            "Check `bm project list` and config.json.",
+            err=True,
+        )
+        raise typer.Exit(130) from None
     for item in created:
         typer.echo(f"{item.name}: {item.project_id} root={item.path} repository={item.repository}")
     typer.echo(
@@ -135,6 +144,15 @@ def remove_project(
         raise typer.Exit(1) from error
     except asyncio.CancelledError:
         typer.echo("Cancelled by a signal; the changes were rolled back.", err=True)
+        raise typer.Exit(130) from None
+    except KeyboardInterrupt:
+        # Ctrl-C outside the protected section (before it started, or while the event loop shut
+        # down): the outcome is not known.
+        typer.echo(
+            "Interrupted outside the protected section; the outcome is unknown. "
+            "Check `bm project list` and config.json.",
+            err=True,
+        )
         raise typer.Exit(130) from None
     for item in removed:
         typer.echo(f"{item.name}: removed ({item.project_id})")
@@ -176,6 +194,15 @@ def peer_setup(
         raise typer.Exit(1) from error
     except asyncio.CancelledError:
         typer.echo("Cancelled by a signal; the changes were rolled back.", err=True)
+        raise typer.Exit(130) from None
+    except KeyboardInterrupt:
+        # Ctrl-C outside the protected section (before it started, or while the event loop shut
+        # down): the outcome is not known.
+        typer.echo(
+            "Interrupted outside the protected section; the outcome is unknown. "
+            "Check `bm project list` and config.json.",
+            err=True,
+        )
         raise typer.Exit(130) from None
     for change in changes:
         target = f"{change.url} merge={change.merge}" if change.url else "no peer"

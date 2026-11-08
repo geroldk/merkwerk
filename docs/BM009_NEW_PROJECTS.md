@@ -24,7 +24,11 @@ commit, the binding markers a backup needs, and the `projects` / `git_repositori
   of the old one (a new file starts at 0600), also when `remove-project` puts the old text back
   and for `peer-setup`. The configuration can hold credentials.
 * **Signals:** SIGTERM, SIGHUP and SIGINT (a `kill`, a closed terminal, Ctrl-C) cancel the work and
-  reach the rollback like any other failure; a second signal is ignored while the rollback runs. The
+  reach the rollback like any other failure; a second signal is ignored while the rollback runs, and the
+  guard is disarmed before a rollback starts (a Ctrl-C also kills the `git` child of a synchronous step; the
+  step then fails for its own reason while the signal is still queued, and must not cancel the rollback).
+  `remove-project` deletes the directories after the guard: a signal there leaves directories behind at
+  worst, never a claim of a rollback. Ctrl-C outside the protected section prints "the outcome is unknown". The
   command then prints `Cancelled by a signal; the changes were rolled back.` and exits 130. `remove-project`
   decides which configuration is right by the database (a cancellation during the commit cannot stop
   the commit). Only SIGKILL, a power cut or an out-of-memory kill can leave a

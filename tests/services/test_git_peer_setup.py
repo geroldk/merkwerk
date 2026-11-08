@@ -71,3 +71,22 @@ def test_a_timeout_of_git_init_also_removes_what_the_call_made(tmp_path, monkeyp
     with pytest.raises(subprocess.TimeoutExpired):
         _create_local_peer(str(tmp_path / "new" / "main.git"))
     assert not (tmp_path / "new").exists()
+
+
+def test_a_child_ended_by_a_signal_is_reported_as_such_and_cleaned_up(tmp_path, monkeypatch):
+    def killed(*args, **kwargs):
+        return subprocess.CompletedProcess(args, -2, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(git_peer_setup.subprocess, "run", killed)
+    with pytest.raises(GitProjectCreateError, match="ended by signal 2"):
+        _create_local_peer(str(tmp_path / "new" / "main.git"))
+    assert not (tmp_path / "new").exists()
+
+
+def test_a_failed_git_init_without_a_message_still_says_why(tmp_path, monkeypatch):
+    def silent(*args, **kwargs):
+        return subprocess.CompletedProcess(args, 128, stdout=b"", stderr=b"  \n")
+
+    monkeypatch.setattr(git_peer_setup.subprocess, "run", silent)
+    with pytest.raises(GitProjectCreateError, match="exit code 128"):
+        _create_local_peer(str(tmp_path / "new" / "main.git"))

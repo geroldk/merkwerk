@@ -192,3 +192,59 @@ async def test_a_second_signal_does_not_cancel_the_rollback():
                 steps.append("rollback step 2")
                 raise
     assert steps == ["rollback step 1", "rollback step 2"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("number", [signal.SIGINT, signal.SIGHUP])
+async def test_a_signal_still_queued_when_a_synchronous_step_fails_does_not_cancel_the_rollback(
+    number,
+):
+    """A Ctrl-C or a closed terminal also kills the `git` child of a synchronous step, so the step
+    fails for its own reason while the signal waits in the loop. The rollback must still finish."""
+    from basic_memory.services.git_project_create import cancel_on_termination
+
+    steps: list[str] = []
+    with cancel_on_termination() as disarm:
+        with pytest.raises(RuntimeError, match="git died"):
+            try:
+                os.kill(os.getpid(), number)  # queued: the loop has not run yet
+                raise RuntimeError("git died")  # the synchronous step fails first, no await between
+            except BaseException:
+                disarm()  # what the tools do before they roll back
+                await asyncio.sleep(0.05)  # the first await of the rollback: the signal lands here
+                steps.append("rollback step 1")
+                await asyncio.sleep(0)
+                steps.append("rollback step 2")
+                raise
+    assert steps == ["rollback step 1", "rollback step 2"]
+
+
+@pytest.mark.asyncio
+async def test_without_disarming_the_queued_signal_would_cancel_the_rollback():
+    """The control for the test above: this is what the review reproduced."""
+    from basic_memory.services.git_project_create import cancel_on_termination
+
+    steps: list[str] = []
+    with cancel_on_termination():
+        with pytest.raises(asyncio.CancelledError):
+            try:
+                os.kill(os.getpid(), signal.SIGINT)
+                raise RuntimeError("git died")
+            except RuntimeError:
+                await asyncio.sleep(0.05)
+                steps.append("rollback step 1")
+    assert steps == []
+
+
+@pytest.mark.asyncio
+async def test_a_nested_guard_shares_the_outer_handlers_and_leaves_them_in_place():
+    from basic_memory.services.git_project_create import cancel_on_termination
+
+    before = signal.getsignal(signal.SIGTERM)
+    with cancel_on_termination() as outer:
+        with cancel_on_termination() as inner:
+            assert inner is outer  # the same switch, so disarming it reaches both
+        with pytest.raises(asyncio.CancelledError):  # the outer guard still works afterwards
+            os.kill(os.getpid(), signal.SIGTERM)
+            await asyncio.sleep(5)
+    assert signal.getsignal(signal.SIGTERM) == before
