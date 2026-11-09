@@ -73,6 +73,8 @@ async def test_overwrite_prefers_replacement_at_exact_path(
             "output_format": "json",
         }
         await client.call_tool("bm_write", arguments)
+        # The note that moved away still has the title; the replacement is meant to share it.
+        arguments_again = {**arguments, "allow_duplicate_title": True}
         await client.call_tool(
             "bm_move",
             {
@@ -84,10 +86,10 @@ async def test_overwrite_prefers_replacement_at_exact_path(
         moved = Path(test_project.path) / "app/probe/SKILL.md"
         original = moved.read_bytes()
         await client.call_tool(
-            "bm_write", {**arguments, "content": "Replacement", "overwrite": False}
+            "bm_write", {**arguments_again, "content": "Replacement", "overwrite": False}
         )
         result = await client.call_tool(
-            "bm_write", {**arguments, "content": "Updated replacement", "overwrite": True}
+            "bm_write", {**arguments_again, "content": "Updated replacement", "overwrite": True}
         )
         assert result.content[0].type == "text"
         assert json.loads(result.content[0].text)["action"] == "updated"

@@ -133,10 +133,8 @@ async def test_write_note_update_existing(mcp_server, app, test_project):
 
 
 @pytest.mark.asyncio
-async def test_write_note_overwrite_preserves_path_when_permalink_changes(
-    mcp_server, app, test_project
-):
-    """A custom permalink replacement still updates the exact requested file."""
+async def test_write_note_overwrite_refuses_a_changed_permalink(mcp_server, app, test_project):
+    """A replacement naming another permalink is refused (P3)."""
     async with Client(mcp_server) as client:
         created = await client.call_tool(
             "bm_write",
@@ -163,7 +161,8 @@ async def test_write_note_overwrite_preserves_path_when_permalink_changes(
             Replacement body.
         """).strip()
 
-        updated = await client.call_tool(
+        # A permalink changes only by design: the replacement is refused and nothing changes.
+        refused = await client.call_tool(
             "bm_write",
             {
                 "project": test_project.name,
@@ -173,25 +172,24 @@ async def test_write_note_overwrite_preserves_path_when_permalink_changes(
                 "overwrite": True,
                 "output_format": "json",
             },
+            raise_on_error=False,
         )
-        updated_payload = _json_content(updated)
-        assert updated_payload["action"] == "updated"
-        assert updated_payload["permalink"] == "overwrite-conflicts/custom-overwrite-permalink"
-        assert updated_payload["file_path"] == "overwrite-conflicts/Overwrite Permalink Change.md"
+        assert refused.is_error
+        assert "cannot be changed by writing or editing" in refused.content[0].text
 
-        read_updated = await client.call_tool(
+        read_back = await client.call_tool(
             "bm_read",
             {
                 "project": test_project.name,
-                "identifier": "overwrite-conflicts/custom-overwrite-permalink",
+                "identifier": created_payload["permalink"],
                 "output_format": "json",
                 "include_frontmatter": False,
             },
         )
-        read_payload = _json_content(read_updated)
-        assert read_payload["permalink"] == "overwrite-conflicts/custom-overwrite-permalink"
-        assert "Replacement body." in read_payload["content"]
-        assert "Original body." not in read_payload["content"]
+        read_payload = _json_content(read_back)
+        assert read_payload["permalink"] == created_payload["permalink"]
+        assert "Original body." in read_payload["content"]
+        assert "Replacement body." not in read_payload["content"]
 
 
 @pytest.mark.asyncio

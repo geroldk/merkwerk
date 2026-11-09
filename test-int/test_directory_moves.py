@@ -74,7 +74,10 @@ async def test_directory_move_reports_a_refused_note_and_moves_the_rest(
     for title, directory in (("Clash", "drafts"), ("Fine", "drafts"), ("Clash", "archive")):
         created = await client.post(
             f"{base}/write",
-            json={"note": {"title": title, "directory": directory, "content": title}},
+            json={
+                "note": {"title": title, "directory": directory, "content": title},
+                "allow_duplicate_title": True,
+            },
         )
         assert created.json()["kind"] == "created", created.text
 
