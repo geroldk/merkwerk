@@ -562,3 +562,36 @@ async def test_replacing_a_note_keeps_its_own_title(client, test_project):
     )
 
     assert replaced["action"] == "updated"
+
+
+@pytest.mark.asyncio
+async def test_the_title_comparison_folds_non_ascii_capitals(client, test_project):
+    await bm_write(title="Übersicht", directory="a", content="One", project=test_project.name)
+
+    with pytest.raises(ToolError, match="^ALREADY_EXISTS:.*Übersicht"):
+        await bm_write(title="übersicht", directory="b", content="Two", project=test_project.name)
+
+
+@pytest.mark.asyncio
+async def test_a_create_by_title_checks_the_requested_title_not_the_text_title(
+    client, test_project
+):
+    await bm_write(title="Plan", directory="archive", content="One", project=test_project.name)
+    await bm_write(title="Draft", directory="archive", content="Two", project=test_project.name)
+
+    # The note is stored as "Fresh Idea"; "Draft" in its text is not its title.
+    created = await write_json(
+        title="Fresh Idea",
+        directory="notes",
+        content="---\ntitle: Draft\n---\nbody",
+        project=test_project.name,
+    )
+    assert created["action"] == "created"
+    # The note is stored as "Plan" although its text says "Other": that repeats a title.
+    with pytest.raises(ToolError, match="^ALREADY_EXISTS:.*Plan"):
+        await bm_write(
+            title="Plan",
+            directory="notes",
+            content="---\ntitle: Other\n---\nbody",
+            project=test_project.name,
+        )

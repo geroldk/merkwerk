@@ -3156,3 +3156,27 @@ async def test_placement_refuses_paths_outside_the_project_without_probing(
     # The first reading that escapes is reported; with a traversal the literal one can
     # escape too, so either reading may be the one named.
     assert body["path"] in body["readings"]
+
+
+@pytest.mark.asyncio
+async def test_put_rename_that_restates_the_permalink_keeps_it(client, v2_project_url):
+    """A rename whose text repeats the note's own permalink line must not become `<old>-1` (P3)."""
+    created = await client.post(
+        f"{v2_project_url}/knowledge/entities",
+        json={"title": "Renamer", "directory": "notes", "content": "Body"},
+    )
+    entity = EntityResponseV2.model_validate(created.json())
+    permalink = entity.permalink
+
+    response = await client.put(
+        f"{v2_project_url}/knowledge/entities/{entity.external_id}",
+        json={
+            "title": "Renamer",
+            "directory": "archive",
+            "content": f"---\npermalink: {permalink}\n---\nBody again",
+        },
+        params={"fast": False},
+    )
+
+    assert response.status_code == 202, response.text
+    assert EntityResponseV2.model_validate(response.json()).permalink == permalink

@@ -356,6 +356,7 @@ async def _resolve_schema_permalink(
     current_permalink: str | None = None,
     content_markdown: EntityMarkdown | None = None,
     skip_conflict_check: bool = False,
+    current_file_path: str | None = None,
     session: AsyncSession | None = None,
 ) -> str:
     if current_permalink and not (content_markdown and content_markdown.frontmatter.permalink):
@@ -366,6 +367,7 @@ async def _resolve_schema_permalink(
         file_path,
         content_markdown,
         skip_conflict_check=skip_conflict_check,
+        current_file_path=current_file_path,
         session=session,
     )
     schema._permalink = resolved
@@ -508,6 +510,8 @@ async def prepare_update_entity_content(
         current_permalink=current_permalink,
         content_markdown=content_markdown,
         skip_conflict_check=skip_conflict_check,
+        # A rename keeps its own permalink line: the note's own row is not a collision.
+        current_file_path=current_file_path.as_posix(),
         session=session,
     )
     post = await schema_to_markdown(schema)

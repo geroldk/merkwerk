@@ -73,18 +73,6 @@ from basic_memory.services.note_write_outcomes import (
 AcceptedNoteChange = RuntimeAcceptedNoteChange[RuntimeNoteContentResponsePayload]
 
 
-def _written_title(data: EntitySchema) -> str:
-    """The title the note will be stored with: the frontmatter's when the text has one."""
-    if data.content and has_frontmatter(data.content):
-        try:
-            title = parse_frontmatter(data.content).get("title")
-        except ParseError:
-            title = None
-        if isinstance(title, str) and title.strip():
-            return title
-    return data.title
-
-
 type AcceptedNoteMutationRequest = (
     AcceptedNoteCreateMutation
     | AcceptedNoteUpdateMutation
@@ -540,13 +528,11 @@ class NoteContentMutationService:
                     if expected_checksum is not None:
                         return RevisionConflict(data.file_path, current_db_checksum=None)
                 # Trigger: the write creates a note (no note owns the path).
-                # Why: a second note with the same title makes `[[Title]]` ambiguous, and the
-                #      title of the written text, not the requested one, is what gets stored.
+                # Why: a second note with the same title makes `[[Title]]` ambiguous; a create stores
+                #      the requested title (the text's own `title:` line is dropped).
                 # Outcome: the write is refused and names the note that has the title.
                 if existing is None and not allow_duplicate_title:
-                    twins = await entity_repository.get_by_equivalent_title(
-                        session, _written_title(data)
-                    )
+                    twins = await entity_repository.get_by_equivalent_title(session, data.title)
                     if twins:
                         twin = twins[0]
                         return DuplicateTitle(

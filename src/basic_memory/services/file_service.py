@@ -199,7 +199,7 @@ class FileService:
                 the boundary first; this keeps the walk from ever becoming a probe of
                 other directories on the server.
         """
-        if not validate_project_path(str(path), self.base_path):
+        if not validate_project_path(str(path), self.base_path, allow_literal_tilde=True):
             raise FileOperationError(f"Directory '{path}' is outside the project")
         # The walk stops at the first file, but a deep tree of empty folders still
         # costs a scan, so it runs off the event loop.
