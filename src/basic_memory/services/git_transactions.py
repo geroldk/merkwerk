@@ -37,7 +37,11 @@ from basic_memory.schemas.git_transactions import (
     GitTransactionWrite,
 )
 from basic_memory.models import Entity
-from basic_memory.services.note_preparation import apply_edit_operation
+from basic_memory.services.note_preparation import (
+    PermalinkChangeError,
+    apply_edit_operation,
+    require_permalink_unchanged,
+)
 from basic_memory.services.note_times import stamp_markdown_times, wanted_note_times
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -66,6 +70,15 @@ async def validate_git_draft(files: Mapping[str, str], root: Path) -> None:
             )
         except (ParseError, ValueError) as error:
             raise GitTransactionError(422, f"Invalid draft note {path}: {error}") from error
+
+
+def _draft_permalink(text: str) -> str | None:
+    """The `permalink:` of a draft text; None when there is none or the frontmatter is unreadable."""
+    try:
+        value = parse_frontmatter(text).get("permalink")
+    except ParseError:  # draft validation reports unreadable frontmatter on its own
+        return None
+    return value if isinstance(value, str) and value else None
 
 
 class GitTransactionService:
@@ -208,6 +221,16 @@ class GitTransactionService:
                     if request.path not in files:
                         raise GitTransactionError(404, "Draft note does not exist")
                     content = apply_edit_operation(files[request.path], request.operation, content)
+                # Trigger: the text replaces a draft note that already has a permalink.
+                # Why: a permalink changes only by design, as for `bm_write` and `bm_edit`.
+                # Outcome: a different `permalink:` line is refused; a missing one is not.
+                if request.path in files:
+                    try:
+                        require_permalink_unchanged(
+                            _draft_permalink(files[request.path]), _draft_permalink(content)
+                        )
+                    except PermalinkChangeError as error:
+                        raise GitTransactionError(400, str(error)) from error
                 # Trigger: the draft text is the only durable copy once committed.
                 # Why: without `created`/`modified` in it, a rebuild dates the note anew.
                 # Outcome: both keys are stamped by the same rules as an ordinary write.

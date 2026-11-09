@@ -14,6 +14,9 @@ class WriteNoteRequest(BaseModel):
     # Optimistic-concurrency precondition: the accepted db_checksum the caller last
     # read. The replacement lands only while the note at the path is that revision.
     expected_checksum: str | None = None
+    # A new note may not take a title another note of the project already has, unless the
+    # caller says it is meant (two notes with one title make `[[Title]]` ambiguous).
+    allow_duplicate_title: bool = False
 
     @model_validator(mode="after")
     def _expected_checksum_conditions_a_replacement(self) -> Self:
@@ -51,6 +54,15 @@ class NoteTargetMoved(BaseModel):
     permalink: str | None
 
 
+class NoteDuplicateTitle(BaseModel):
+    kind: Literal["duplicate_title"] = "duplicate_title"
+    title: str
+    # The note that already has the title.
+    file_path: str
+    external_id: str
+    permalink: str | None = None
+
+
 class NoteLocked(BaseModel):
     kind: Literal["locked"] = "locked"
     message: str
@@ -72,6 +84,7 @@ type WriteNoteResponse = Annotated[
     | NoteUpdated
     | NoteAlreadyExists
     | NoteTargetMoved
+    | NoteDuplicateTitle
     | NoteLocked
     | NoteRevisionConflict,
     Field(discriminator="kind"),

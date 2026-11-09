@@ -44,6 +44,14 @@ class TargetMoved:
 
 
 @dataclass(frozen=True, slots=True)
+class DuplicateTitle:
+    """A new note would take a title another note of the project already has."""
+
+    title: str
+    note: NoteLocation
+
+
+@dataclass(frozen=True, slots=True)
 class Locked:
     message: str
 
@@ -66,5 +74,12 @@ class Rejected:
 
 
 type WriteOutcome = (
-    Created | Updated | AlreadyExists | TargetMoved | Locked | RevisionConflict | Rejected
+    Created
+    | Updated
+    | AlreadyExists
+    | TargetMoved
+    | DuplicateTitle
+    | Locked
+    | RevisionConflict
+    | Rejected
 )

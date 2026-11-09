@@ -60,6 +60,7 @@ from basic_memory.repository.entity_repository import EntityRepository
 from basic_memory.services.note_write_outcomes import (
     AlreadyExists,
     Created,
+    DuplicateTitle,
     Updated,
     TargetMoved,
     Locked,
@@ -70,6 +71,20 @@ from basic_memory.services.note_write_outcomes import (
 )
 
 AcceptedNoteChange = RuntimeAcceptedNoteChange[RuntimeNoteContentResponsePayload]
+
+
+def _written_title(data: EntitySchema) -> str:
+    """The title the note will be stored with: the frontmatter's when the text has one."""
+    if data.content and has_frontmatter(data.content):
+        try:
+            title = parse_frontmatter(data.content).get("title")
+        except ParseError:
+            title = None
+        if isinstance(title, str) and title.strip():
+            return title
+    return data.title
+
+
 type AcceptedNoteMutationRequest = (
     AcceptedNoteCreateMutation
     | AcceptedNoteUpdateMutation
@@ -445,8 +460,14 @@ class NoteContentMutationService:
         user_profile_id: UUID | None,
         source: str,
         expected_checksum: str | None = None,
+        allow_duplicate_title: bool = True,
     ) -> WriteOutcome:
         """Create at a path or replace its current owner, without search resolution.
+
+        ``allow_duplicate_title=False`` refuses a create whose title another note of the
+        project already has (apart from case and surrounding space). It never affects a
+        replacement. The default keeps existing internal callers as they were; the route
+        passes the caller's choice.
 
         Retained exact permalinks only identify a moved target when the requested
         path has no owner. Rejections leave the transaction before becoming values,
@@ -518,6 +539,25 @@ class NoteContentMutationService:
                     # path. Creating one would resurrect a note deleted after the read.
                     if expected_checksum is not None:
                         return RevisionConflict(data.file_path, current_db_checksum=None)
+                # Trigger: the write creates a note (no note owns the path).
+                # Why: a second note with the same title makes `[[Title]]` ambiguous, and the
+                #      title of the written text, not the requested one, is what gets stored.
+                # Outcome: the write is refused and names the note that has the title.
+                if existing is None and not allow_duplicate_title:
+                    twins = await entity_repository.get_by_equivalent_title(
+                        session, _written_title(data)
+                    )
+                    if twins:
+                        twin = twins[0]
+                        return DuplicateTitle(
+                            twin.title,
+                            NoteLocation(
+                                str(twin.external_id),
+                                twin.title,
+                                twin.file_path,
+                                twin.permalink,
+                            ),
+                        )
 
             # Dispatch through the public operations so runtime overrides retain
             # their pre-acceptance work as well as the in-transaction hook.

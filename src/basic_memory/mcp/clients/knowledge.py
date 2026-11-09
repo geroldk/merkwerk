@@ -72,6 +72,7 @@ class KnowledgeClient:
         *,
         overwrite: bool,
         expected_checksum: str | None = None,
+        allow_duplicate_title: bool = False,
     ) -> WriteNoteResponse:
         """Write at an exact path and preserve the service's expected outcomes."""
         from basic_memory.mcp.tools.utils import call_post
@@ -88,6 +89,7 @@ class KnowledgeClient:
                     note=note,
                     overwrite=overwrite,
                     expected_checksum=expected_checksum,
+                    allow_duplicate_title=allow_duplicate_title,
                 ).model_dump(mode="json"),
                 client_name="knowledge",
                 operation="write_note",

@@ -1007,6 +1007,20 @@ def validate_project_path(
         return False
 
 
+def validate_caller_note_path(path: str, project_path: Path | None) -> bool:
+    """Validate a note path given by a caller: a '~' inside a name is an ordinary character.
+
+    The storage layer already keeps a literal '~' (``allow_literal_tilde=True``); only a path
+    whose first segment starts with '~' ("~", "~/x", "~user/x") is refused, since that is
+    how a home directory is written. Leaving the project stays refused by the same
+    resolution under the root as for every other path.
+    """
+    first = path.replace("\\", "/").lstrip("/").split("/", 1)[0]
+    if first.startswith("~"):
+        return False
+    return validate_project_path(path, project_path, allow_literal_tilde=True)
+
+
 def ensure_timezone_aware(dt: datetime, cloud_mode: bool | None = None) -> datetime:
     """Ensure a datetime is timezone-aware.
 

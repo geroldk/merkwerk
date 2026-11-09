@@ -23,6 +23,7 @@ from basic_memory.schemas.v2.note_write import (
     NoteCreated,
     NoteLocked,
     NoteRevisionConflict,
+    NoteDuplicateTitle,
     NoteTargetMoved,
     NoteUpdated,
     WriteNoteRequest,
@@ -38,6 +39,7 @@ from basic_memory.services.note_write_outcomes import (
     Locked,
     Rejected,
     RevisionConflict,
+    DuplicateTitle,
     TargetMoved,
     Updated,
 )
@@ -93,6 +95,7 @@ async def write_note(
                 user_profile_id=None,
                 source="api",
                 expected_checksum=data.expected_checksum,
+                allow_duplicate_title=data.allow_duplicate_title,
             )
         except NoteContentMutationServiceError as error:
             raise HTTPException(status_code=error.status_code, detail=error.detail) from error
@@ -123,6 +126,13 @@ async def write_note(
                 )
             case TargetMoved(note=note):
                 return NoteTargetMoved(**asdict(note))
+            case DuplicateTitle(title=title, note=note):
+                return NoteDuplicateTitle(
+                    title=title,
+                    file_path=note.file_path,
+                    external_id=note.external_id,
+                    permalink=note.permalink,
+                )
             case Locked(message=message):
                 return NoteLocked(message=message)
             case RevisionConflict(file_path=file_path, current_db_checksum=current, note=note):

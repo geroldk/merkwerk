@@ -44,10 +44,11 @@ from basic_memory.schemas.v2.note_write import (
     NoteCreated,
     NoteLocked,
     NoteRevisionConflict,
+    NoteDuplicateTitle,
     NoteTargetMoved,
     NoteUpdated,
 )
-from basic_memory.utils import coerce_dict, nfc_path, parse_tags, validate_project_path
+from basic_memory.utils import coerce_dict, nfc_path, parse_tags, validate_caller_note_path
 
 MARKDOWN_SUFFIX = ".md"
 
@@ -149,6 +150,16 @@ async def bm_write(
             ),
         ),
     ] = None,
+    allow_duplicate_title: Annotated[
+        bool,
+        Field(
+            description=(
+                "Create the note although another note of the project has the same title "
+                "(default: refused, because two notes with one title make [[Title]] ambiguous). "
+                "Does not affect replacing a note."
+            )
+        ),
+    ] = False,
     output_format: OutputFormat = "text",
     *,
     project: ProjectParam,
@@ -231,7 +242,10 @@ async def bm_write(
         knowledge_client = KnowledgeClient(target.client, target.project.external_id)
         try:
             outcome = await knowledge_client.write_note(
-                note, overwrite=effective_overwrite, expected_checksum=expected_checksum
+                note,
+                overwrite=effective_overwrite,
+                expected_checksum=expected_checksum,
+                allow_duplicate_title=allow_duplicate_title,
             )
         except ToolError as error:
             raise note_change_failure(
@@ -269,6 +283,18 @@ async def bm_write(
                     try_instead=(
                         f"bm_read(identifier={shown!r}, project={project!r}) to work on that note, or "
                         "overwrite=false to create a separate note at this path"
+                    ),
+                    output_format=output_format,
+                )
+            case NoteDuplicateTitle(title=twin_title, file_path=twin_path):
+                shown = target.paths.path(twin_path)
+                raise refusal(
+                    "ALREADY_EXISTS",
+                    f"A note titled '{twin_title}' already exists at '{shown}'. "
+                    "Nothing was written.",
+                    try_instead=(
+                        "a different title, bm_edit on that note, or "
+                        "allow_duplicate_title=true if two notes with this title are meant"
                     ),
                     output_format=output_format,
                 )
@@ -328,7 +354,7 @@ def _place_note(
     if identifier is None:
         assert title is not None and directory is not None  # checked by the caller
         folder = directory.strip("/")
-        if folder and not validate_project_path(
+        if folder and not validate_caller_note_path(
             folder, local_project_path(target.client, target.project)
         ):
             raise refusal(

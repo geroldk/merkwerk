@@ -29,7 +29,7 @@ from basic_memory.mcp.server import mcp
 from basic_memory.mcp.tool_params import OutputFormat, ProjectParam
 from basic_memory.runtime.storage import RUNTIME_MARKDOWN_FILE_SUFFIXES
 from basic_memory.schemas.memory import memory_url_path
-from basic_memory.utils import generate_permalink, validate_project_path
+from basic_memory.utils import generate_permalink, validate_caller_note_path
 
 
 @mcp.tool(
@@ -215,7 +215,7 @@ def _project_relative_destination(
         remainder = segments[len(prefix) :]
         if leading == prefix and (remainder or into_folder):
             relative = "/".join(remainder)
-    if not validate_project_path(
+    if not validate_caller_note_path(
         relative.rstrip("/"), local_project_path(target.client, target.project)
     ):
         raise refusal(

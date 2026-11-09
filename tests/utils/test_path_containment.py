@@ -54,3 +54,32 @@ def test_portable_validation_does_not_rewrite_filename(path: str):
 @pytest.mark.parametrize("path", ["\n", " \r ", "note\n.md", "\x00"])
 def test_portable_validation_rejects_control_characters(path: str):
     assert not valid_project_path_value(path)
+
+
+# --- A '~' inside a name is an ordinary character (P5) ---
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "decisions/ADR-0005- GN, trotz ~800 Fundstellen.md",
+        "a/~b.md",
+        "notes/x~.md",
+        "tilde~mid/file.md",
+    ],
+)
+def test_a_tilde_inside_a_name_is_allowed(path, tmp_path):
+    from basic_memory.utils import validate_caller_note_path
+
+    assert validate_caller_note_path(path, tmp_path)
+    assert validate_caller_note_path(path, None)
+
+
+@pytest.mark.parametrize(
+    "path", ["~", "~/x", "~user/x", "~\\AppData\\x", "/~/x", "~.md", "../x", "a/../../x"]
+)
+def test_a_home_directory_spelling_or_an_escape_is_refused(path, tmp_path):
+    from basic_memory.utils import validate_caller_note_path
+
+    assert not validate_caller_note_path(path, tmp_path)
+    assert not validate_caller_note_path(path, None)

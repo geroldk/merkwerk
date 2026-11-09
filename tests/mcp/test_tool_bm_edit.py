@@ -636,3 +636,57 @@ async def test_appended_observations_and_relations_are_indexed(
     assert entity is not None
     assert {o.category for o in entity.observations} == {"design", "implementation"}
     assert {r.relation_type for r in entity.outgoing_relations} == {"implements", "relates_to"}
+
+
+# --- A permalink changes only by design (P3) ---
+
+
+async def _permalink(project_name: str, path: str = "notes/plan.md") -> str:
+    text = str(await bm_read(path, project=project_name))
+    line = next(line for line in text.splitlines() if line.startswith("permalink:"))
+    return line.split(":", 1)[1].strip()
+
+
+@pytest.mark.asyncio
+async def test_find_replace_cannot_change_the_permalink_line(client, test_project):
+    await _seed(test_project.name)
+    permalink = await _permalink(test_project.name)
+
+    with pytest.raises(ToolError, match="cannot be changed by writing or editing"):
+        await bm_edit(
+            identifier="notes/plan.md",
+            command="find_replace",
+            find_text=f"permalink: {permalink}",
+            content="permalink: somewhere/else",
+            project=test_project.name,
+        )
+
+    assert await _permalink(test_project.name) == permalink
+
+
+@pytest.mark.asyncio
+async def test_find_replace_may_restate_the_same_permalink(client, test_project):
+    await _seed(test_project.name)
+    permalink = await _permalink(test_project.name)
+
+    await bm_edit(
+        identifier="notes/plan.md",
+        command="find_replace",
+        find_text=f"permalink: {permalink}",
+        content=f"permalink: {permalink}",
+        project=test_project.name,
+    )
+
+    assert await _permalink(test_project.name) == permalink
+
+
+@pytest.mark.asyncio
+async def test_other_edits_keep_working_and_keep_the_permalink(client, test_project):
+    await _seed(test_project.name)
+    permalink = await _permalink(test_project.name)
+
+    await bm_edit(
+        identifier="notes/plan.md", command="append", content="more", project=test_project.name
+    )
+
+    assert await _permalink(test_project.name) == permalink

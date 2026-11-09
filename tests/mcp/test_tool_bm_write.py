@@ -436,3 +436,129 @@ async def test_note_type_is_validated_as_an_argument(client, test_project, note_
     assert "note_type" in result.content[0].text  # pyright: ignore[reportAttributeAccessIssue]
     with pytest.raises(ToolError, match="^NOT_FOUND:"):
         await bm_read(identifier="notes/typed.md", project=test_project.name)
+
+
+# --- A permalink changes only by design (P3) ---
+
+
+async def _written_permalink(project_name: str, path: str) -> str:
+    from basic_memory.mcp.tools import bm_read
+
+    text = str(await bm_read(path, project=project_name))
+    return next(
+        line.split(":", 1)[1].strip() for line in text.splitlines() if line.startswith("permalink:")
+    )
+
+
+@pytest.mark.asyncio
+async def test_overwrite_with_another_permalink_line_is_refused(client, test_project):
+    await write_json(identifier="notes/a.md", content="One", project=test_project.name)
+    permalink = await _written_permalink(test_project.name, "notes/a.md")
+
+    with pytest.raises(ToolError, match="cannot be changed by writing or editing"):
+        await bm_write(
+            identifier="notes/a.md",
+            content="---\npermalink: somewhere/else\n---\nTwo",
+            overwrite=True,
+            project=test_project.name,
+        )
+
+    assert await _written_permalink(test_project.name, "notes/a.md") == permalink
+
+
+@pytest.mark.asyncio
+async def test_overwrite_with_the_same_or_no_permalink_line_works(client, test_project):
+    await write_json(identifier="notes/a.md", content="One", project=test_project.name)
+    permalink = await _written_permalink(test_project.name, "notes/a.md")
+
+    await bm_write(
+        identifier="notes/a.md",
+        content=f"---\npermalink: {permalink}\n---\nTwo",
+        overwrite=True,
+        project=test_project.name,
+    )
+    await bm_write(
+        identifier="notes/a.md", content="Three", overwrite=True, project=test_project.name
+    )
+
+    assert await _written_permalink(test_project.name, "notes/a.md") == permalink
+
+
+@pytest.mark.asyncio
+async def test_a_new_note_may_still_name_its_own_permalink(client, test_project):
+    await bm_write(
+        identifier="notes/b.md",
+        content="---\npermalink: my/own/address\n---\nBody",
+        project=test_project.name,
+    )
+
+    assert await _written_permalink(test_project.name, "notes/b.md") == "my/own/address"
+
+
+# --- A new note may not repeat a title (P2) ---
+
+
+@pytest.mark.asyncio
+async def test_a_new_note_with_a_title_already_in_the_project_is_refused(client, test_project):
+    await bm_write(
+        identifier="notes/first.md",
+        content="---\ntitle: Same Title\n---\nOne",
+        project=test_project.name,
+    )
+
+    with pytest.raises(ToolError, match="^ALREADY_EXISTS:.*Same Title.*notes/first.md"):
+        await bm_write(
+            identifier="other/second.md",
+            content="---\ntitle: Same Title\n---\nTwo",
+            project=test_project.name,
+        )
+
+
+@pytest.mark.asyncio
+async def test_the_title_comparison_ignores_case_and_surrounding_space(client, test_project):
+    await bm_write(
+        identifier="notes/first.md",
+        content="---\ntitle: Same Title\n---\nOne",
+        project=test_project.name,
+    )
+
+    with pytest.raises(ToolError, match="^ALREADY_EXISTS:"):
+        await bm_write(
+            identifier="other/second.md",
+            content="---\ntitle: '  same TITLE '\n---\nTwo",
+            project=test_project.name,
+        )
+
+
+@pytest.mark.asyncio
+async def test_title_addressing_refuses_a_repeated_title_too(client, test_project):
+    await bm_write(title="Plan", directory="a", content="One", project=test_project.name)
+
+    with pytest.raises(ToolError, match="^ALREADY_EXISTS:.*Plan"):
+        await bm_write(title="Plan", directory="b", content="Two", project=test_project.name)
+
+
+@pytest.mark.asyncio
+async def test_allow_duplicate_title_creates_the_second_note(client, test_project):
+    await bm_write(title="Plan", directory="a", content="One", project=test_project.name)
+
+    created = await write_json(
+        title="Plan",
+        directory="b",
+        content="Two",
+        allow_duplicate_title=True,
+        project=test_project.name,
+    )
+
+    assert created["action"] == "created"
+
+
+@pytest.mark.asyncio
+async def test_replacing_a_note_keeps_its_own_title(client, test_project):
+    await bm_write(title="Plan", directory="a", content="One", project=test_project.name)
+
+    replaced = await write_json(
+        title="Plan", directory="a", content="Two", overwrite=True, project=test_project.name
+    )
+
+    assert replaced["action"] == "updated"

@@ -190,6 +190,27 @@ class EntityRepository(Repository[Entity]):
         result = await self.execute_query(session, query, use_query_options=load_relations)
         return list(result.scalars().all())
 
+    async def get_by_equivalent_title(self, session: AsyncSession, title: str) -> Sequence[Entity]:
+        """Notes whose title is the given one apart from case and surrounding space.
+
+        Link resolution matches a title exactly and then ignoring case; a new note must not
+        make either ambiguous. Shortest path first, like `get_by_title`.
+        """
+        wanted = " ".join(title.split()).casefold()
+        if not wanted:
+            return []
+        query = (
+            self.select()
+            .where(func.lower(func.trim(Entity.title)) == title.strip().lower())
+            .order_by(func.length(Entity.file_path), Entity.file_path)
+        )
+        result = await self.execute_query(session, query, use_query_options=False)
+        return [
+            entity
+            for entity in result.scalars().all()
+            if " ".join(entity.title.split()).casefold() == wanted
+        ]
+
     async def get_by_file_path(
         self,
         session: AsyncSession,

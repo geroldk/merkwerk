@@ -26,7 +26,7 @@ from basic_memory.deps import (
     ReadCacheDep,
     SessionMakerDep,
 )
-from basic_memory.utils import validate_project_path
+from basic_memory.utils import validate_caller_note_path
 
 router = APIRouter(prefix="/resource", tags=["resources-v2"])
 
@@ -215,7 +215,7 @@ async def get_resource_content(
             action="get_content",
             phase="validate_path",
         ):
-            if not validate_project_path(entity_file_path, file_service.local_project_path):
+            if not validate_caller_note_path(entity_file_path, file_service.local_project_path):
                 logger.error(  # pragma: no cover
                     f"Invalid file path in entity {entity_db_id}: {entity_file_path}"
                 )

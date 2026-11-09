@@ -43,6 +43,7 @@ from basic_memory.schemas.v2.note_write import (
     NoteCreated,
     NoteLocked,
     NoteRevisionConflict,
+    NoteDuplicateTitle,
     NoteTargetMoved,
     NoteUpdated,
 )
@@ -258,6 +259,14 @@ async def _write_copy(
     match outcome:
         case NoteCreated(entity=written):
             return written
+        case NoteDuplicateTitle(title=twin_title, file_path=twin_path):
+            raise refusal(
+                "ALREADY_EXISTS",
+                f"A note titled '{twin_title}' already exists at "
+                f"'{target.paths.path(twin_path)}' in project '{target.project.name}'. {UNCHANGED}",
+                try_instead="renaming one of the notes first",
+                output_format=output_format,
+            )
         case NoteAlreadyExists() | NoteTargetMoved():
             raise refusal(
                 "ALREADY_EXISTS",

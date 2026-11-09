@@ -115,7 +115,7 @@ from basic_memory.utils import (
     generate_permalink,
     nfc_path,
     normalize_project_reference,
-    validate_project_path,
+    validate_caller_note_path,
 )
 
 router = APIRouter(prefix="/knowledge", tags=["knowledge-v2"], route_class=ReadCacheRoute)
@@ -481,7 +481,7 @@ async def place_note(
 
         placement = await place_missing_note(
             readings,
-            within_project=lambda path: validate_project_path(path, project_home),
+            within_project=lambda path: validate_caller_note_path(path, project_home),
             folder_exists=folder_exists,
             prefix_is_routing=app_config.permalinks_include_project,
         )
@@ -679,7 +679,7 @@ async def index_file(
         if file_service.local_project_path is None:
             raise HTTPException(status_code=404, detail="Local file recovery is unavailable")
 
-        if not validate_project_path(data.file_path, project_config.home):
+        if not validate_caller_note_path(data.file_path, project_config.home):
             raise HTTPException(
                 status_code=400,
                 detail=f"File path '{data.file_path}' is not allowed - "
@@ -719,7 +719,7 @@ async def index_file(
         #     target must stay inside the resolved project home; escapes get a 400
         #     before the file-existence probe below ever touches the target.
         resolved_target = (project_config.home / file_path).resolve()
-        if not validate_project_path(file_path, project_config.home) or not (
+        if not validate_caller_note_path(file_path, project_config.home) or not (
             resolved_target.is_relative_to(project_config.home.resolve())
         ):
             raise HTTPException(

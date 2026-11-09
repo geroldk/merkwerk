@@ -192,6 +192,26 @@ def _frontmatter_permalink(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+class PermalinkChangeError(ValueError):
+    """The text of a note names another permalink than the note has."""
+
+
+def require_permalink_unchanged(current: str | None, requested: str | None) -> None:
+    """Refuse a text that renames the note's address.
+
+    A permalink changes only by design (a move into another project forms a new one).
+    A different `permalink:` line in written or edited text used to be taken over
+    silently when the value was free; `set_metadata` already refuses it. A missing line is
+    fine: the note keeps its permalink.
+    """
+    if current and requested and requested != current:
+        raise PermalinkChangeError(
+            f"The permalink is the note's address and cannot be changed by writing or editing "
+            f"its text ({current!r} to {requested!r}). Leave the permalink line as it is, or "
+            "remove it; a move into another project forms a new permalink."
+        )
+
+
 def _build_frontmatter_markdown(title: str, note_type: str, permalink: str) -> EntityMarkdown:
     from basic_memory.markdown.schemas import EntityFrontmatter
 
@@ -470,6 +490,9 @@ async def prepare_update_entity_content(
             # that invalid merge input; the final accepted Markdown is validated below.
             pass
     content_markdown = _apply_schema_frontmatter_overrides(schema)
+    require_permalink_unchanged(
+        entity.permalink, content_markdown.frontmatter.permalink if content_markdown else None
+    )
     update_permalink_on_rename = bool(
         dependencies.app_config and dependencies.app_config.update_permalinks_on_move
     )
@@ -1004,6 +1027,7 @@ async def prepare_edit_entity_content(
         if "type" in content_frontmatter:
             note_type = _coerce_to_string(content_frontmatter["type"])
         content_permalink = _frontmatter_permalink(content_frontmatter.get("permalink"))
+        require_permalink_unchanged(entity.permalink, content_permalink)
         if content_permalink is not None:
             permalink = await resolve_permalink(
                 dependencies,

@@ -402,3 +402,35 @@ def test_workspace_qualified_destination_drops_the_whole_prefix(destination, rel
     )
 
     assert move_module._project_relative_destination(target, destination, "text") == relative
+
+
+# --- A '~' inside a name (P5) ---
+
+
+@pytest.mark.asyncio
+async def test_a_tilde_inside_a_name_can_be_written_read_and_moved(client, test_project):
+    name = "decisions/ADR-0005- GN, trotz ~800 Fundstellen.md"
+    await _note(test_project.name, name)
+
+    assert "Body" in str(await bm_read(name, project=test_project.name))
+    moved = await move_json(
+        identifier=name, destination="archive/ADR-0005 mit ~tilde.md", project=test_project.name
+    )
+
+    assert moved["action"] == "moved"
+    assert moved["file_path"] == "archive/ADR-0005 mit ~tilde.md"
+    back = await move_json(
+        identifier="archive/ADR-0005 mit ~tilde.md", destination=name, project=test_project.name
+    )
+    assert back["file_path"] == name
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("destination", ["~/stolen.md", "~user/x.md", "~"])
+async def test_a_home_directory_destination_is_still_refused(client, test_project, destination):
+    await _note(test_project.name)
+
+    with pytest.raises(ToolError, match="OUTSIDE_PROJECT"):
+        await bm_move(
+            identifier="notes/plan.md", destination=destination, project=test_project.name
+        )

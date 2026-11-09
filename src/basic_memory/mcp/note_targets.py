@@ -40,7 +40,7 @@ from basic_memory.schemas.memory import (
 )
 from basic_memory.schemas.project_info import ProjectItem
 from basic_memory.schemas.v2.entity import EntityResolveResponse
-from basic_memory.utils import generate_permalink, validate_project_path
+from basic_memory.utils import generate_permalink, validate_caller_note_path
 
 
 type TargetKind = Literal["path", "identifier"]
@@ -125,7 +125,7 @@ async def open_project_target(
         # A leading '/' anchors at the project root ('/' or '/specs'), never the
         # filesystem root, so it is dropped before the check.
         project_relative = memory_url_path(route.path).lstrip("/")
-        if kind == "path" and not validate_project_path(
+        if kind == "path" and not validate_caller_note_path(
             project_relative, local_project_path(client, active_project)
         ):
             raise refusal(

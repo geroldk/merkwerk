@@ -858,3 +858,31 @@ async def test_api_lease_configuration_and_passive_expiry_preserve_then_collect_
                 and not cleaned.json()["draft_available"]
             )
             assert host_setup.repository.head() == transaction["base_commit"]
+
+
+@pytest.mark.asyncio
+async def test_a_draft_note_keeps_its_permalink(host_setup):
+    from basic_memory.api.app import app
+
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=ASGITransport(app), base_url="http://test") as client:
+            prefix = f"/v2/projects/{host_setup.project.external_id}/git/transactions"
+            transaction = await start(client, prefix)
+            await write(client, prefix, transaction, "A.md", note("A", "first"))
+
+            other = note("A", "second").replace("test-project/a", "somewhere/else")
+            refused = await client.post(
+                f"{prefix}/{transaction['transaction_id']}/write",
+                headers=headers(transaction),
+                json={
+                    "path": "A.md",
+                    "content": other,
+                    "expected_revision": 1,
+                    "operation": "replace",
+                },
+            )
+            assert refused.status_code == 400
+            assert "cannot be changed by writing or editing" in refused.text
+
+            # The refusal changed nothing: the same revision still accepts the same permalink.
+            await write(client, prefix, transaction, "A.md", note("A", "third"), revision=1)
