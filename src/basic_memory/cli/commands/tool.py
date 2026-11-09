@@ -201,6 +201,13 @@ def write(
         Optional[bool], typer.Option("--overwrite", help="Replace an existing note")
     ] = None,
     expected_checksum: ExpectedChecksumOption = None,
+    allow_duplicate_title: Annotated[
+        bool,
+        typer.Option(
+            "--allow-duplicate-title",
+            help="Create the note although another note of the project has the same title",
+        ),
+    ] = False,
     project: ProjectOption = None,
     json_output: JsonOption = False,
     local: LocalOption = False,
@@ -236,6 +243,7 @@ def write(
         metadata=metadata,
         overwrite=overwrite,
         expected_checksum=expected_checksum,
+        allow_duplicate_title=allow_duplicate_title,
         project=project,
         json_output=json_output,
         local=local,

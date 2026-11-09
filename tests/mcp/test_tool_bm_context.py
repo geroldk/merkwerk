@@ -569,6 +569,7 @@ async def test_refuses_ambiguous_title(client, test_project):
             title="Bean Origins",
             directory=directory,
             content=f"# Bean Origins\n\nThe {directory} copy.\n",
+            allow_duplicate_title=True,
         )
 
     with pytest.raises(ToolError, match="Ambiguous identifier 'Bean Origins'"):

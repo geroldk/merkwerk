@@ -128,6 +128,7 @@ EXPECTED_TOOL_SIGNATURES: dict[str, list[str]] = {
         "metadata",
         "overwrite",
         "expected_checksum",
+        "allow_duplicate_title",
         "output_format",
         "project",
     ],

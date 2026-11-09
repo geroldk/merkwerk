@@ -179,7 +179,11 @@ async def test_an_ambiguous_title_is_an_ambiguous_refusal(client, test_project):
     """Two notes share the title, so neither is picked; JSON keeps the refusal shape."""
     for directory in ("a", "b"):
         await bm_write(
-            title="Twin", directory=directory, content="# Twin", project=test_project.name
+            title="Twin",
+            directory=directory,
+            content="# Twin",
+            project=test_project.name,
+            allow_duplicate_title=True,
         )
 
     async with open_project_target("Twin", test_project.name, None, kind="identifier") as target:

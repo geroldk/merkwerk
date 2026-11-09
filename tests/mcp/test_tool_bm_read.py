@@ -45,7 +45,13 @@ async def read_json(identifier: str, **arguments: Any) -> dict[str, Any]:
 
 
 async def _write(project_name: str, title: str, content: str, directory: str = "notes") -> None:
-    await bm_write(title=title, directory=directory, content=content, project=project_name)
+    await bm_write(
+        title=title,
+        directory=directory,
+        content=content,
+        project=project_name,
+        allow_duplicate_title=True,
+    )
 
 
 @pytest_asyncio.fixture

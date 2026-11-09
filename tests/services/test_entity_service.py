@@ -724,11 +724,11 @@ async def test_update_with_content(
 
     # now update the content
     update_content = dedent(
-        """
+        f"""
         ---
         title: Git Workflow Guide
         type: test
-        permalink: git-workflow-guide
+        permalink: {project_prefix}/test/git-workflow-guide
         ---
         
         # Git Workflow Guide
@@ -758,8 +758,8 @@ async def test_update_with_content(
     assert created is False
     assert entity.title == "Git Workflow Guide"
 
-    # assert custom permalink value
-    assert entity.permalink == "git-workflow-guide"
+    # the permalink is kept; a different one is refused (P3)
+    assert entity.permalink == f"{project_prefix}/test/git-workflow-guide"
 
     assert len(entity.observations) == 1
     assert entity.observations[0].category == "design"

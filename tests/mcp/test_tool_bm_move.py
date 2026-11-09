@@ -20,7 +20,11 @@ from basic_memory.schemas.response import DirectoryMoveResult
 
 async def _note(project_name: str, path: str = "notes/plan.md") -> dict[str, Any]:
     result = await bm_write(
-        identifier=path, content="Body", output_format="json", project=project_name
+        identifier=path,
+        content="Body",
+        output_format="json",
+        project=project_name,
+        allow_duplicate_title=True,
     )
     assert isinstance(result, dict)
     return result
