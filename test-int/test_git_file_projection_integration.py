@@ -9,12 +9,16 @@ editor's.
 import asyncio
 import hashlib
 import os
+from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
+from httpx import ASGITransport, AsyncClient
 from loguru import logger
 from sqlalchemy import select, update
 
+from basic_memory import db
+from basic_memory.api.container import resolve_container
 from basic_memory.index import git_projection
 from basic_memory.index.git_file_projection_plan import BaseFile, DiskView
 from basic_memory.index.git_projection import GitProjectionPipeline, build_git_projection_pipeline
@@ -31,6 +35,9 @@ from basic_memory.runtime.note_content import (
     RuntimeNoteMaterializationStatus,
 )
 from basic_memory.services.git_project_projection import project_git_content
+
+from tests.git_host_support import HostSetup, host_setup as host_setup
+from tests.git_host_support import ready as host_ready
 
 
 @pytest.fixture
@@ -820,3 +827,183 @@ async def test_old_bytes_of_an_unknown_owner_go_only_after_a_clean_pass(pipeline
     on_disk(pipeline, moved)
     assert not (root / "notes").exists()
     assert await retirement_rows(pipeline) == 0
+
+
+# --- Local moves through accept() (the API), not published commits ---
+
+
+def hold_files_stage(monkeypatch) -> asyncio.Event:
+    """Keep the files stage waiting, so local moves pile up in SQL first."""
+    apply = GitProjectionPipeline.apply
+    release = asyncio.Event()
+
+    async def held(self, stage, commit_id, *, graph_base_commit=None):
+        if stage == "files":
+            await release.wait()
+        await apply(self, stage, commit_id, graph_base_commit=graph_base_commit)
+
+    monkeypatch.setattr(GitProjectionPipeline, "apply", held)
+    return release
+
+
+async def host_files_written(project_id: str) -> None:
+    host = resolve_container().git_host
+    assert host is not None
+    worker = host.runtime_for(project_id).worker
+    async with asyncio.timeout(30):
+        while True:
+            status = await worker.status()
+            row = next((row for row in status.stages if row.stage == "files"), None)
+            if (
+                row is not None
+                and row.completed_commit == status.source_commit
+                and row.running_commit is None
+                and row.last_error is None
+            ):
+                return
+            worker.notify()
+            await asyncio.sleep(0.05)
+
+
+async def host_rows(setup: HostSetup) -> list[NoteContent]:
+    _, factory = await db.get_or_create_db(setup.config.database_path)
+    async with factory() as session:
+        return list(await session.scalars(select(NoteContent)))
+
+
+async def host_retirements(setup: HostSetup) -> int:
+    _, factory = await db.get_or_create_db(setup.config.database_path)
+    async with factory() as session:
+        return len(list(await session.scalars(select(GitFileRetirement.file_path))))
+
+
+def timed_note(path: str, body: str = "Body") -> str:
+    """A note that already carries created/modified, so a local move keeps its bytes."""
+    stem = path.removesuffix(".md")
+    return (
+        f"---\ntitle: {stem.rpartition('/')[2]}\ntype: note\npermalink: test-project/{stem}\n"
+        "created: '2025-01-02T03:04:05+00:00'\nmodified: '2025-02-03T04:05:06+00:00'\n"
+        f"---\n\n{body}\n"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_note_kept_at_its_path_takes_a_later_local_edit(
+    host_setup, config_manager, monkeypatch
+):
+    """C2 with accept(): a published move away and back reaches SQL before any files pass.
+
+    The note keeps its path and bytes on disk (KEEP). The pass must still publish its
+    row; otherwise the row keeps no file checksum and the next local edit (accept_write
+    leaves the file checksum as it is) finds a file it cannot call its own.
+    """
+    from basic_memory.api.app import app
+
+    host_setup.config.update_permalinks_on_move = False
+    config_manager.save_config(host_setup.config)
+    project_id = host_setup.project.external_id
+    original = timed_note("src/a")
+    repository = host_setup.repository
+    note_id = seed_host(host_setup, {"src/a.md": original})["src/a.md"]
+    root = Path(host_setup.project.path)
+    proofs: list[str] = []
+    prove = GitProjectRepository.contains_published_note_content
+
+    def recorded_proof(self, commit_id, path, content):
+        # Recorded, not raised: a raise inside the worker would only become a retry.
+        proofs.append(path)
+        return prove(self, commit_id, path, content)
+
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=ASGITransport(app), base_url="http://test") as client:
+            await host_ready(client, project_id)
+            host = resolve_container().git_host
+            assert host is not None
+            runtime = host.runtime_for(project_id)
+            release = hold_files_stage(monkeypatch)
+            away = publish_host(repository, {"else/a.md": original}, {"else/a.md": note_id})
+            runtime.worker.notify()
+            async with asyncio.timeout(15):
+                while not any(
+                    row.stage == "content" and row.completed_commit == away
+                    for row in (await runtime.worker.status()).stages
+                ):
+                    await asyncio.sleep(0.02)
+            # The move back reaches SQL while the files stage still waits on the first.
+            back = publish_host(repository, {"src/a.md": original}, {"src/a.md": note_id})
+            async with runtime.gate:
+                await runtime.pipeline.recover_content(back)
+            monkeypatch.setattr(
+                GitProjectRepository, "contains_published_note_content", recorded_proof
+            )
+            release.set()
+            await host_files_written(project_id)
+            (row,) = await host_rows(host_setup)
+            assert row.file_write_status == "synced"
+            assert row.file_checksum is not None and row.file_checksum == row.db_checksum
+            assert await host_retirements(host_setup) == 0
+            assert (root / "src/a.md").read_text() == original
+            edited = await client.patch(
+                f"/v2/projects/{project_id}/knowledge/entities/{note_id}",
+                json={"operation": "append", "content": "\nA local edit\n"},
+            )
+            assert edited.status_code == 202, edited.text
+            await host_files_written(project_id)
+            await host_ready(client, project_id)
+    (row,) = await host_rows(host_setup)
+    assert row.file_write_status == "synced"
+    assert (root / "src/a.md").read_text() == row.markdown_content
+    assert "A local edit" in row.markdown_content
+    assert proofs == []
+
+
+def publish_host(
+    repository: GitProjectRepository, files: dict[str, str], ids: dict[str, UUID]
+) -> str:
+    return repository.publish(
+        repository.prepare(
+            transaction_id=uuid4(), base_commit=repository.head(), files=files, note_ids=ids
+        )
+    ).commit_id
+
+
+@pytest.mark.asyncio
+async def test_a_local_case_only_rename_through_an_alias_keeps_the_note(host_setup, monkeypatch):
+    """C1 through accept(): the old spelling reaches the live file (here a hard link)."""
+    from basic_memory.api.app import app
+
+    project_id = host_setup.project.external_id
+    # No created/modified: the move writes them in, so the bytes change with the rename.
+    note_id = seed_host(host_setup, {"src/a.md": note("src/a.md")})["src/a.md"]
+    root = Path(host_setup.project.path)
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=ASGITransport(app), base_url="http://test") as client:
+            await host_ready(client, project_id)
+            release = hold_files_stage(monkeypatch)
+            moved = await client.put(
+                f"/v2/projects/{project_id}/knowledge/entities/{note_id}/move",
+                json={"destination_path": "src/A.md"},
+            )
+            assert moved.status_code in {200, 202}, moved.text
+            assert set(host_setup.repository.snapshot().files) == {"src/A.md"}
+            os.link(root / "src/a.md", root / "src/A.md")
+            release.set()
+            await host_files_written(project_id)
+            await host_ready(client, project_id)
+    (row,) = await host_rows(host_setup)
+    assert row.file_write_status == "synced" and row.file_path == "src/A.md"
+    assert (root / "src/A.md").read_text() == row.markdown_content
+    old = root / "src/a.md"
+    assert not old.exists() or old.samefile(root / "src/A.md")
+    assert await host_retirements(host_setup) == 0
+
+
+def seed_host(setup: HostSetup, files: dict[str, str]) -> dict[str, UUID]:
+    repository = setup.repository
+    ids = {path: uuid4() for path in files}
+    repository.publish(
+        repository.prepare(
+            transaction_id=uuid4(), base_commit=repository.head(), files=files, note_ids=ids
+        )
+    )
+    return ids
