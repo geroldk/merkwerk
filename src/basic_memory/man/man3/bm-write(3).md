@@ -56,7 +56,7 @@ observations and relations with bm_context.
 - **metadata** (object | null, optional, default: None) — Extra frontmatter fields, merged into the note's frontmatter.
 - **overwrite** (boolean | null, optional, default: None) — Replace a note that already exists. Default: the write_note_overwrite_default setting (false unless changed).
 - **expected_checksum** (string | null, optional, default: None) — Replace the note only while it is still this revision (the checksum from bm_read). Implies overwrite=true.
-- **allow_duplicate_title** (boolean, optional, default: False) — Create the note although another note of the project has the same title (default: refused, because two notes with one title make [[Title]] ambiguous). Does not affect replacing a note.
+- **allow_duplicate_title** (boolean, optional, default: False) — Create the note although another note of the project has the same title (default: refused, because two notes with one title make [[Title]] ambiguous). Set it to true only if the user explicitly asked for two notes with this title. Does not affect replacing a note.
 - **output_format** (optional, default: "text")
 
 ## EXAMPLES

@@ -156,6 +156,7 @@ async def bm_write(
             description=(
                 "Create the note although another note of the project has the same title "
                 "(default: refused, because two notes with one title make [[Title]] ambiguous). "
+                "Set it to true only if the user explicitly asked for two notes with this title. "
                 "Does not affect replacing a note."
             )
         ),
@@ -294,7 +295,7 @@ async def bm_write(
                     "Nothing was written.",
                     try_instead=(
                         "a different title, bm_edit on that note, or "
-                        "allow_duplicate_title=true if two notes with this title are meant"
+                        "allow_duplicate_title=true only if the user explicitly asked for two notes with this title"
                     ),
                     output_format=output_format,
                 )
