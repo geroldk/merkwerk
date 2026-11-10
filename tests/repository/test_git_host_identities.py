@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, override
 from uuid import UUID, uuid4
 
 import pytest
@@ -280,3 +281,85 @@ def test_full_caches_start_over():
     cache = {str(index): index for index in range(module._INTRODUCTION_CACHE_LIMIT)}
     GitHostIdentities._remember(cache, {"new": -1})
     assert cache == {"new": -1}
+
+
+@pytest.mark.asyncio
+async def test_a_double_move_is_a_duplicate_while_the_source_still_owns_the_note(
+    host, session_maker
+):
+    """Peers moved one note a -> b and a -> c; this host has both before a's release.
+
+    b's head took the note from a, and so does c's claim: whichever arrives second is the
+    duplicate, though a still owns the note in SQL and in its head (rule (b) alone would
+    let both wait, and the second projection would then hit SQL's unique index).
+    """
+    note = uuid4()
+    a_id, b_id = host.projects["a"].project_id, host.projects["b"].project_id
+    publish(host.repo("a"), add={"n.md": note})
+    await own_in_sql(session_maker, a_id, note)
+    publish(host.repo("b"), add={"n.md": note}, moved={note: host.uuid("a")})
+    assert (await classify(host, session_maker, "b")).deferred == {note: a_id}
+    publish(host.repo("c"), add={"n.md": note}, moved={note: host.uuid("a")})
+    foreign = await classify(host, session_maker, "c")
+    assert foreign.duplicates == {note: b_id} and foreign.deferred == {}
+
+
+@pytest.mark.asyncio
+async def test_a_double_move_is_a_duplicate_before_any_sql_owner_exists(host, session_maker):
+    """a released the note and b's projection has not run: no SQL row holds it at all."""
+    note = uuid4()
+    publish(host.repo("a"), add={"n.md": note})
+    publish(host.repo("a"), remove=(note,))
+    publish(host.repo("b"), add={"n.md": note}, moved={note: host.uuid("a")})
+    publish(host.repo("c"), add={"n.md": note}, moved={note: host.uuid("a")})
+    foreign = await classify(host, session_maker, "c")
+    assert foreign.duplicates == {note: host.projects["b"].project_id}
+
+
+@pytest.mark.asyncio
+async def test_a_chain_past_a_head_that_still_holds_the_note_waits(host, session_maker):
+    """Chain a -> b -> c seen before b released: b's head holds the note, c names b."""
+    note = uuid4()
+    a_id = host.projects["a"].project_id
+    publish(host.repo("a"), add={"n.md": note})
+    await own_in_sql(session_maker, a_id, note)
+    publish(host.repo("b"), add={"n.md": note}, moved={note: host.uuid("a")})
+    publish(host.repo("c"), add={"n.md": note}, moved={note: host.uuid("b")})
+    foreign = await classify(host, session_maker, "c")
+    assert foreign.deferred == {note: a_id} and foreign.duplicates == {}
+    # The source a itself, which a peer's move names, keeps its note meanwhile.
+    assert (await classify(host, session_maker, "a")).duplicates == {}
+
+
+@pytest.mark.asyncio
+async def test_a_cache_cleared_between_lookups_is_a_miss(host):
+    """Another thread may clear a full cache between an `in` test and an index."""
+
+    class Vanishing(dict[Any, Any]):
+        @override
+        def __contains__(self, key: object) -> bool:  # pragma: no cover - never asked now
+            self.clear()
+            return True
+
+    note = uuid4()
+    repository = host.repo("a")
+    tip = publish(repository, add={"n.md": note})
+    identities = host.identities
+    identities._introductions = Vanishing({(str(repository.path), tip, note): None})
+    identities._trailers = Vanishing()
+    assert identities._claims(repository, tip, [note]) == {note: frozenset()}
+
+
+@pytest.mark.asyncio
+async def test_an_unproven_twin_stays_named_after_its_sql_owner_despite_a_rival(
+    host, session_maker
+):
+    """c holds the note without a move proof: a duplicate of the SQL owner a, though b's
+    head holds it too."""
+    note = uuid4()
+    a_id = host.projects["a"].project_id
+    publish(host.repo("a"), add={"n.md": note})
+    await own_in_sql(session_maker, a_id, note)
+    publish(host.repo("b"), add={"n.md": note}, moved={note: host.uuid("a")})
+    publish(host.repo("c"), add={"n.md": note})
+    assert (await classify(host, session_maker, "c")).duplicates == {note: a_id}

@@ -101,11 +101,12 @@ class GitProjectRuntime:
         sync_remote: GitSyncRemote | None = None,
         sync_merge: bool = False,
     ) -> None:
-        self.pipeline = pipeline
-        self.dependencies = dependencies
         self.gate = asyncio.Lock()
+        # The graph stage takes the same gate per note (GitProjectionPipeline.apply).
+        self.pipeline = replace(pipeline, content_gate=self.gate)
+        self.dependencies = dependencies
         self.worker = GitProjectionWorker(
-            pipeline, poll_interval=poll_interval, content_gate=self.gate
+            self.pipeline, poll_interval=poll_interval, content_gate=self.gate
         )
         self._running = False
         self._sql_commit: str | None = None
@@ -330,6 +331,7 @@ class GitProjectRuntime:
         unique index is the only check (an offline or test runtime)."""
         if (identities := self.pipeline.identities) is not None:
             try:
+                identities.require_intents_readable(note_ids)
                 await identities.require_unowned(
                     session, project_id=self.pipeline.project_id, note_ids=note_ids
                 )

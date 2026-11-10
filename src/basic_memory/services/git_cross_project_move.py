@@ -13,24 +13,33 @@ the host's move lock, so no local write, transaction or peer sync of the target 
 the path, the permalink or the UUID in between: the window in which the note is in no
 project can only stay open after a crash. Then the intent finishes the move at the next
 host start (or POST /v2/git/moves/resume), deciding from the source's published history
-whether (b) happened, never from an answer or from the source head alone.
+whether (b) happened, never from the source head alone.
+
+The source's gate is not held before (b): another client may delete the note meanwhile.
+Only this move's own removal counts: the delete's answer decides (success, or the commit
+a "published; SQL pending" names); a definite refusal means nothing moved; only a lost
+answer is decided from history, and then only a removal of the exact bytes read counts.
 
 A move that cannot finish as planned is kept: "pending" (the target could not commit
-yet; resume retries) or "stuck" (after a crash the planned path was taken, or the UUID
-came back into the source). Its bytes stay in the intent and in the source history, and
-a person chooses where the note goes (POST /v2/git/moves/{move_id}/resolve).
+yet; resume retries) or "stuck", with `stuck_reason`: the planned path or the rebuilt
+draft is refused by the target, the UUID came back into the source (only choice
+"source"), the source project left the host (only choice "target"), or the source
+history no longer holds the commit the move read (only choice "target"). Its bytes stay in the intent and in
+the source history, and a person chooses where the note goes
+(POST /v2/git/moves/{move_id}/resolve).
 """
 
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Coroutine
+from collections.abc import Coroutine, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import PurePosixPath
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NoReturn
 from uuid import UUID, uuid4
 
+import anyio
 from loguru import logger
 from sqlalchemy import select
 
@@ -43,13 +52,17 @@ from basic_memory.indexing.accepted_note_mutation_runner import (
 from basic_memory.markdown.note_lock import LOCKED_NOTE_MESSAGE, note_is_locked
 from basic_memory.models import Entity, NoteContent
 from basic_memory.repository.entity_repository import EntityRepository
-from basic_memory.repository.git_host_identities import GitHostIdentities
-from basic_memory.repository.git_move_intent_repository import (
-    GitMoveIntentError,
-    GitMoveIntentRepository,
+from basic_memory.repository.git_host_identities import GitHostIdentities, GitNoteOwnedElsewhere
+from basic_memory.repository.git_move_intent_repository import GitMoveIntentRepository
+from basic_memory.repository.git_project_repository import (
+    GitPublicationError,
+    GitSnapshot,
+    quote_in_message,
 )
-from basic_memory.repository.git_project_repository import GitSnapshot, quote_in_message
-from basic_memory.repository.git_projection_repository import GitProjectionConflict
+from basic_memory.repository.git_projection_repository import (
+    GitProjectionConflict,
+    GitProjectionDeferred,
+)
 from basic_memory.repository.git_transaction_repository import GitTransactionError
 from basic_memory.schemas.base import Entity as EntitySchema
 from basic_memory.schemas.git_moves import (
@@ -158,17 +171,17 @@ async def _settled[T](operation: Coroutine[Any, Any, T]) -> T:
     still receives its cancellation once the move has reached its outcome.
     """
     task = asyncio.ensure_future(operation)
-    cancelled: asyncio.CancelledError | None = None
-    while not task.done():
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError as error:
-            cancelled = error
-    if cancelled is not None:
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        # Constraint: an anyio cancel scope (FastMCP, Starlette middleware) delivers its
+        #   cancellation again on every loop tick; a loop around asyncio.shield would spin.
+        # Outcome: one shielded wait for the move, then the caller's cancellation.
+        with anyio.CancelScope(shield=True):
+            await asyncio.wait({task})
         if not task.cancelled():
             task.exception()
-        raise cancelled
-    return task.result()
+        raise
 
 
 def _project_name(runtime: GitProjectRuntime) -> str:
@@ -259,8 +272,9 @@ async def _move_admitted(
 ) -> GitCrossProjectMoveResult:
     # --- Checks: nothing is written yet ---
     # Target SQL first follows its head, so the title and permalink checks see every
-    # note; a target that waits for other projects' notes still takes this one.
-    await target.catch_up_admitted()
+    # note; a target that waits for other projects' notes still takes this one, and its
+    # waiting notes (in its head, not yet in SQL) are checked from the head.
+    deferral = await target.catch_up_admitted()
     base = await asyncio.to_thread(target.pipeline.repository.snapshot)
     note = await _source_note(source, request)
     identities = _identities(host)
@@ -271,7 +285,9 @@ async def _move_admitted(
             f"Note {note.external_id} is part of the open cross-project move {holder}; "
             f"finish or resolve it first (GET /v2/git/moves). {UNCHANGED}",
         )
-    await _require_unique_title(target, note.title)
+    await _require_unique_title(
+        target, note.title, waiting=_waiting_titles(base, deferral, note.external_id)
+    )
     canonical = await _canonical(
         target,
         title=note.title,
@@ -281,6 +297,7 @@ async def _move_admitted(
         modified=note.modified,
     )
     _require_free(base, canonical.path, note.external_id)
+    await _require_held_only_by_source(identities, source, note.external_id)
 
     # --- Draft (0) and intent: still nothing published ---
     move_id = uuid4()
@@ -369,13 +386,14 @@ async def _publish(
         # base is the head the checks read, and its notes prove themselves to the catch-up.
         return await _commit(host, source, target, intent, catch_up=catch_up, base=base)
     except Exception as error:
+        # The raw error may carry Git stderr or host paths: only the log keeps it.
         logger.exception("Cross-project move stopped after the source delete", error=str(error))
         return _result(
             intent,
             "pending",
             message=(
-                f"The move stopped after the source deleted the note ({error}); it finishes "
-                "at the next host start or with POST /v2/git/moves/resume"
+                "The move stopped after the source deleted the note; it finishes at the "
+                "next host start or with POST /v2/git/moves/resume"
             ),
         )
 
@@ -439,8 +457,45 @@ async def _source_note(
     )
 
 
-async def _require_unique_title(target: GitProjectRuntime, title: str) -> None:
-    """P2: a second note with the title would make `[[Title]]` ambiguous in the target."""
+def _waiting_titles(
+    base: GitSnapshot, deferral: GitProjectionDeferred | None, moving: UUID
+) -> dict[str, str]:
+    """The titles of the notes a waiting target holds in its head but not yet in SQL.
+
+    The moving note itself is left out: a target that already holds it is refused as
+    "already in the target" below.
+    """
+    if deferral is None:
+        return {}
+    waiting = {note.external_id for note in deferral.waiting} - {moving}
+    titles: dict[str, str] = {}
+    for path, external_id in base.manifest.note_ids.items():
+        if external_id in waiting:
+            # A note without a title is named by its file, as indexing names it.
+            frontmatter = parse_frontmatter(base.files[path])
+            titles[path] = str(frontmatter.get("title") or PurePosixPath(path).stem)
+    return titles
+
+
+async def _require_unique_title(
+    target: GitProjectRuntime, title: str, *, waiting: Mapping[str, str] | None = None
+) -> None:
+    """P2: a second note with the title would make `[[Title]]` ambiguous in the target.
+
+    `waiting` (path -> title) are the target's notes that wait for another project to
+    release them: in its head, but not yet in its SQL.
+    """
+    wanted = title.strip().casefold()
+    for path, other in sorted((waiting or {}).items()):
+        if wanted and other.strip().casefold() == wanted:
+            raise GitMoveRefused(
+                409,
+                "duplicate_title",
+                f"A note titled '{other}' already exists at '{path}' in project "
+                f"'{_project_name(target)}' (it waits for another project). {UNCHANGED}",
+                title=other,
+                file_path=path,
+            )
     async with target.pipeline.session_maker() as session:
         twins = await EntityRepository(
             project_id=target.pipeline.project_id
@@ -459,7 +514,7 @@ async def _require_unique_title(target: GitProjectRuntime, title: str) -> None:
 
 
 async def _canonical(
-    target: GitProjectRuntime,
+    runtime: GitProjectRuntime,
     *,
     title: str,
     content: str,
@@ -467,10 +522,10 @@ async def _canonical(
     created: datetime | None,
     modified: datetime | None,
 ) -> _Canonical:
-    """The bytes an ordinary create of this note in the target would accept.
+    """The bytes an ordinary create of this note in `runtime`'s project would accept.
 
-    The permalink is formed again from the target path (one of the source project
-    would point into the wrong project), with the '-1' suffix a taken one gets. The
+    The permalink is formed again from the path (one of another project or path
+    would point to the wrong place), with the '-1' suffix a taken one gets. The
     source entity's times go into a note that lacks them before the preparer runs, which
     would otherwise date the note with the move (BM-010).
     """
@@ -492,14 +547,14 @@ async def _canonical(
         content_type="text/markdown",
         content=text,
     )
-    async with target.pipeline.session_maker() as session:
+    async with runtime.pipeline.session_maker() as session:
         try:
             project = await load_accepted_note_mutation_project(
                 session,
-                project_external_id=target.pipeline.project_external_id,
-                dependencies=target.dependencies,
+                project_external_id=runtime.pipeline.project_external_id,
+                dependencies=runtime.dependencies,
             )
-            preparer = target.dependencies.preparer_factory.create_note_preparer(project)
+            preparer = runtime.dependencies.preparer_factory.create_note_preparer(project)
             prepared = await prepare_create_or_reject(
                 preparer, data, check_storage_exists=True, session=session, authorship=None
             )
@@ -523,6 +578,26 @@ async def _canonical(
     return _Canonical(final, markdown, str(parse_frontmatter(markdown)["permalink"]))
 
 
+async def _require_held_only_by_source(
+    identities: GitHostIdentities, source: GitProjectRuntime, external_id: UUID
+) -> None:
+    """No other project may hold the UUID in SQL or in its published head.
+
+    Trigger: a peer's move of this note into a third project arrived here and waits.
+    Why: the target commit's ownership guard would refuse after the source delete, and
+      the move could then never finish (nor return: the third project holds the UUID).
+    Outcome: refused before anything is written; an unreadable intent refuses too.
+    """
+    async with source.pipeline.session_maker() as session:
+        try:
+            identities.require_intents_readable({external_id})
+            await identities.require_unowned(
+                session, project_id=source.pipeline.project_id, note_ids={external_id}
+            )
+        except GitNoteOwnedElsewhere as error:
+            raise GitMoveRefused(409, "owned_elsewhere", f"{error}. {UNCHANGED}") from error
+
+
 def _require_free(base: GitSnapshot, path: str, external_id: UUID) -> None:
     key = portable_path_key(path)
     if any(portable_path_key(other) == key for other in base.files):
@@ -540,8 +615,10 @@ async def _delete_source(
 ) -> str:
     """Delete the note in the source; the commit that removed it, or GitMoveRefused.
 
-    The answer alone never decides: a refused or failed delete may still have published
-    (a lost answer, "Git published; SQL pending"), and only the source's history knows.
+    The source gate is not held between the checks and this delete, so another client
+    may delete the note (or edit and then delete it) meanwhile. Only this move's own
+    removal lets the move go on: its answer decides first, and only a lost answer is
+    decided from the source's history.
     """
     failure: Exception | None = None
     try:
@@ -551,37 +628,44 @@ async def _delete_source(
             source=MOVE_SOURCE,
             base_checksum=note.checksum,
         )
-    except Exception as error:  # decided from Git below
+    except Exception as error:  # decided below
         failure = error
     repository = source.pipeline.repository
     head = await asyncio.to_thread(repository.head)
-    removals = await asyncio.to_thread(
-        repository.removals_since, note.base_commit, head, note.external_id
+    removals = (
+        await asyncio.to_thread(repository.removals_since, note.base_commit, head, note.external_id)
+        or []
     )
-    if not removals:
-        # The source still holds the note as it was read: nothing was moved.
-        match failure:
-            case NoteContentMutationServiceError(status_code=status, detail=dict() as detail):
-                message = str(detail.get("message") or "The source refused the delete")
-                extra = {k: v for k, v in detail.items() if k not in {"message", "kind"}}
-                raise GitMoveRefused(
-                    status,
-                    str(detail.get("kind") or "refused_by_source"),
-                    f"{message.rstrip('.')}. {UNCHANGED}",
-                    **extra,
-                ) from failure
-            case NoteContentMutationServiceError(status_code=status, detail=str() as detail):
-                raise GitMoveRefused(
-                    status, "refused_by_source", f"{detail.rstrip('.')}. {UNCHANGED}"
-                ) from failure
-            case None:
-                raise GitMoveRefused(
-                    409, "not_accepting", f"The source did not delete the note. {UNCHANGED}"
-                )
-            case _:
-                raise GitMoveRefused(
-                    503, "source_failed", f"The source delete failed: {failure}. {UNCHANGED}"
-                ) from failure
+    removal: str | None = None
+    match failure:
+        case None:
+            # The guarded delete removed exactly the bytes read. Its commit is the newest
+            # removal: the reservation keeps anyone from creating the UUID anew meanwhile.
+            removal = removals[-1] if removals else None
+        case NoteContentMutationServiceError(
+            status_code=503, detail={"published_commit": str() as published}
+        ):
+            # "Git published; SQL pending": that commit, and no other, is this delete's.
+            removal = published if published in removals else None
+        case NoteContentMutationServiceError(status_code=status) if status < 500:
+            # Trigger: a definite refusal (e.g. 409: the note is gone or changed).
+            # Why: nothing of this move published; a removal in history is someone
+            #   else's delete, which the move must not undo in the target.
+            # Outcome: nothing was moved, whatever the history shows.
+            removal = None
+        case _:
+            # The answer was lost: the first removal is this move's only when it removed
+            # the bytes the move read (the guarded delete could not have run otherwise).
+            if removals and await asyncio.to_thread(
+                repository.removed_unchanged,
+                removals[0],
+                note.base_commit,
+                note.external_id,
+                note.path,
+            ):
+                removal = removals[0]
+    if removal is None:
+        _refuse_unmoved(failure)
     if failure is not None:
         # Trigger: the delete published, but its SQL did not follow (or the answer was lost).
         # Why: the target commit refuses a UUID the source's SQL still holds.
@@ -592,7 +676,40 @@ async def _delete_source(
             error=str(failure),
         )
         await _catch_up_quietly(source)
-    return removals[0]
+    assert removal is not None
+    return removal
+
+
+def _refuse_unmoved(failure: Exception | None) -> NoReturn:
+    """The source delete did not publish for this move: nothing was moved."""
+    match failure:
+        case NoteContentMutationServiceError(status_code=status, detail=dict() as detail):
+            message = str(detail.get("message") or "The source refused the delete")
+            extra = {
+                k: v
+                for k, v in detail.items()
+                if k not in {"message", "kind"} and (v is None or isinstance(v, str))
+            }
+            raise GitMoveRefused(
+                status,
+                str(detail.get("kind") or "refused_by_source"),
+                f"{message.rstrip('.')}. {UNCHANGED}",
+                **extra,
+            ) from failure
+        case NoteContentMutationServiceError(status_code=status, detail=str() as detail):
+            raise GitMoveRefused(
+                status, "refused_by_source", f"{detail.rstrip('.')}. {UNCHANGED}"
+            ) from failure
+        case None:
+            raise GitMoveRefused(
+                409, "not_accepting", f"The source did not delete the note. {UNCHANGED}"
+            )
+        case _:
+            # The raw error may carry Git stderr or host paths: the log keeps it.
+            logger.warning("Cross-project move: source delete failed", error=repr(failure))
+            raise GitMoveRefused(
+                503, "source_failed", f"The source delete failed. {UNCHANGED}"
+            ) from failure
 
 
 async def _catch_up_quietly(runtime: GitProjectRuntime) -> None:
@@ -655,7 +772,13 @@ async def _commit(
                 "rolled_back",
                 "frozen",
             }:
-                return await _keep(intents, intent, "pending", f"{error}; the move resumes later")
+                logger.warning("Cross-project move: target commit failed", error=str(error))
+                return await _keep(
+                    intents,
+                    intent,
+                    "pending",
+                    "The target could not commit the note yet; the move resumes later",
+                )
             # The draft can no longer commit (the target advanced, or the draft expired or
             # was cleaned while the host was down): rebuild it from the intent's bytes.
             try:
@@ -695,7 +818,7 @@ async def _completed(
             "completed",
             target_commit=target_commit,
             index_pending=True,
-            message=f"The target's index has not caught up yet: {error}",
+            message="The target's index has not caught up yet; its worker catches up",
         )
     if deferral is not None:
         return _result(
@@ -825,16 +948,30 @@ async def _forget(intents: GitMoveIntentRepository, intent: GitMoveIntent) -> No
 def _open_intents(
     host: GitHost,
 ) -> tuple[list[tuple[GitMoveIntent, GitProjectRuntime]], list[str]]:
-    """Every readable intent with its target runtime (oldest first), and the unreadable."""
+    """Every readable intent with its target runtime (oldest first), and the unreadable.
+
+    Each file is read on its own: one damaged or stray file hides no other move. The
+    unreadable ones are named by project and file only (no host path, no raw error),
+    and while any exists, every caller-chosen UUID is refused host-wide (fail closed).
+    """
     found: list[tuple[GitMoveIntent, GitProjectRuntime]] = []
     unreadable: list[str] = []
     for runtime in host.runtimes.values():
-        intents = _intents(runtime)
-        try:
-            found.extend((intent, runtime) for intent in intents.load_all())
-        except (GitMoveIntentError, ValueError, OSError) as error:
-            unreadable.append(f"{intents.path}: {error}")
+        readable, problems = _intents(runtime).load_each()
+        found.extend((intent, runtime) for intent in readable)
+        for problem in problems:
+            logger.error(
+                "Cross-project move intent cannot be used",
+                project=runtime.pipeline.project_external_id,
+                file=problem.file_name,
+                error=problem.detail,
+            )
+            unreadable.append(
+                f"project '{_project_name(runtime)}' ({runtime.pipeline.project_external_id}): "
+                f"bm-moves/{problem.file_name} {problem.reason}"
+            )
     found.sort(key=lambda item: (item[0].created_at, str(item[0].move_id)))
+    _identities(host).unreadable_intents = tuple(unreadable)
     return found, unreadable
 
 
@@ -845,21 +982,22 @@ def list_cross_project_moves(host: GitHost) -> GitMoveListing:
     )
 
 
-def reserve_open_moves(host: GitHost) -> None:
-    """Before any request: an open move's UUID may not be created anywhere else."""
-    found, unreadable = _open_intents(host)
+def reserve_open_moves(host: GitHost) -> list[tuple[GitMoveIntent, GitProjectRuntime]]:
+    """An open move's UUID may not be created anywhere else (at start, and under the
+    move lock before a resume or a resolve, so a file fixed meanwhile is reserved too)."""
+    found, _ = _open_intents(host)
     identities = _identities(host)
     for intent, _ in found:
         identities.reservations[intent.external_id] = intent.move_id
-    for problem in unreadable:
-        logger.error("Cross-project move intents cannot be read", problem=problem)
+    return found
 
 
 async def resume_cross_project_moves(host: GitHost) -> list[GitMoveResumeOutcome]:
     """Finish or undo every open move; never raises (it runs at host start)."""
     async with host.move_lock:
-        # Unreadable intent files are collected there, not raised (they stay reserved).
-        found, _ = await asyncio.to_thread(_open_intents, host)
+        # Unreadable intent files are listed, not raised; while one exists every
+        # caller-chosen UUID is refused (its move's UUID is unknown).
+        found = await asyncio.to_thread(reserve_open_moves, host)
         outcomes = []
         for intent, target in found:
             try:
@@ -874,7 +1012,7 @@ async def resume_cross_project_moves(host: GitHost) -> list[GitMoveResumeOutcome
                         move_id=intent.move_id,
                         external_id=intent.external_id,
                         outcome="failed",
-                        detail=str(error),
+                        detail="The resume failed; the move stays open (see the server log)",
                     )
                 )
         return outcomes
@@ -940,13 +1078,31 @@ async def _resume_admitted(
             "The source's published history no longer contains the commit the move read",
         )
         return _ResumeResult("stuck", kept.message or "", None)
-    if not removals and in_source:
-        # (b) never happened: the note is still in the source, as it was.
+    # Trigger: a drafted intent, and the first removal after the base did not remove the
+    #   bytes the move read (an edit came first), or no removal at all.
+    # Why: the move's guarded delete could only have removed those exact bytes; any
+    #   other removal is someone else's delete, which the move must not undo.
+    # Outcome: (b) never happened: the draft goes, the source keeps what it has.
+    ours = bool(removals) and (
+        intent.state != "drafted"
+        or await asyncio.to_thread(
+            repository.removed_unchanged,
+            removals[0],
+            intent.source_base_commit,
+            intent.external_id,
+            intent.source_path,
+        )
+    )
+    if not ours and (in_source or intent.state == "drafted"):
         await _drop_draft(target, intent.transaction_id, intent.transaction_key)
         await _forget(intents, intent)
         _identities(host).reservations.pop(intent.external_id, None)
         return _ResumeResult(
-            "abandoned", "The source never deleted the note; it stays in the source", None
+            "abandoned",
+            "The source never deleted the note; it stays in the source"
+            if in_source
+            else "The move never deleted the note; another change removed it in the source",
+            None,
         )
     if in_source:
         # Trigger: the source deleted the note, and its UUID came back there later (a
@@ -984,7 +1140,7 @@ async def resolve_cross_project_move(
 ) -> GitCrossProjectMoveResult:
     """A person's choice for an open move: publish in the target, or return to the source."""
     async with host.move_lock:
-        found, _ = await asyncio.to_thread(_open_intents, host)
+        found = await asyncio.to_thread(reserve_open_moves, host)
         match = next(((i, t) for i, t in found if i.move_id == move_id), None)
         if match is None:
             raise GitMoveRefused(404, "not_found", f"No open cross-project move {move_id}.")
@@ -1060,9 +1216,34 @@ async def _return_to_source(
             ),
         )
     path = destination or intent.source_path
-    original = await asyncio.to_thread(repository.snapshot, intent.source_base_commit)
-    content = original.files[intent.source_path]
+    try:
+        original = await asyncio.to_thread(repository.snapshot, intent.source_base_commit)
+        content = original.files[intent.source_path]
+    except (GitPublicationError, KeyError) as error:
+        # Trigger: the source's published history lost the commit the move read.
+        # Why: the bytes the note had there are gone from it; only the intent holds them.
+        # Outcome: refused, the move stays open; choice 'target' publishes those bytes.
+        raise GitMoveRefused(
+            409,
+            "no_source_bytes",
+            "The source's history no longer holds the note as the move read it; choose 'target'.",
+        ) from error
     async with source.admission():
+        if path != intent.source_path:
+            # Trigger: the note returns to another path (its old one is taken meanwhile).
+            # Why: its old permalink belongs to the old path, which may be reused now.
+            # Outcome: the bytes an ordinary create there would get ('-1' if taken).
+            await source.catch_up_admitted()
+            content = (
+                await _canonical(
+                    source,
+                    title=intent.title,
+                    content=content,
+                    path=path,
+                    created=intent.source_created,
+                    modified=intent.source_modified,
+                )
+            ).content
         transactions = source.transactions
         started = await transactions.start_admitted(GitTransactionStart())
         try:

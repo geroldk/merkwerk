@@ -16,8 +16,9 @@ from basic_memory.schemas.git_transactions import GitCommitId
 
 # drafted: the target draft exists; the source may or may not have let go yet.
 # source_deleted: the source published the delete (its commit is recorded).
-# stuck: the source let go, but the target cannot take the note as planned; a person
-#   chooses where it goes (POST /v2/git/moves/{move_id}/resolve). Nothing is lost.
+# stuck: the source let go, but the move cannot finish as planned; `stuck_reason` names
+#   why, and a person chooses where it goes (POST /v2/git/moves/{move_id}/resolve).
+#   Nothing is lost.
 type GitMoveState = Literal["drafted", "source_deleted", "stuck"]
 
 
@@ -71,8 +72,9 @@ class GitCrossProjectMoveRequest(BaseModel):
     target_project_id: UUID
     destination_path: str
     expected_checksum: str | None = Field(default=None, min_length=1, max_length=128)
-    # A folder moved note by note catches the target up once at the end (POST
-    # .../git/moves/catch-up), not after every note.
+    # A folder moved note by note skips the catch-up after each commit and catches the
+    # target up once at the end (POST .../git/moves/catch-up); the target's SQL still
+    # follows its head before each note, for the title and permalink checks.
     catch_up: bool = True
 
     @field_validator("destination_path")
@@ -133,7 +135,9 @@ class GitMoveIntentView(BaseModel):
 
 class GitMoveListing(BaseModel):
     moves: list[GitMoveIntentView]
-    # Intent files that could not be read; each needs a person (the move stays reserved).
+    # Intent files that could not be used, by project and file name with a fixed reason
+    # (no host path, no raw error). Each needs a person; while any is listed, every
+    # caller-chosen UUID is refused host-wide, since such a file's move is unknown.
     unreadable: list[str] = []
 
 
@@ -158,7 +162,8 @@ class GitMoveResolve(BaseModel):
     target: publish it in the target project, at `destination_path` (default: the planned
       path), with its permalink formed again there.
     source: put it back into the source project, at `destination_path` (default: where it
-      was), with the bytes it had there.
+      was), with the bytes it had there; at another path the permalink is formed again
+      there (a taken one gets '-1'), as for any new note.
     """
 
     model_config = ConfigDict(extra="forbid")

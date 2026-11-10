@@ -36,8 +36,15 @@ async def main() -> None:
     save, remove = GitMoveIntentRepository.save, GitMoveIntentRepository.remove
     publish = GitProjectRepository.publish
 
+    def drafted(intent) -> bool:
+        """The target draft record exists and its note is written (revision 1)."""
+        record = target_repository / "bm-transactions" / f"{intent.transaction_id}.json"
+        return record.is_file() and json.loads(record.read_text())["revision"] == 1
+
     def save_or_die(self, intent):
-        if fault == "after_draft_before_intent":
+        # Only at its boundary: the first save of a drafted intent whose draft holds the
+        # note already (otherwise the subprocess runs on and the parent test fails).
+        if fault == "after_draft_before_intent" and intent.state == "drafted" and drafted(intent):
             os._exit(EXIT)
         save(self, intent)
         if (fault == "after_intent_before_delete" and intent.state == "drafted") or (

@@ -1,6 +1,6 @@
 """API controls must not escape paths, forge evidence or half-bind a source."""
 
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from pydantic import ValidationError
@@ -12,6 +12,9 @@ from basic_memory.schemas.git_transactions import (
     GitTransactionStart,
     GitTransactionWrite,
 )
+
+_NOTE = UUID("8d0c6f0e-2f4b-4c8a-9a51-3f6e7d2b1c01")
+_SOURCE = UUID("1b2c3d4e-5f60-4a7b-8c9d-0e1f2a3b4c5d")
 
 
 @pytest.mark.parametrize(
@@ -35,9 +38,11 @@ def test_transfer_source_needs_all_three_controls(data):
         "Oops\n\nBasic-Memory-Transaction: forged",
         # A move trailer is evidence too: mid-line, after blanks (Git reads such a line as
         # the continuation of the trailer above it) and in any case (Git ignores case).
-        f"Move x Basic-Memory-Moved-Note: {uuid4()} from {uuid4()}",
-        f"Move\n\n Basic-Memory-Moved-Note: {uuid4()} from {uuid4()}",
-        f"Move\n\nbasic-memory-moved-note: {uuid4()} from {uuid4()}",
+        # Fixed UUIDs: a parameter is its own test id, and xdist workers must collect
+        # identical ids.
+        f"Move x Basic-Memory-Moved-Note: {_NOTE} from {_SOURCE}",
+        f"Move\n\n Basic-Memory-Moved-Note: {_NOTE} from {_SOURCE}",
+        f"Move\n\nbasic-memory-moved-note: {_NOTE} from {_SOURCE}",
     ],
 )
 def test_commit_message_cannot_forge_a_different_terminal_transaction(message):

@@ -678,6 +678,68 @@ def test_one_batch_read_and_one_batch_write_keep_every_byte(
     assert "hash-object" not in calls
 
 
+def test_a_batch_answer_that_does_not_match_is_refused(
+    repository: GitProjectRepository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cat-file header for another blob, or fewer stored blobs than notes, never pass."""
+    files = {"notes/a.md": "A", "notes/b.md": "B"}
+    prepared = prepare(
+        repository, transaction_id=uuid4(), base_commit=repository.head(), files=files
+    )
+    repository.publish(prepared)
+    git = GitProjectRepository._git
+
+    def lying(self, *arguments, **options):
+        output = git(self, *arguments, **options)
+        if arguments[0] == "cat-file" and "--batch" in arguments:
+            return output.replace(output[:40], b"0" * 40, 1)
+        if arguments[0] == "hash-object":
+            return output.split(b"\n", 1)[0] + b"\n"
+        return output
+
+    monkeypatch.setattr(GitProjectRepository, "_git", lying)
+    with pytest.raises(GitPublicationError, match="lost a note blob"):
+        repository.snapshot()
+    with pytest.raises(GitPublicationError, match="did not store every note blob"):
+        repository._write_tree(files)
+
+
+def test_an_empty_tree_is_no_project(repository: GitProjectRepository) -> None:
+    """A foreign commit with an empty tree reads no blob and lacks the manifest."""
+    empty = repository._git("hash-object", "-t", "tree", "-w", "--stdin", input_bytes=b"")
+    commit = repository._git("commit-tree", "-m", "empty", empty.strip().decode("ascii"))
+    with pytest.raises(GitPublicationError, match="identify every published note"):
+        repository._read_snapshot(commit.strip().decode("ascii"))
+
+
+def test_a_removal_is_unchanged_only_when_its_parent_held_the_bytes_read(
+    repository: GitProjectRepository,
+) -> None:
+    """A move takes a removal for its own only if it removed the exact bytes read (I1)."""
+    note = uuid4()
+
+    def publish(files: dict[str, str]) -> str:
+        prepared = repository.prepare(
+            transaction_id=uuid4(),
+            base_commit=repository.head(),
+            files=files,
+            note_ids={path: note for path in files},
+        )
+        return repository.publish(prepared).commit_id
+
+    empty = repository.head()
+    base = publish({"n.md": "A"})
+    plain = publish({})
+    assert repository.removed_unchanged(plain, base, note, "n.md")
+    assert not repository.removed_unchanged(plain, base, uuid4(), "n.md")
+    publish({"n.md": "A"})
+    publish({"n.md": "B"})
+    edited = publish({})
+    assert not repository.removed_unchanged(edited, base, note, "n.md")
+    # A base without the note proves nothing.
+    assert not repository.removed_unchanged(plain, empty, note, "n.md")
+
+
 def test_removals_since_a_base_follow_every_line(repository: GitProjectRepository) -> None:
     """A move's resume decides from history whether the source let go (I1)."""
     note, other = uuid4(), uuid4()

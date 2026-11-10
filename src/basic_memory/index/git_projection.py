@@ -316,6 +316,9 @@ class GitProjectionPipeline:
     # The host-wide ownership view (I1); None for an offline caller, which keeps the
     # old rule: any UUID another project owns refuses the snapshot.
     identities: GitHostIdentities | None = None
+    # The runtime's SQL content gate (shared with accept()); the graph stage holds it per
+    # note, never for the whole stage. None for an offline caller.
+    content_gate: asyncio.Lock | None = None
 
     async def apply(
         self,
@@ -361,49 +364,63 @@ class GitProjectionPipeline:
             for note in snapshot.manifest.notes:
                 if graph_paths is not None and note.path not in graph_paths:
                     continue
-                await self.require_head(commit_id)
-                async with self.session_maker() as session:
-                    entity = await session.scalar(
-                        select(Entity).where(
-                            Entity.project_id == self.project_id,
-                            Entity.external_id == str(note.external_id),
-                            Entity.file_path == note.path,
+                # Trigger: the graph stage indexes a note's file, which creates its entity
+                #   (and a content row) when SQL has none.
+                # Why: a write that deletes the note between the checks below and the index
+                #   would be undone in SQL: the file is still on disk until the files stage
+                #   runs, so the entity comes back, outside the published head (and a moved
+                #   note's UUID would stay in its source). That state never converges.
+                # Outcome: the runtime's content gate is held per note, from the head check
+                #   through the index: a short critical section, never the whole stage.
+                gate = self.content_gate if stage == "graph" else None
+                async with gate if gate is not None else nullcontext():
+                    await self.require_head(commit_id)
+                    async with self.session_maker() as session:
+                        entity = await session.scalar(
+                            select(Entity).where(
+                                Entity.project_id == self.project_id,
+                                Entity.external_id == str(note.external_id),
+                                Entity.file_path == note.path,
+                            )
                         )
-                    )
-                    content = (
-                        await session.get(NoteContent, entity.id) if entity is not None else None
-                    )
-                    if content is None or content.markdown_content != snapshot.files[note.path]:
-                        # A local write already moved SQL past this target: superseded.
-                        await self.require_head(commit_id)
-                        raise GitProjectionConflict(SQL_BEHIND)
-                    entity_id = content.entity_id
-                await self.require_file(snapshot, note.path)
-                if stage == "graph":
-                    indexed = await self.file_indexer.index_file(note.path, source="git-projection")
-                    if (
-                        indexed.content_superseded
-                        or indexed.external_id != str(note.external_id)
-                        or indexed.content_checksum
-                        != await compute_checksum(snapshot.files[note.path])
-                    ):
-                        raise GitProjectionConflict(
-                            "Index did not publish the target note generation"
+                        content = (
+                            await session.get(NoteContent, entity.id)
+                            if entity is not None
+                            else None
                         )
+                        if content is None or content.markdown_content != snapshot.files[note.path]:
+                            # A local write already moved SQL past this target: superseded.
+                            await self.require_head(commit_id)
+                            raise GitProjectionConflict(SQL_BEHIND)
+                        entity_id = content.entity_id
                     await self.require_file(snapshot, note.path)
-                else:
-                    # The files stage has its own path; only vectors remain here.
-                    vectors = await self.search_service.sync_entity_vectors(entity_id)
-                    if (
-                        vectors.entities_failed
-                        or vectors.entities_deferred
-                        # An unchanged entity is both synced and skipped by BM's
-                        # repository; these counters are not disjoint outcomes.
-                        or not (vectors.entities_synced == 1 or vectors.entities_skipped == 1)
-                    ):
-                        raise GitProjectionConflict(
-                            "Vector sync incomplete: " + "; ".join(vectors.sample_errors)
+                    if stage == "graph":
+                        indexed = await self.file_indexer.index_file(
+                            note.path, source="git-projection"
                         )
+                        if (
+                            indexed.content_superseded
+                            or indexed.external_id != str(note.external_id)
+                            or indexed.content_checksum
+                            != await compute_checksum(snapshot.files[note.path])
+                        ):
+                            raise GitProjectionConflict(
+                                "Index did not publish the target note generation"
+                            )
+                        await self.require_file(snapshot, note.path)
+                    else:
+                        # The files stage has its own path; only vectors remain here.
+                        vectors = await self.search_service.sync_entity_vectors(entity_id)
+                        if (
+                            vectors.entities_failed
+                            or vectors.entities_deferred
+                            # An unchanged entity is both synced and skipped by BM's
+                            # repository; these counters are not disjoint outcomes.
+                            or not (vectors.entities_synced == 1 or vectors.entities_skipped == 1)
+                        ):
+                            raise GitProjectionConflict(
+                                "Vector sync incomplete: " + "; ".join(vectors.sample_errors)
+                            )
             if stage == "graph":
                 await self.search_service.repository.purge_stale_search_rows()
             else:

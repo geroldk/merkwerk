@@ -14,6 +14,10 @@ tell such a moment from a real duplicate:
     moved one note to two projects (a double move) -> duplicate;
 (c) otherwise -> a real duplicate, refused as before.
 
+The double move is also caught while the common source still owns the note: another
+project's published head that took the note by a move from a source the claim names too
+(and is not on a chain to the claim) makes the claim a duplicate, whatever SQL says.
+
 Only manifests and commit trailers are read, never note bytes.
 """
 
@@ -22,6 +26,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
+from typing import Any
 from uuid import UUID
 
 from sqlalchemy import select
@@ -37,6 +42,7 @@ from basic_memory.schemas.git_project import GitProjectManifest
 
 # Introductions are fixed for a fixed tip and trailers for a commit, so both are cached.
 _INTRODUCTION_CACHE_LIMIT = 4096
+_MISSING: Any = object()
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,6 +69,18 @@ class GitNoteOwnedElsewhere(ValueError):
         self.external_id = external_id
 
 
+class GitMoveIntentsUnreadable(GitNoteOwnedElsewhere):
+    """A caller-chosen UUID while some move intent cannot be read: it may reserve it."""
+
+    def __init__(self, external_id: UUID) -> None:
+        ValueError.__init__(
+            self,
+            f"Note UUID {external_id} cannot be taken now: a cross-project move intent "
+            "cannot be read and may reserve it (GET /v2/git/moves lists the file)",
+        )
+        self.external_id = external_id
+
+
 class GitHostIdentities:
     """The host-wide view of note ownership, shared by every project runtime.
 
@@ -75,8 +93,11 @@ class GitHostIdentities:
             project.project_id: project for project in projects
         }
         self._by_external_id = {project.external_id: project for project in self.projects.values()}
-        # Note UUID -> the cross-project move that reserves it host-wide (filled in part B).
+        # Note UUID -> the cross-project move that reserves it host-wide.
         self.reservations: dict[UUID, UUID] = {}
+        # Intent files that cannot be read (by name), as the last read of bm-moves/ found.
+        # Their moves' UUIDs are unknown, so every caller-chosen UUID is refused meanwhile.
+        self.unreadable_intents: tuple[str, ...] = ()
         self._wakers: dict[int, Callable[[], None]] = {}
         self._waiting: dict[int, frozenset[int]] = {}
         self._introductions: dict[tuple[str, str, UUID], str | None] = {}
@@ -115,18 +136,24 @@ class GitHostIdentities:
         `history` is the claiming repository and the commit whose manifest this is (a
         published head, a validated incoming tip or a prepared merge).
         """
-        owners = await self.sql_owners(
-            session, project_id, (note.external_id for note in manifest.notes)
-        )
-        if not owners:
-            return ForeignNotes({}, {})
-        return await asyncio.to_thread(self._classify, owners, history)
+        note_ids = [note.external_id for note in manifest.notes]
+        owners = await self.sql_owners(session, project_id, note_ids)
+        return await asyncio.to_thread(self._classify, project_id, note_ids, owners, history)
 
     def _classify(
-        self, owners: Mapping[UUID, int], history: tuple[GitProjectRepository, str]
+        self,
+        project_id: int,
+        note_ids: list[UUID],
+        owners: Mapping[UUID, int],
+        history: tuple[GitProjectRepository, str],
     ) -> ForeignNotes:
         claimant, tip = history
-        heads: dict[int, frozenset[UUID]] = {}
+        # The other projects' published heads: a manifest read each, no note bytes.
+        heads = {
+            other.project_id: other.repository.published_note_ids()
+            for other in self.projects.values()
+            if other.project_id != project_id
+        }
         deferred: dict[UUID, int] = {}
         duplicates: dict[UUID, int] = {}
         held: dict[UUID, GitHostProject] = {}
@@ -135,37 +162,69 @@ class GitHostIdentities:
             if owner is None:
                 duplicates[note] = owner_id
                 continue
-            if owner_id not in heads:
-                heads[owner_id] = owner.repository.published_note_ids()
             # Rule (a): the owner published the release; its SQL follows on its own.
             if note not in heads[owner_id]:
                 deferred[note] = owner_id
             else:
                 held[note] = owner
-        # Rule (b) needs each claim's introduction: one walk of the claiming history for
-        # all of them (a folder that arrived by 600 single moves is 600 such notes).
-        claims = self._claims(claimant, tip, held)
+        # Trigger: another project's head newly holds a note of this manifest, though its
+        #   SQL does not (yet): it synced a peer's move, and its projection waits or lags.
+        # Why: two hosts that each moved one note out of one project into two targets
+        #   leave two heads that both claim a move from the same source; while the source
+        #   still owns the note in SQL, rule (b) alone would let both through, and the
+        #   second projection would hit SQL's unique index (and refuse the next start).
+        # Outcome: such a rival head makes the claim a duplicate (invalid_incoming on sync).
+        rivals: dict[UUID, list[GitHostProject]] = {}
+        for note in note_ids:
+            if note in duplicates:
+                continue
+            others = [
+                self.projects[other_id]
+                for other_id, ids in heads.items()
+                if note in ids and other_id != owners.get(note)
+            ]
+            if others:
+                rivals[note] = others
+        # Rules (b) and the rival check need each claim's introduction: one walk of the
+        # claiming history for all of them (a folder that arrived by 600 single moves is
+        # 600 such notes).
+        claims = self._claims(claimant, tip, held.keys() | rivals.keys())
         for note, owner in held.items():
             if self._move_in_progress(note, owner, claims[note]):
                 deferred[note] = owner.project_id
             else:
                 duplicates[note] = owner.project_id
+        for note, others in sorted(rivals.items(), key=lambda item: str(item[0])):
+            if note in duplicates:
+                continue
+            if rival := next(
+                (other for other in others if self._double_move(note, other, claims[note])),
+                None,
+            ):
+                deferred.pop(note, None)
+                duplicates[note] = rival.project_id
         return ForeignNotes(deferred, duplicates)
 
     def _move_in_progress(self, note: UUID, owner: GitHostProject, claim: frozenset[UUID]) -> bool:
         """Rule (b): the claim's own introduction proves a move the owner will follow."""
-        if not claim:
+        return bool(claim) and not self._double_move(note, owner, claim)
+
+    def _double_move(self, note: UUID, holder: GitHostProject, claim: frozenset[UUID]) -> bool:
+        """Whether `holder` took the note by a move from a source the claim names too.
+
+        A holder the claim names, or one a move chain leads from to the claim, will
+        release the note once its own move arrives: no double move.
+        """
+        if not claim or holder.external_id in claim or self._custody_reaches(note, claim, holder):
             return False
-        if owner.external_id in claim or self._custody_reaches(note, claim, owner):
-            return True
-        # Trigger: the claim names a source other than the owner, and no project on this
-        #   host shows a move chain from the owner to that source.
-        # Why: either a chain still travelling (the owner will release once it syncs), or
-        #   two hosts each moved the note out of one project: the owner then holds a move
+        # Trigger: the claim names a source other than the holder, and no project on this
+        #   host shows a move chain from the holder to that source.
+        # Why: either a chain still travelling (the holder will release once it syncs), or
+        #   two hosts each moved the note out of one project: the holder then holds a move
         #   from that same source, and neither side would ever release.
         # Outcome: the double move is a duplicate (named invalid_incoming on sync).
-        owner_claim = self._claims(owner.repository, owner.repository.head(), [note])[note]
-        return not (owner_claim & claim)
+        holder_claim = self._claims(holder.repository, holder.repository.head(), [note])[note]
+        return bool(holder_claim & claim)
 
     def _custody_reaches(self, note: UUID, claim: frozenset[UUID], owner: GitHostProject) -> bool:
         """Whether the projects the claim names took the note, hop by hop, from the owner."""
@@ -196,11 +255,12 @@ class GitHostIdentities:
         """
         notes = list(notes)
         path = str(repository.path)
-        # Read into locals: another thread may clear a full cache meanwhile.
+        # Read into locals with one lookup each: another thread may clear a full cache
+        # between an `in` test and an index, and a cached introduction may be None.
         introductions = {
-            note: self._introductions[key]
+            note: found
             for note in notes
-            if (key := (path, tip, note)) in self._introductions
+            if (found := self._introductions.get((path, tip, note), _MISSING)) is not _MISSING
         }
         if missing := [note for note in notes if note not in introductions]:
             introductions |= repository.last_introductions(tip, missing)
@@ -209,9 +269,9 @@ class GitHostIdentities:
             )
         commits = {commit for commit in introductions.values() if commit is not None}
         trailers = {
-            commit: self._trailers[key]
+            commit: found
             for commit in commits
-            if (key := (path, commit)) in self._trailers
+            if (found := self._trailers.get((path, commit))) is not None
         }
         if unread := [commit for commit in commits if commit not in trailers]:
             trailers |= repository.moved_notes_of(unread)
@@ -258,6 +318,15 @@ class GitHostIdentities:
             move = self.reservations.get(note)
             if move is not None and move != holder:
                 raise GitNoteOwnedElsewhere(note, f"open cross-project move {move}")
+
+    def require_intents_readable(self, note_ids: Iterable[UUID]) -> None:
+        """Fail closed for a caller-chosen UUID while an intent file cannot be read.
+
+        Random UUIDs of new notes cannot collide with a move's; a chosen one (a PUT by
+        UUID, a new cross-project move) might be exactly the unreadable move's note.
+        """
+        if self.unreadable_intents and (wanted := sorted(note_ids, key=str)):
+            raise GitMoveIntentsUnreadable(wanted[0])
 
     async def require_unowned(
         self,

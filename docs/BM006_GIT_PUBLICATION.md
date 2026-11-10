@@ -124,6 +124,11 @@ a non-breaking hyphen. Any well-formed trailer for the note counts, so a chain A
 converges; but when the owner itself took the note by a move from the same source the
 claim names, and no project on this host shows a move chain from the owner to that
 source, two hosts moved one note to two projects (a double move): that is case (c).
+The double move is also caught while the common source still owns the note (both
+targets synced before it): another project's published head that already took the note
+by a move from a source the claim names too, and lies on no chain to the claim, makes the
+claim a duplicate whatever SQL says, so the second target is refused by name instead of
+reaching SQL's unique index (sync orders b, c, a and c, b, a are tested).
 Only manifests and trailers are read: one first-parent walk of the claiming history
 for all notes at once (manifests in `cat-file --batch` chunks, stopping when every note
 is placed) and one `git log` for their trailers; both are cached per tip and commit.
@@ -149,7 +154,11 @@ waiting notes, the owners and an owner's own content error (MCP: `UNAVAILABLE`);
 not the 503 "Git published; SQL pending". A transaction commit that would publish a
 UUID another project still holds is refused (409), and so is a PUT upsert that would
 create one; a UUID an open cross-project move reserves is refused host-wide except for
-that move (the reservations are filled by the move service).
+that move (the reservations are filled by the move service). While any intent file in a
+`bm-moves/` cannot be read, its move's UUID is unknown: every caller-chosen UUID (a PUT
+upsert create, a new cross-project move) is refused host-wide until the file is fixed or
+removed and the moves are read again (`GET /v2/git/moves`, resume, next start); new notes
+with fresh UUIDs are not affected.
 
 **Sync.** `require_note_ownership` applies the same rule to a fast-forward tip and to a
 prepared merge: a waiting UUID may be published, a real duplicate stays
@@ -188,12 +197,15 @@ The steps, under the host's `move_lock` (one move, resume or resolve at a time) 
 the **target's admission gate held from the draft to the commit** (lock order target, then
 source):
 
-1. **Checks, nothing written.** The target's SQL follows its head (a target that waits for
-   other notes still takes this one). The source note must be in SQL and in the source
+1. **Checks, nothing written.** The target's SQL follows its head before each note (a
+   target that waits for other notes still takes this one; the titles of its waiting
+   notes are read from its head). The source note must be in SQL and in the source
    head with the same bytes; `expected_checksum`, a Markdown path, no `locked: true`, no
    open move holding the UUID, no note with the same title in the target (P2, ignoring
-   case), a free path (also equivalent spellings, and on disk), and the UUID not in the
-   target. The canonical bytes come from the target's own create preparer in a rolled-back
+   case), a free path (also equivalent spellings, and on disk), the UUID not in the
+   target, and no other project holding it in SQL or in its published head (a peer's
+   move of it into a third project that waits here: 409 `owned_elsewhere`, since the
+   target commit could never take it after the source delete). The canonical bytes come from the target's own create preparer in a rolled-back
    session: the permalink is formed from the new path (a taken one gets `-1`), and a note
    without `created`/`modified` first gets the source entity's times, never the move time.
 2. **Draft (0).** A target transaction holds the note under its UUID
@@ -203,13 +215,21 @@ source):
    target bytes and the draft's key; `GET /v2/git/moves` never shows either.
 3. **Source delete (b)** through the ordinary guarded delete (`NoteContentMutationService`
    of the request, with the checksum read in 1; the journal records it like any delete, and a
-   deployment's actor resolver sees the label `api-cross-project-move`). Whether it happened is
-   decided from the source's published history only (`removals_since`: a commit after the
-   base that dropped the UUID), never from the answer: a refusal with no such commit
-   drops the draft and the intent and answers the source's refusal ("Nothing was moved";
-   a waiting source answers 409 `kind=deferred`). After "Git published; SQL pending" the
-   source is caught up under its own gate before the commit. The intent then says
-   `source_deleted` with the removing commit.
+   deployment's actor resolver sees the label `api-cross-project-move`). The source's gate
+   is not held between the checks and the delete, so another client may delete the note
+   (or edit and then delete it) meanwhile; only this move's own removal counts. Success:
+   the newest removal after the base is the move's (the reservation keeps the UUID from
+   being created anew). "Git published; SQL pending": the removal whose commit the answer
+   names. A definite refusal (4xx, e.g. the note is gone or changed): nothing was moved,
+   whatever the history shows, so a delete by someone else is never undone in the
+   target. A lost answer: the first removal after the base (`removals_since`) counts only
+   if its parent held the note with exactly the bytes read. Otherwise the draft and the
+   intent go and the source's refusal is answered ("Nothing was moved"; a waiting source
+   answers 409 `kind=deferred`). After "Git published; SQL pending" the source is caught
+   up under its own gate before the commit. The intent then says `source_deleted` with
+   the removing commit. Known limit: a lost answer at the same moment as someone else's
+   delete of the unchanged note cannot be told apart from the move's own delete; the
+   move then completes.
 4. **Target commit (c)** with the trailer `Basic-Memory-Moved-Note: <uuid> from <source>`.
    A draft that can no longer commit (the target advanced, the draft expired after 1800 s
    or was cleaned) is rebuilt from the intent: new canonical bytes through the preparer,
@@ -220,9 +240,16 @@ source):
    move: the answer is `completed` with `index_pending` and both commit ids.
 
 The answer is `completed`, `pending` (the source let go, the target could not commit yet;
-resume retries) or `stuck` (after a crash the planned path was taken meanwhile, or the UUID
-came back into the source). With the gate held, `stuck` cannot arise from local writes; it
-needs a crash. Nothing is lost then: the bytes are in the intent and in the source's
+resume retries) or `stuck`. `GET /v2/git/moves` names the cause in `stuck_reason`:
+
+| Stuck because | Choices that work |
+| --- | --- |
+| the planned path (or a rebuilt draft) is refused by the target | `target` with a free `destination_path`, or `source` |
+| the UUID came back into the source after the delete | `source` only (`target` answers 409 `in_source`) |
+| the source project is not on this host any more | `target` only (`source` answers 409 `no_source`) |
+| the source's history no longer contains the commit the move read | `target` only (`source` answers 409 `no_source_bytes`) |
+
+With the gate held, `stuck` cannot arise from local writes; it needs a crash. Nothing is lost then: the bytes are in the intent and in the source's
 history, the UUID stays reserved (a PUT that would create it anywhere is refused 409
 `owned_elsewhere`), and the MCP tool answers `PARTIAL_FAILURE` with `details.move_id`,
 `state`, `external_id` and `target_path`.
@@ -235,14 +262,19 @@ error boundary, so one broken intent never stops the host):
 | --- | --- |
 | target published the draft (record or trailer), or its head holds the UUID | completed: the intent goes |
 | no commit dropped the UUID, and the source head holds it | abandoned: the draft goes, the note stays in the source |
+| intent `drafted`, and the first removal did not remove the bytes read (an edit came first) | abandoned: someone else removed it; the move never deleted |
 | a commit dropped it, and the source head holds it again | stuck (a peer or a write brought it back); never dropped as "never moved" |
 | a commit dropped it | commit as in step 4, rebuilding the draft if needed |
 
 `POST /v2/git/moves/resume` does the same online. `POST /v2/git/moves/{move_id}/resolve`
 takes a person's choice for a stuck move: `{"choice": "target", "destination_path": ...}`
 publishes it in the target at another path, `{"choice": "source"}` puts it back into the
-source with its UUID and the bytes it had there (or closes the move when the source holds
-the UUID again; the moved bytes stay in the source's history). There is no CLI command;
+source with its UUID and the bytes it had there (at another `destination_path` its
+permalink is formed again there, as for any new note; or it closes the move when the
+source holds the UUID again; the moved bytes stay in the source's history). Each
+intent file is read on its own: a damaged or stray file is listed under `unreadable` by
+project and file name with a fixed reason (no host path, no raw error), and the readable
+intents next to it are still reserved and resumed. There is no CLI command;
 the offline `bm git remove-project` refuses a project an open move names, and
 `bm git backup` / `restore` carry `bm-moves/` (with its lock taken during the backup), so
 the restored host's rebuild resumes the move.
@@ -433,7 +465,11 @@ Work samples the latest published head and may coalesce A/B into C. A head chang
 supersedes an old pass: the content stage stops at once, the files stage finishes its
 writes (each fenced by the materializer's version claim and the checksum-guarded
 delete) and checks HEAD at its end; attempt/target guards reject late
-acknowledgements. The worker
+acknowledgements. The graph stage holds the runtime's content gate per note, from its
+HEAD check through the file index: indexing a file creates its entity when SQL has none,
+so a delete published between the check and the index (its file is still on disk until
+the files stage runs) would otherwise come back into SQL outside the head, and the next
+write would refuse ("SQL content is outside the captured Git basis"). The worker
 records completion only after work returns. Cancellation/process death before that
 point leaves a durable running marker; a new owner repeats the stage safely.
 Context exit cancels and awaits both tasks. SQL transactions do not span embedding

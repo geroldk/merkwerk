@@ -1,10 +1,12 @@
 """Moves that keep a note's UUID, travelling between two hosts by Git sync (I1 part A).
 
-The other host is simulated by publishing straight into each project's peer repository,
-exactly the commits its W2 move leaves: the source loses the note, the target gains it
-with BM's `Basic-Memory-Moved-Note` trailer. This host syncs the projects one by one, in
-any order; the sync guard and the projection must let a proven move through and wait,
-and must still refuse a real duplicate by name.
+The other host is simulated by publishing straight into each project's peer repository
+commits of the shape its W2 move leaves: the source loses the note, the target gains it
+with BM's `Basic-Memory-Moved-Note` trailer (written by the same `prepare` the route uses,
+and read back by the same reader the guard uses). The note bytes and the commit message
+are simpler than the route's: the guard reads only manifests and trailers. This host syncs
+the projects one by one, in any order; the sync guard and the projection must let a proven
+move through and wait, and must still refuse a real duplicate by name.
 """
 
 import asyncio
@@ -359,6 +361,103 @@ async def test_one_note_moved_to_two_projects_on_two_hosts_is_refused_by_name(
             # The refusal stays until a person resolves it (no recovery tool).
             again = await hosted.sync("c")
             assert again.last_attempt.reason == "invalid_incoming"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("order", [("b", "c", "a"), ("c", "b", "a")])
+async def test_a_double_move_synced_before_its_source_is_refused_by_name(
+    host_setup, config_manager, tmp_path, order
+):
+    """Two other hosts moved X a -> b and a -> c; this host syncs both targets first.
+
+    While a still owns X, both claims name a move from a. The second target must be
+    refused as invalid_incoming (not projected into SQL's unique index), and the host
+    must start again afterwards.
+    """
+    from basic_memory.api.app import app
+
+    hosted = Hosted(host_setup)
+    await hosted.add(host_setup, config_manager, "b", "second")
+    await hosted.add(host_setup, config_manager, "c", "third")
+    x = (await seed(hosted, {"Xnote": "a"}))["Xnote"]
+    hosted.clone_peers(config_manager, tmp_path)
+    peer_publish(hosted.peers["a"], remove=("Xnote.md",))
+    for name in ("b", "c"):
+        peer_publish(
+            hosted.peers[name],
+            add={f"{name}/xnote.md": (canonical("Xnote", f"{name}/xnote.md"), x)},
+            moved={x: UUID(hosted.ids["a"])},
+        )
+    first, second, source = order
+    labels = {"b": "second", "c": "third"}
+    async with app.router.lifespan_context(app):
+        assert (await hosted.sync(first)).last_attempt.outcome == "pulled"
+        refused = await hosted.sync(second)
+        assert refused.last_attempt.reason == "invalid_incoming", refused
+        assert refused.failure_detail is not None
+        assert str(x) in refused.failure_detail
+        assert f"project '{labels[first]}'" in refused.failure_detail
+        assert f"incoming for project '{labels[second]}'" in refused.failure_detail
+        assert x not in hosted.local[second].snapshot().manifest.note_ids.values()
+        assert (await hosted.sync(source)).last_attempt.outcome == "pulled"
+        await settled(hosted, "a", first, second)
+        assert await hosted.owner(x) == [(first, f"{first}/xnote.md")]
+        # The refusal stays named; it never turns into a raw database error.
+        again = await hosted.sync(second)
+        assert again.last_attempt.reason == "invalid_incoming", again
+        for name in ("a", "b", "c"):
+            stage = (await hosted.runtime(name).worker.status()).caught_up
+            assert stage, name
+    # Peer activity alone must not keep this host from starting.
+    async with app.router.lifespan_context(app):
+        assert await hosted.owner(x) == [(first, f"{first}/xnote.md")]
+
+
+@pytest.mark.asyncio
+async def test_a_local_move_of_a_note_a_peer_moved_elsewhere_moves_nothing(
+    host_setup, config_manager, tmp_path
+):
+    """A peer moved X from a to c; this host synced c (it waits) and then moves X to b.
+
+    The third project's head holds X: the target commit could never take it, nor could
+    the source take it back. Refused before the source delete, with nothing moved.
+    """
+    from basic_memory.api.app import app
+
+    hosted = Hosted(host_setup)
+    await hosted.add(host_setup, config_manager, "b", "second")
+    await hosted.add(host_setup, config_manager, "c", "third")
+    x = (await seed(hosted, {"Xnote": "a"}))["Xnote"]
+    hosted.clone_peers(config_manager, tmp_path)
+    peer_publish(hosted.peers["a"], remove=("Xnote.md",))
+    peer_publish(
+        hosted.peers["c"],
+        add={"there/xnote.md": (canonical("Xnote", "there/xnote.md"), x)},
+        moved={x: UUID(hosted.ids["a"])},
+    )
+    async with app.router.lifespan_context(app):
+        async with client_for(app) as client:
+            assert (await hosted.sync("c")).last_attempt.outcome == "pulled"
+            before = hosted.local["a"].head(), hosted.local["b"].head()
+            answer = await client.post(
+                f"/v2/projects/{hosted.ids['a']}/git/moves",
+                json={
+                    "external_id": str(x),
+                    "target_project_id": hosted.ids["b"],
+                    "destination_path": "here/xnote.md",
+                },
+            )
+            listing = (await client.get("/v2/git/moves")).json()
+            # The peer's move then completes here as usual.
+            assert (await hosted.sync("a")).last_attempt.outcome == "pulled"
+            await settled(hosted, "a", "b", "c")
+            assert await hosted.owner(x) == [("c", "there/xnote.md")]
+    assert answer.status_code == 409, answer.text
+    assert answer.json()["detail"]["kind"] == "owned_elsewhere"
+    assert "project 'third'" in answer.json()["detail"]["message"]
+    assert "Nothing was moved" in answer.json()["detail"]["message"]
+    assert before[1] == hosted.local["b"].head()
+    assert listing == {"moves": [], "unreadable": []}
 
 
 @pytest.mark.asyncio

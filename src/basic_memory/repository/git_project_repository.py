@@ -567,9 +567,8 @@ class GitProjectRepository:
 
     def _blobs(self, blob_ids: Iterable[str]) -> dict[str, bytes]:
         """The bytes of several blobs, in one `cat-file --batch` call."""
+        # No blobs (an empty tree) is an empty batch and an empty answer.
         wanted = list(dict.fromkeys(blob_ids))
-        if not wanted:
-            return {}
         output = self._git(
             "cat-file", "--batch", input_bytes="".join(f"{blob}\n" for blob in wanted).encode()
         )
@@ -741,6 +740,30 @@ class GitProjectRepository:
             if note not in manifests[entry[0]]
             and any(note in manifests[parent] for parent in entry[1:])
         ]
+
+    def removed_unchanged(self, removal: str, base: str, external_id: UUID, path: str) -> bool:
+        """Whether a parent of `removal` held `external_id` at `path` with `base`'s bytes.
+
+        A cross-project move whose delete answer was lost takes a removal for its own
+        only so (I1): an edit followed by someone else's delete leaves other bytes in the
+        removing commit's parent, and the move's guarded delete could not have run then.
+        """
+        _require_commit_id(removal)
+        _require_commit_id(base)
+        validate_note_path(path)
+        expected = self._run("rev-parse", "--verify", "--quiet", f"{base}:{path}")
+        if expected.returncode != 0:
+            return False
+        for parent in self._git("rev-parse", f"{removal}^@").decode("ascii").split():
+            held = self._run("rev-parse", "--verify", "--quiet", f"{parent}:{path}")
+            if held.returncode != 0 or held.stdout != expected.stdout:
+                continue
+            manifest = GitProjectManifest.model_validate_json(
+                self._git("show", f"{parent}:{GIT_PROJECT_MANIFEST_PATH}")
+            )
+            if manifest.note_ids.get(path) == external_id:
+                return True
+        return False
 
     def last_introduction(self, tip: str, external_id: UUID) -> str | None:
         """The commit that last brought `external_id` into the line ending at `tip`."""

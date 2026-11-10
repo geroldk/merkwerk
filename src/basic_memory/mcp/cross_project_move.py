@@ -150,7 +150,8 @@ async def _move_one(
     """Copy one note into the target project, then delete it from the source.
 
     On a Git host the server moves it instead and the note keeps its id; `catch_up`
-    False leaves the target's index to one catch-up after a whole folder.
+    False skips the catch-up after the commit (one follows the whole folder; the target
+    is still projected before each note).
     """
     address = source.paths.path(file_path)
     if not runtime_file_path_is_markdown_note(file_path):
@@ -352,6 +353,8 @@ _KEPT_ID_CODES: dict[str, RefusalCode] = {
     "not_accepting": "UNAVAILABLE",
     "reserved": "UNAVAILABLE",
     "source_failed": "UNAVAILABLE",
+    # Another project holds the UUID (a peer's move of it waits here): retry once synced.
+    "owned_elsewhere": "UNAVAILABLE",
 }
 
 
@@ -541,7 +544,9 @@ async def move_directory_across(
                     destination_path,
                     None,
                     output_format,
-                    # One catch-up of the target after the folder, not one per note.
+                    # The catch-up after each note's commit is batched into one after the
+                    # folder; the target's SQL still follows its head before each note
+                    # (the title and permalink checks need it).
                     catch_up=not on_git,
                 )
             )

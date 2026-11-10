@@ -65,6 +65,7 @@ async def move_answered(
         (409, "deferred", "UNAVAILABLE"),
         (409, "reserved", "UNAVAILABLE"),
         (503, "source_failed", "UNAVAILABLE"),
+        (409, "owned_elsewhere", "UNAVAILABLE"),
     ],
 )
 async def test_each_refusal_kind_gets_its_code(status, kind, code):

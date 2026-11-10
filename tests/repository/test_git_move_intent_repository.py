@@ -10,6 +10,7 @@ from pydantic import ValidationError
 
 from basic_memory.repository.git_move_intent_repository import (
     GitMoveIntentError,
+    GitMoveIntentProblem,
     GitMoveIntentRepository,
 )
 from basic_memory.repository.git_project_repository import GitProjectRepository
@@ -131,3 +132,34 @@ def test_an_intent_file_named_in_another_spelling_is_refused(store):
     path.rename(store.path / f"{str(saved.move_id).upper()}.json")
     with pytest.raises(GitMoveIntentError, match="Unknown file"):
         store.move_ids()
+
+
+def test_one_bad_file_spoils_only_itself(store, tmp_path):
+    """Each readable intent comes back next to a damaged, stray or foreign file."""
+    assert store.load_each() == ([], [])
+    good = intent(store)
+    store.save(good)
+    foreign = intent(store, target_project_id=uuid4())
+    store.save(foreign)
+    secret = "KEY-PLAINTEXT-123"
+    damaged = uuid4()
+    (store.path / f"{damaged}.json").write_text(f'{{"move_id": "{damaged}", "key": "{secret}"}}')
+    (store.path / "kaputt.json").write_text("{}")
+    other = uuid4()
+    (store.path / f"{other}.json").write_text(good.model_dump_json())
+    found, problems = store.load_each()
+    assert found == [good]
+    reasons = {problem.file_name: problem.reason for problem in problems}
+    assert reasons == {
+        f"{damaged}.json": "cannot be read",
+        "kaputt.json": "is not a move intent",
+        f"{foreign.move_id}.json": "names another target project",
+        f"{other}.json": f"Move intent {other}.json names another move",
+    }
+    # Only the server log sees the raw error; the reasons are Basic Memory's own words.
+    assert all(secret not in problem.reason for problem in problems)
+    for path in store.path.glob("*.json"):
+        path.unlink()
+    moved = store.path.rename(tmp_path / "real-moves")
+    store.path.symlink_to(moved)
+    assert store.load_each() == ([], [GitMoveIntentProblem("bm-moves", "is a symlink", "symlink")])

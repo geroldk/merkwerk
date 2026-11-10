@@ -410,6 +410,11 @@ async def test_a_crashed_move_finishes_or_undoes_at_the_next_start(
     a, a_repo, b, b_repo = two_projects
     note = await seeded(app, a, b)
     await crash(tmp_path, fault, a, a_repo, b, b_repo, note, "moved/Mover.md")
+    if fault == "after_draft_before_intent":
+        # The boundary was reached: a draft holding the note, and no intent for it.
+        (orphan,) = open_drafts(b_repo, b)
+        assert GitTransactionRepository(b_repo, UUID(b)).load(UUID(orphan)).revision == 1
+        assert intents(b_repo, b) == []
     async with app.router.lifespan_context(app):
         async with AsyncClient(transport=ASGITransport(app), base_url="http://test") as client:
             await ready(client, a)
@@ -582,8 +587,10 @@ async def test_resolve_refuses_what_would_duplicate_and_returns_where_it_can(
     note = await seeded(app, a, b)
     await crash(tmp_path, "after_delete_before_commit", a, a_repo, b, b_repo, note, "m/Mover.md")
     publish_into(b_repo, add={"m/Mover.md": (canonical("Besetzt", "m/Mover.md"), uuid4())})
-    # The source's old path is taken by another note meanwhile.
-    publish_into(a_repo, add={"notes/Mover.md": (canonical("Andere", "notes/mover.md"), uuid4())})
+    # The source's old path is taken by another note meanwhile, with the permalink an
+    # ordinary create there gets (the moved note's old one).
+    taken = canonical("Andere", "test-project/notes/mover.md")
+    publish_into(a_repo, add={"notes/Mover.md": (taken, uuid4())})
     async with app.router.lifespan_context(app):
         async with AsyncClient(transport=ASGITransport(app), base_url="http://test") as client:
             (stuck,) = (await client.get("/v2/git/moves")).json()["moves"]
@@ -603,6 +610,9 @@ async def test_resolve_refuses_what_would_duplicate_and_returns_where_it_can(
     assert elsewhere.json()["file_path"] == "zurueck/Mover.md"
     assert unknown.status_code == 404
     assert read.status_code == 200 and read.json()["file_path"] == "zurueck/Mover.md"
+    # The returned note's permalink is formed again for its new path.
+    returned = parse_frontmatter(a_repo.snapshot().files["zurueck/Mover.md"])
+    assert returned["permalink"] == "test-project/zurueck/mover"
     assert intents(b_repo, b) == []
 
 
@@ -656,7 +666,14 @@ async def test_an_intent_whose_source_left_the_host_stays_stuck_and_goes_to_the_
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "answer", ["fails", "published_sql_pending", "published_catch_up_fails", "says_nothing"]
+    "answer",
+    [
+        "fails",
+        "published_sql_pending",
+        "published_names_its_commit",
+        "published_catch_up_fails",
+        "says_nothing",
+    ],
 )
 async def test_the_source_delete_is_judged_from_its_history_not_its_answer(
     host_setup, two_projects, monkeypatch, answer
@@ -679,9 +696,10 @@ async def test_the_source_delete_is_judged_from_its_history_not_its_answer(
         if answer == "says_nothing":
             return None
         await delete(self, **arguments)
-        raise NoteContentMutationServiceError(
-            503, {"message": "Git published; SQL pending. Check status before retry."}
-        )
+        detail = {"message": "Git published; SQL pending. Check status before retry."}
+        if answer == "published_names_its_commit":
+            detail["published_commit"] = a_repo.head()
+        raise NoteContentMutationServiceError(503, detail)
 
     async with app.router.lifespan_context(app):
         async with AsyncClient(transport=ASGITransport(app), base_url="http://test") as client:
@@ -706,6 +724,110 @@ async def test_the_source_delete_is_judged_from_its_history_not_its_answer(
         assert UUID(note) in a_repo.published_note_ids()
         assert open_drafts(b_repo, b) == []
     assert intents(b_repo, b) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("meanwhile", ["delete", "edit_then_delete"])
+async def test_a_delete_by_someone_else_before_the_moves_own_is_not_undone(
+    host_setup, two_projects, monkeypatch, meanwhile
+):
+    """The source gate is not held from the checks to the delete: another client may
+    delete the note (or edit and delete it) meanwhile. That removal is not the move's;
+    the move must not publish the note it read into the target."""
+    from basic_memory.api.app import app
+    from basic_memory.services import git_cross_project_move
+
+    a, a_repo, b, b_repo = two_projects
+    canonical_step = git_cross_project_move._canonical
+    entity = f"/v2/projects/{a}/knowledge/entities"
+
+    async def someone_else_first(runtime, **arguments):
+        if meanwhile == "edit_then_delete":
+            edited = await client.put(
+                f"{entity}/{note}",
+                json={"title": "Mover", "directory": "notes", "content": "Edited\n"},
+            )
+            assert edited.status_code in {200, 202}, edited.text
+        deleted = await client.delete(f"{entity}/{note}")
+        assert deleted.status_code in {200, 202}, deleted.text
+        return await canonical_step(runtime, **arguments)
+
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=ASGITransport(app), base_url="http://test") as client:
+            note = (await write(client, a, "Mover"))["external_id"]
+            await ready(client, a)
+            await ready(client, b)
+            monkeypatch.setattr(git_cross_project_move, "_canonical", someone_else_first)
+            answer = await move(client, a, note, b, "archive/Mover.md")
+            monkeypatch.setattr(git_cross_project_move, "_canonical", canonical_step)
+            await ready(client, a)
+            await ready(client, b)
+            assert reservations() == {}
+    assert answer.status_code in {404, 409}, answer.text
+    assert "Nothing was moved" in answer.json()["detail"]["message"]
+    assert UUID(note) not in a_repo.published_note_ids()
+    assert UUID(note) not in b_repo.published_note_ids()
+    assert intents(b_repo, b) == [] and open_drafts(b_repo, b) == []
+
+
+@pytest.mark.asyncio
+async def test_a_resumed_move_does_not_take_someone_elses_removal_for_its_own(
+    host_setup, two_projects, tmp_path
+):
+    """A drafted intent after a crash; meanwhile the note was edited and deleted in the
+    source. The move's guarded delete could not have removed those bytes: abandoned."""
+    from basic_memory.api.app import app
+
+    a, a_repo, b, b_repo = two_projects
+    note = await seeded(app, a, b)
+    await crash(tmp_path, "after_intent_before_delete", a, a_repo, b, b_repo, note, "m/Mover.md")
+    (path,) = a_repo.snapshot().files
+    publish_into(a_repo, add={path: (canonical("Mover", path, "tags: [edited]\n"), UUID(note))})
+    base = a_repo.snapshot()
+    prepared = a_repo.prepare(
+        transaction_id=uuid4(), base_commit=base.commit_id, files={}, note_ids={}
+    )
+    a_repo.publish(prepared)
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=ASGITransport(app), base_url="http://test") as client:
+            await ready(client, a)
+            await ready(client, b)
+            listing = (await client.get("/v2/git/moves")).json()
+            assert reservations() == {}
+    assert listing["moves"] == []
+    assert UUID(note) not in b_repo.published_note_ids()
+    assert UUID(note) not in a_repo.published_note_ids()
+    assert intents(b_repo, b) == []
+
+
+@pytest.mark.asyncio
+async def test_a_title_a_waiting_target_holds_in_its_head_is_refused(
+    host_setup, config_manager, two_projects
+):
+    """The target waits for a note (not yet in its SQL); a move must still see its title."""
+    from basic_memory.api.app import app
+
+    a, a_repo, b, b_repo = two_projects
+    third, _ = await add_git_project(host_setup, config_manager, "third")
+    c = third.external_id
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=ASGITransport(app), base_url="http://test") as client:
+            note = (await write(client, a, "Mover"))["external_id"]
+            held = (await write(client, c, "Held"))["external_id"]
+            await ready(client, a)
+            await ready(client, c)
+            publish_into(
+                b_repo,
+                add={"held.md": (canonical("mover", "held.md"), UUID(held))},
+                moved={UUID(held): UUID(c)},
+            )
+            before = a_repo.head(), b_repo.head()
+            answer = await move(client, a, note, b, "archive/Mover.md")
+            assert reservations() == {}
+    assert answer.status_code == 409, answer.text
+    assert answer.json()["detail"]["kind"] == "duplicate_title"
+    assert answer.json()["detail"]["file_path"] == "held.md"
+    assert (a_repo.head(), b_repo.head()) == before
 
 
 # --- Edges: every refusal before the delete, every outcome after it ---
@@ -879,6 +1001,8 @@ async def test_every_outcome_after_the_source_let_go(host_setup, two_projects, m
     else:
         # The source let go; the move stays open and resume finishes it.
         assert state == "pending", answer.text
+        # Basic Memory's own words only: no raw exception text reaches the caller.
+        assert "Unexpected failure" not in (answer.json()["message"] or "")
         assert [move["move_id"] for move in listed] == [answer.json()["move_id"]]
         assert [outcome["outcome"] for outcome in resumed] == ["completed"]
     assert b_repo.snapshot().manifest.note_ids == {"archive/Mover.md": UUID(note)}
@@ -970,18 +1094,48 @@ async def test_a_lost_draft_record_is_rebuilt_and_an_unreadable_intent_is_listed
     (planned,) = intents(b_repo, b)
     # The draft's pointer is gone (a damaged copy); the intent still holds the bytes.
     (b_repo.path / "bm-transactions" / f"{planned.transaction_id}.json").unlink()
-    # And a file nobody can read sits next to the intents of the other project.
-    stray = a_repo.path / "bm-moves"
-    stray.mkdir(mode=0o700)
-    (stray / "kaputt.json").write_text("{}")
+    # And next to that intent sit a stray file and a damaged intent holding a key.
+    moves = b_repo.path / "bm-moves"
+    (moves / "kaputt.json").write_text("{}")
+    damaged = uuid4()
+    (moves / f"{damaged}.json").write_text(
+        f'{{"move_id": "{damaged}", "transaction_key": "KEY-PLAINTEXT-123"}}'
+    )
+    chosen = uuid4()
     async with app.router.lifespan_context(app):
         async with AsyncClient(transport=ASGITransport(app), base_url="http://test") as client:
             await ready(client, b)
             listing = (await client.get("/v2/git/moves")).json()
             read = await client.get(f"/v2/projects/{b}/knowledge/entities/{note}")
+            # While an intent cannot be read, its move's UUID is unknown: no caller may
+            # choose a UUID (a random one is still fine).
+            put = await client.put(
+                f"/v2/projects/{a}/knowledge/entities/{chosen}",
+                json={"title": "Gewaehlt", "directory": "notes", "content": "x\n"},
+            )
+            free = await client.post(
+                f"/v2/projects/{a}/knowledge/write",
+                json={"note": {"title": "Frei", "directory": "notes", "content": "x\n"}},
+            )
+            (moves / "kaputt.json").unlink()
+            (moves / f"{damaged}.json").unlink()
+            # Once the files are gone (and the moves read again), the UUID is free.
+            assert (await client.get("/v2/git/moves")).json()["unreadable"] == []
+            again = await client.put(
+                f"/v2/projects/{a}/knowledge/entities/{chosen}",
+                json={"title": "Gewaehlt", "directory": "notes", "content": "x\n"},
+            )
+    # The readable intent next to the bad files was resumed: the note arrived.
     assert read.status_code == 200, read.text
     assert listing["moves"] == []
-    assert len(listing["unreadable"]) == 1 and "kaputt.json" in listing["unreadable"][0]
+    assert sorted(entry.rsplit("/", 1)[-1] for entry in listing["unreadable"]) == sorted(
+        [f"{damaged}.json cannot be read", "kaputt.json is not a move intent"]
+    )
+    text = json.dumps(listing)
+    assert "KEY-PLAINTEXT-123" not in text and str(b_repo.path) not in text
+    assert put.status_code == 409 and "cannot be read" in put.json()["detail"]["message"]
+    assert free.status_code == 200, free.text
+    assert again.status_code in {200, 201, 202}, again.text
 
 
 @pytest.mark.asyncio
@@ -1005,8 +1159,17 @@ async def test_a_base_outside_the_source_history_keeps_the_move_stuck(
     async with app.router.lifespan_context(app):
         async with AsyncClient(transport=ASGITransport(app), base_url="http://test") as client:
             (stuck,) = (await client.get("/v2/git/moves")).json()["moves"]
+            resolve = f"/v2/git/moves/{stuck['move_id']}/resolve"
+            to_source = await client.post(resolve, json={"choice": "source"})
+            (still,) = (await client.get("/v2/git/moves")).json()["moves"]
+            to_target = await client.post(resolve, json={"choice": "target"})
     assert stuck["state"] == "stuck" and "history" in stuck["stuck_reason"]
-    assert UUID(note) not in b_repo.published_note_ids()
+    # The bytes the note had in the source are gone from its history: only 'target'.
+    assert to_source.status_code == 409, to_source.text
+    assert to_source.json()["detail"]["kind"] == "no_source_bytes"
+    assert still["move_id"] == stuck["move_id"]
+    assert to_target.status_code == 200 and to_target.json()["state"] == "completed"
+    assert b_repo.snapshot().manifest.note_ids == {"m/Mover.md": UUID(note)}
 
 
 @pytest.mark.asyncio

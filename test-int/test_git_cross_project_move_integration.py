@@ -6,6 +6,7 @@ deliberately not one atomic commit, because projects are the transaction boundar
 """
 
 import asyncio
+import inspect
 import json
 from datetime import datetime
 from typing import Any
@@ -589,3 +590,75 @@ async def test_a_folder_in_json_lists_every_kept_id_and_says_when_the_index_lags
         path.replace("ordner/", "zurueck/", 1): note for path, note in source.items()
     }
     assert second_repo.snapshot().files == {}
+
+
+@pytest.mark.asyncio
+async def test_a_delete_while_the_graph_stage_indexes_the_note_stays_deleted(
+    host_setup, monkeypatch
+):
+    """The graph stage must not bring back an entity a write deleted meanwhile.
+
+    It indexes a note's file after checking SQL; the file stays on disk until the files
+    stage runs. A delete published between the check and the index used to come back
+    into SQL (outside the head), and the next write refused: "SQL content is outside the
+    captured Git basis" (the flaky folder move of the cross-project tests).
+    """
+    from httpx import ASGITransport, AsyncClient
+
+    from basic_memory.api.app import app
+    from basic_memory.index.git_projection import GitProjectionPipeline
+
+    from tests.git_host_support import ready
+
+    project = host_setup.project.external_id
+    require_file = GitProjectionPipeline.require_file
+    pending: dict[str, Any] = {}
+
+    async def deleting_meanwhile(self, snapshot, path):
+        if (
+            pending.get("path") == path
+            and "task" not in pending
+            and inspect.stack()[1].function == "apply"
+        ):
+            # Only the graph stage's own check (from apply), not the files stage's: the
+            # delete gets every chance to publish before the index runs.
+            pending["task"] = asyncio.create_task(
+                client.delete(f"/v2/projects/{project}/knowledge/entities/{pending['note']}")
+            )
+            await asyncio.wait({pending["task"]}, timeout=1.0)
+        return await require_file(self, snapshot, path)
+
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=ASGITransport(app), base_url="http://test") as client:
+            notes = {}
+            for title in ("Alpha", "Beta"):
+                answer = await client.post(
+                    f"/v2/projects/{project}/knowledge/write",
+                    json={"note": {"title": title, "directory": "ordner", "content": "x\n"}},
+                )
+                assert answer.status_code == 200, answer.text
+                notes[title] = answer.json()["entity"]
+            await ready(client, project)
+            pending.update(path=notes["Alpha"]["file_path"], note=notes["Alpha"]["external_id"])
+            monkeypatch.setattr(GitProjectionPipeline, "require_file", deleting_meanwhile)
+            # A new note changes the graph identities: the next graph pass reads every note.
+            third = await client.post(
+                f"/v2/projects/{project}/knowledge/write",
+                json={"note": {"title": "Gamma", "directory": "ordner", "content": "x\n"}},
+            )
+            assert third.status_code == 200, third.text
+            async with asyncio.timeout(30):
+                while "task" not in pending:
+                    await asyncio.sleep(0.02)
+                deleted = await pending["task"]
+            assert deleted.status_code in {200, 202}, deleted.text
+            monkeypatch.setattr(GitProjectionPipeline, "require_file", require_file)
+            beta = await client.delete(
+                f"/v2/projects/{project}/knowledge/entities/{notes['Beta']['external_id']}"
+            )
+            await ready(client, project)
+    assert beta.status_code in {200, 202}, beta.text
+    _, factory = await db.get_or_create_db(host_setup.config.database_path)
+    async with factory() as session:
+        paths = set((await session.scalars(select(Entity.file_path))).all())
+    assert paths == {"ordner/Gamma.md"}

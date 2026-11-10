@@ -67,12 +67,18 @@ yet) is kept with its content and finishes at the next start of the host or
 with `POST /v2/git/moves/resume`; until then the call answers
 `PARTIAL_FAILURE` with `details.move_id`, `details.state` (`pending` or
 `stuck`) and `details.external_id`, and the id stays reserved (no other note
-may take it). `stuck` means the planned path was taken meanwhile: a person
-chooses with `POST /v2/git/moves/{move_id}/resolve`, `{"choice": "target",
+may take it). A `stuck` move needs a person, who chooses with
+`POST /v2/git/moves/{move_id}/resolve`, `{"choice": "target",
 "destination_path": ...}` or `{"choice": "source"}` (back where it came from).
-`GET /v2/git/moves` lists open moves. A directory moves note by note through the
-same route, with every id kept, and the target's index catches up once at the
-end; the text form lists every note, one line each, without an upper limit. As a
+`GET /v2/git/moves` lists open moves; its `stuck_reason` names the cause and so
+the choice that works: the planned path was taken or the target refuses the
+note there (either choice; `target` with a free path), the id came back into the
+source (only `source`), the source project left the host (only `target`), or the
+source's history no longer holds the commit the move read (only `target`). A directory
+moves note by note through the same route, with every id kept; the target is
+projected before each note (the title and path checks need it), and only the
+catch-up after each note is saved up into one at the end; the text form lists
+every note, one line each, without an upper limit. As a
 rough guide, a folder of 300 notes moved into a project of 1000 notes in about
 13 minutes (2.6 s per note) and one of 600 in about 31 minutes, on one machine
 with both projects idle; graph and search indexing follow for some minutes
@@ -158,8 +164,12 @@ bm_move(identifier="plans/launch.md", destination="inbox/", project="demo",
   it finishes on its own (next start, or `POST /v2/git/moves/resume`), or, when
   `stuck`, by a person's choice; its id stays reserved meanwhile.
 - A target project that waits for notes another project still holds takes the
-  move anyway; the answer then says its index is pending. A source that waits
-  refuses (`UNAVAILABLE`) until the owner it waits for has synced.
+  move anyway (a waiting note's title still counts as taken); the answer then
+  says its index is pending. A source that waits refuses (`UNAVAILABLE`) until
+  the owner it waits for has synced, and so does a note whose id another project
+  holds already (a peer's move of it that waits here).
+- If another client deletes or edits the note while the move runs, the move
+  moves nothing; it never brings back a note someone deleted.
 - Off a Git host a directory move is file by file. If some files fail, the
   error lists which moved and which did not; bm_list the destination before
   retrying.

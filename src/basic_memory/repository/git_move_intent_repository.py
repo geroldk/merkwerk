@@ -10,6 +10,7 @@ rename, fsync of the directory), as the transaction pointers next to it are writ
 import os
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from uuid import UUID
@@ -25,6 +26,15 @@ MOVES_LOCK = "bm-moves.lock"
 
 class GitMoveIntentError(RuntimeError):
     """An intent file is unusable: a symlink, another project's, or unreadable."""
+
+
+@dataclass(frozen=True, slots=True)
+class GitMoveIntentProblem:
+    """One file in bm-moves/ that is no usable intent of this target."""
+
+    file_name: str
+    reason: str
+    detail: str
 
 
 class GitMoveIntentRepository:
@@ -99,8 +109,47 @@ class GitMoveIntentRepository:
             identities.append(identity)
         return identities
 
+    def load_each(self) -> tuple[list[GitMoveIntent], list[GitMoveIntentProblem]]:
+        """Every readable intent of this target (oldest first), and each unusable file.
+
+        One damaged or stray file must not hide its neighbours: each readable intent is
+        still reserved and resumed. A problem carries Basic Memory's own wording for API
+        callers and the raw error for the server log only.
+        """
+        if self.path.is_symlink():
+            return [], [GitMoveIntentProblem(MOVES_DIRECTORY, "is a symlink", "symlink")]
+        if not self.path.is_dir():
+            return [], []
+        intents: list[GitMoveIntent] = []
+        problems: list[GitMoveIntentProblem] = []
+        for path in sorted(self.path.glob("*.json")):
+            try:
+                identity = UUID(path.stem)
+            except ValueError:
+                identity = None
+            if identity is None or path.name != f"{identity}.json":
+                problems.append(GitMoveIntentProblem(path.name, "is not a move intent", ""))
+                continue
+            try:
+                intent = self.load(identity)
+            except GitMoveIntentError as error:
+                problems.append(GitMoveIntentProblem(path.name, str(error), str(error)))
+                continue
+            except (KeyError, ValueError, OSError) as error:
+                problems.append(GitMoveIntentProblem(path.name, "cannot be read", repr(error)))
+                continue
+            if intent.target_project_id != self.project_id:
+                problems.append(GitMoveIntentProblem(path.name, "names another target project", ""))
+                continue
+            intents.append(intent)
+        intents.sort(key=lambda intent: (intent.created_at, str(intent.move_id)))
+        return intents, problems
+
     def load_all(self) -> list[GitMoveIntent]:
-        """Every open intent of this target, oldest first."""
+        """Every open intent of this target, oldest first; any unusable file raises.
+
+        For callers that must refuse rather than skip (backup, project removal).
+        """
         intents = [self.load(identity) for identity in self.move_ids()]
         if any(intent.target_project_id != self.project_id for intent in intents):
             raise GitMoveIntentError("A move intent names another target project")
