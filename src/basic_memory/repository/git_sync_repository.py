@@ -10,9 +10,13 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from basic_memory.models import Entity
+from basic_memory.repository.git_host_identities import GitHostIdentities
 from basic_memory.repository.git_project_repository import GitProjectRepository
 from basic_memory.schemas.git_sync import GitSyncRecord, GitSyncRemote
 from basic_memory.schemas.git_project import GitProjectManifest
+
+
+INCOMING_OWNED_ELSEWHERE = "Incoming note UUID is already owned by another project"
 
 
 class GitSyncRepository:
@@ -24,18 +28,43 @@ class GitSyncRepository:
         self.fingerprint = hashlib.sha256(remote.url.encode()).hexdigest() if remote else ""
 
     async def require_note_ownership(
-        self, session: AsyncSession, project_id: int, manifest: GitProjectManifest
+        self,
+        session: AsyncSession,
+        project_id: int,
+        manifest: GitProjectManifest,
+        *,
+        identities: GitHostIdentities | None = None,
+        history: tuple[GitProjectRepository, str] | None = None,
     ) -> None:
-        foreign = await session.scalar(
-            select(Entity.id)
-            .where(
-                Entity.external_id.in_([str(note.external_id) for note in manifest.notes]),
-                Entity.project_id != project_id,
+        """Refuse incoming history that would give a note UUID to two projects.
+
+        With the host's `identities` and the incoming `history` (its tip or the prepared
+        merge), a UUID another project still owns for a proven reason is let through:
+        projection then waits until the owner releases it (I1). Only a real duplicate
+        is refused, naming the UUID and both projects.
+        """
+        if identities is None or history is None:
+            foreign = await session.scalar(
+                select(Entity.id)
+                .where(
+                    Entity.external_id.in_([str(note.external_id) for note in manifest.notes]),
+                    Entity.project_id != project_id,
+                )
+                .limit(1)
             )
-            .limit(1)
+            if foreign is not None:
+                raise ValueError(INCOMING_OWNED_ELSEWHERE)
+            return
+        foreign = await identities.classify_foreign(
+            session, project_id=project_id, manifest=manifest, history=history
         )
-        if foreign is not None:
-            raise ValueError("Incoming note UUID is already owned by another project")
+        if foreign.duplicates:
+            raise ValueError(
+                identities.duplicates_message(
+                    f"{INCOMING_OWNED_ELSEWHERE}; incoming for {identities.describe(project_id)}",
+                    foreign,
+                )
+            )
 
     def load(self) -> GitSyncRecord:
         if self.path.is_symlink():

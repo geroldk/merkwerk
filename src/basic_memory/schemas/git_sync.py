@@ -62,3 +62,6 @@ class GitSyncStatus(BaseModel):
     relationship: Literal["unobserved", "equal", "ahead", "behind", "diverged"]
     last_attempt: GitSyncAttempt | None
     open_review: GitSyncReview | None = None
+    # Why the last attempt failed, in words (e.g. which note UUID two projects claim).
+    # Held in memory only: bm-sync.json keeps its format, so an older version reads it.
+    failure_detail: str | None = None

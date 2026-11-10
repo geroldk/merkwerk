@@ -166,6 +166,8 @@ async def bm_project(
                 lines.append(f"Peer (last observation): {status.synchronization.relationship}")
                 if status.synchronization.last_attempt is not None:
                     lines.append(status.synchronization.last_attempt.model_dump_json())
+                if status.synchronization.failure_detail is not None:
+                    lines.append(f"  {status.synchronization.failure_detail}")
                 if (open_review := status.synchronization.open_review) is not None:
                     lines.append(
                         f"Merge review {open_review.id} open: {open_review.conflicts} "

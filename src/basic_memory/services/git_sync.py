@@ -8,6 +8,8 @@ from functools import partial
 from typing import TYPE_CHECKING, Literal
 from uuid import UUID, uuid4
 
+from loguru import logger
+
 from basic_memory.repository.git_project_repository import (
     GitPublicationConflict,
     GitPublicationError,
@@ -62,6 +64,8 @@ class GitSyncService:
         self.records = GitSyncRepository(
             runtime.pipeline.repository, UUID(runtime.pipeline.project_external_id), remote
         )
+        # The failed attempt's id and its reason in words (not persisted, see GitSyncStatus).
+        self._failure: tuple[UUID, str] | None = None
 
     async def recover(self) -> None:
         record = await asyncio.to_thread(self.records.load)
@@ -108,6 +112,13 @@ class GitSyncService:
             observed_remote_commit=record.observed_remote_commit,
             relationship=relationship,
             last_attempt=record.attempt,
+            failure_detail=(
+                self._failure[1]
+                if self._failure is not None
+                and isinstance(attempt, SyncFailed)
+                and attempt.attempt_id == self._failure[0]
+                else None
+            ),
         )
 
     async def _merge(
@@ -182,8 +193,14 @@ class GitSyncService:
         )
         async with self.runtime.admission():
             async with self.runtime.pipeline.session_maker() as session:
+                # The prepared merge is the history to judge: a note it keeps although
+                # the local side deleted it is introduced by the merge itself (I1).
                 await self.records.require_note_ownership(
-                    session, self.runtime.pipeline.project_id, manifest
+                    session,
+                    self.runtime.pipeline.project_id,
+                    manifest,
+                    identities=self.runtime.pipeline.identities,
+                    history=(repository, merge.commit_id),
                 )
             await settle_git_operation(partial(repository.publish_merge, merge))
         return "merged", merge.commit_id
@@ -252,6 +269,8 @@ class GitSyncService:
                                     session,
                                     self.runtime.pipeline.project_id,
                                     validated_tip.manifest,
+                                    identities=self.runtime.pipeline.identities,
+                                    history=(repository, incoming),
                                 )
                             failure_reason = "local_changed"
                             await settle_git_operation(
@@ -319,6 +338,15 @@ class GitSyncService:
                     failure_reason = "local_changed"
                 if isinstance(error, ReviewIncomplete):
                     refused = error  # the caller must see why its decisions were not applied
+                if failure_reason == "invalid_incoming":
+                    # The record keeps only the reason; the words (which UUID, which
+                    # projects) go to the log and to the status of this attempt.
+                    self._failure = (attempt.attempt_id, str(error))
+                    logger.warning(
+                        "Git sync refused incoming history",
+                        project_id=self.runtime.pipeline.project_id,
+                        reason=str(error),
+                    )
                 record = record.model_copy(
                     update={
                         "attempt": SyncFailed(
