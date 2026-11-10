@@ -175,11 +175,19 @@ async def test_section_names_a_slash_heading_whole(client, test_project):
     await _write(test_project.name, "Slash", SLASH_NOTE)
 
     payload = await read_json("notes/Slash.md", project=test_project.name, section="KI/ML")
-    etc = await read_json("notes/Slash.md", project=test_project.name, section="/etc")
 
     assert payload["content"] == "## KI/ML\nliteral\n"
     assert payload["section"] == "Plan/KI/ML"
-    assert etc["content"] == "## /etc\nconfig"
+
+
+@pytest.mark.asyncio
+async def test_section_names_a_heading_with_a_leading_slash(client, test_project):
+    """The selector "/etc" was refused as a malformed path; it is this heading's text."""
+    await _write(test_project.name, "Slash", SLASH_NOTE)
+
+    payload = await read_json("notes/Slash.md", project=test_project.name, section="/etc")
+
+    assert payload["content"] == "## /etc\nconfig"
 
 
 @pytest.mark.asyncio
