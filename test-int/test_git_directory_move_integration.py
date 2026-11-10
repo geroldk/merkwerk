@@ -897,7 +897,8 @@ def _app():
 
 # --- Scale ---
 # Gerold's decision: no upper limit on the number of notes. These measure what that costs
-# under the gate. They are benchmarks, so the default integration run leaves them out.
+# under the gate. The fresh 600-note move takes about a minute end to end, inside the
+# default run; the long-history one needs a real repository and is an opt-in benchmark.
 
 
 async def _scale_move(setup: HostSetup, folder: str, count: int, monkeypatch) -> dict[str, Any]:
@@ -1006,9 +1007,10 @@ async def _scale_move(setup: HostSetup, folder: str, count: int, monkeypatch) ->
     }
 
 
-@pytest.mark.benchmark
 @pytest.mark.slow
-@pytest.mark.timeout(900)
+# About 60 s alone (seeding, start-up projection, files stage, two moves); the margin is
+# for parallel runs, since the default 120 s would be tight under contention.
+@pytest.mark.timeout(600)
 @pytest.mark.asyncio
 async def test_six_hundred_notes_move_as_one_commit(git_host, monkeypatch):
     result = await _scale_move(git_host, "archiv/2026/analysen", 600, monkeypatch)
