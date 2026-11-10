@@ -20,6 +20,11 @@ from filelock import FileLock
 from basic_memory import __version__
 from basic_memory.config import BasicMemoryConfig, DatabaseBackend, ProjectEntry, ProjectMode
 from basic_memory.index.git_project_ownership import GitLocalBinding
+from basic_memory.repository.git_move_intent_repository import (
+    MOVES_DIRECTORY,
+    MOVES_LOCK,
+    GitMoveIntentRepository,
+)
 from basic_memory.repository.git_project_repository import GitProjectRepository, PUBLISHED_REF
 from basic_memory.repository.git_transaction_repository import (
     GitTransactionRepository,
@@ -76,6 +81,13 @@ def validate_transactions(repository: GitProjectRepository, project_id: UUID) ->
             source = records.load(record.source_transaction_id)
             if source.revision != record.source_revision:
                 raise ValueError("Retained source draft revision differs")
+
+
+def validate_moves(repository: GitProjectRepository, project_id: UUID) -> None:
+    """Open cross-project moves into this project (I1) must name their own draft."""
+    records = GitTransactionRepository(repository, project_id)
+    for intent in GitMoveIntentRepository(repository, project_id).load_all():
+        records.load(intent.transaction_id)
 
 
 def write_private(path: Path, content: bytes) -> None:
@@ -151,6 +163,8 @@ def create_git_backup(config_path: Path, destination: Path) -> GitBackupManifest
                 root / ".basic-memory/git-projection.lock",
                 repository.path / "bm-projection.lock",
                 repository.path / "bm-transactions.lock",
+                # An open cross-project move (I1) must not change during the cut either.
+                repository.path / MOVES_LOCK,
             }
         )
     sources = [config_path.parent, *roots, *(p.resolve() for p in config.git_repositories.values())]
@@ -184,12 +198,17 @@ def create_git_backup(config_path: Path, destination: Path) -> GitBackupManifest
                 for project in projects:
                     repository = GitProjectRepository(Path(project.source_repository))
                     validate_transactions(repository, project.project_id)
+                    validate_moves(repository, project.project_id)
                     bundle = Path(directory) / f"{project.project_id}.bundle"
                     repository._git("bundle", "create", str(bundle), "--all")
                     prefix = f"projects/{project.project_id}"
                     files = [(bundle, f"{prefix}/repository.bundle")]
                     for path in (repository.path / "bm-transactions").glob("*.json"):
                         files.append((path, f"{prefix}/metadata/bm-transactions/{path.name}"))
+                    # Without its intent, an interrupted move's note would live only in
+                    # the source's history after a restore.
+                    for path in (repository.path / MOVES_DIRECTORY).glob("*.json"):
+                        files.append((path, f"{prefix}/metadata/{MOVES_DIRECTORY}/{path.name}"))
                     for name in sorted(_METADATA_FILES):
                         path = repository.path / name
                         if path.exists() or path.is_symlink():
@@ -327,7 +346,7 @@ def restore_git_backup(backup: Path, destination: Path) -> GitBackupManifest:
                     claimed.add(name)
                     suffix = name.removeprefix(f"{prefix}/metadata/")
                     parts = PurePosixPath(suffix).parts
-                    if parts[0] == "bm-transactions" and len(parts) == 2:
+                    if parts[0] in {"bm-transactions", MOVES_DIRECTORY} and len(parts) == 2:
                         if parts[1] != f"{UUID(Path(parts[1]).stem)}.json":
                             raise ValueError("Invalid transaction metadata filename")
                         target = repository.path / suffix
@@ -344,6 +363,8 @@ def restore_git_backup(backup: Path, destination: Path) -> GitBackupManifest:
                 with archive.open(name) as source:
                     write_private(target, source.read())
             validate_transactions(repository, project.project_id)
+            # The rebuild's host start resumes these moves (index/git_host.py).
+            validate_moves(repository, project.project_id)
         if claimed != set(manifest.files):
             raise ValueError("Unknown backup members")
         config.projects = {

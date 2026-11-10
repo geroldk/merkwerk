@@ -27,6 +27,11 @@ from basic_memory import db
 from basic_memory.config import BasicMemoryConfig, ConfigManager
 from basic_memory.index.git_host import require_git_peer_settings, require_git_project_roots
 from basic_memory.models import Entity, Project
+from basic_memory.repository.git_move_intent_repository import (
+    MOVES_DIRECTORY,
+    GitMoveIntentError,
+    GitMoveIntentRepository,
+)
 from basic_memory.repository.git_project_repository import (
     GitProjectRepository,
     GitPublicationError,
@@ -70,12 +75,40 @@ def _require_unused_repository(name: str, repository_path: Path) -> None:
             f"Project {name!r} has been used or its repository is unreadable ({error}); not removed"
         ) from error
     extra = [ref for ref in references if ref != "refs/heads/main"]
-    pointers = list((repository_path / "bm-transactions").glob("*.json"))
+    pointers = list((repository_path / "bm-transactions").glob("*.json")) + list(
+        (repository_path / MOVES_DIRECTORY).glob("*.json")
+    )
     if extra or pointers:
         raise GitProjectCreateError(
             f"Project {name!r} has been worked in ({len(extra)} extra reference(s), "
             f"{len(pointers)} transaction pointer(s)); not removed"
         )
+
+
+def _require_no_open_moves(config: BasicMemoryConfig, wanted: dict[UUID, str]) -> None:
+    """No open cross-project move (I1) may name a project that goes, as source or target.
+
+    The intent lives next to the target repository and finishes from the source's
+    history; removing either would leave the moving note in no project.
+    """
+    for project_id, repository_path in config.git_repositories.items():
+        try:
+            intents = GitMoveIntentRepository(
+                GitProjectRepository(repository_path), project_id
+            ).load_all()
+        except (GitMoveIntentError, GitPublicationError, ValueError, OSError) as error:
+            raise GitProjectCreateError(
+                f"Open cross-project moves in {repository_path} cannot be read ({error}); "
+                "nothing removed"
+            ) from error
+        for intent in intents:
+            named = {intent.source_project_id, intent.target_project_id} & set(wanted)
+            if named:
+                names = ", ".join(sorted(repr(wanted[project]) for project in named))
+                raise GitProjectCreateError(
+                    f"Project(s) {names} take part in the open cross-project move "
+                    f"{intent.move_id}; finish or resolve it first (GET /v2/git/moves)"
+                )
 
 
 def _require_empty_root(name: str, root: Path) -> None:
@@ -149,6 +182,7 @@ async def _remove_empty_git_projects(
         raise GitProjectCreateError(
             f"Project(s) with notes are not removed: {', '.join(sorted(used))}"
         )
+    _require_no_open_moves(config, {UUID(by_name[name].external_id): name for name in wanted})
     if len(wanted) >= len(projects):
         raise GitProjectCreateError("At least one project must remain")
     if config.default_project in wanted:
