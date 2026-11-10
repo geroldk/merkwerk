@@ -9,7 +9,7 @@ from starlette.requests import Request
 from starlette.routing import Route
 from typer.core import TyperCommand
 
-from basic_memory.api.git_policy import enforce_git_api_policy
+from basic_memory.api.git_policy import GIT_NOTE_WRITES, enforce_git_api_policy
 from basic_memory.cli.app import app_callback
 from basic_memory.cli.container import CliContainer
 from basic_memory.deps.git import get_git_host, get_git_runtime
@@ -34,6 +34,29 @@ async def test_legacy_host_dependencies_do_not_create_git_runtime(app_config):
     assert await get_git_host(Request({"type": "http"}), app_config) is None
     assert await get_git_runtime(1, None) is None
     await enforce_git_api_policy(Request({"type": "http"}), app_config)
+
+
+def test_git_note_writes_allow_the_one_commit_folder_move_but_not_the_upstream_one():
+    """V1: folders move as one Git commit; the note-by-note upstream route stays refused."""
+    assert "move_git_directory" in GIT_NOTE_WRITES
+    assert "move_directory" not in GIT_NOTE_WRITES
+
+
+@pytest.mark.asyncio
+async def test_git_folder_move_route_passes_the_policy_and_upstream_does_not(app_config, tmp_path):
+    from basic_memory.api.v2.routers.knowledge_router import router
+    from fastapi.routing import APIRoute
+
+    app_config.git_repositories = {uuid4(): tmp_path / "project.git"}
+    routes = {route.name: route for route in router.routes if isinstance(route, APIRoute)}
+
+    def request(name: str) -> Request:
+        return Request({"type": "http", "method": "POST", "route": routes[name]})
+
+    await enforce_git_api_policy(request("move_git_directory"), app_config)
+    with pytest.raises(HTTPException) as error:
+        await enforce_git_api_policy(request("move_directory"), app_config)
+    assert error.value.status_code == 403
 
 
 @pytest.mark.asyncio

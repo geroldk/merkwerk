@@ -146,6 +146,29 @@ class MoveDirectoryRequestV2(BaseModel):
     )
 
 
+class GitMovedNote(BaseModel):
+    """One note of a folder move on a Git host. Its id and permalink stay as they were."""
+
+    previous_file_path: str
+    file_path: str
+    external_id: str
+    permalink: str
+
+
+class GitDirectoryMoveResult(BaseModel):
+    """A folder moved inside one Git project as one published commit, all or nothing.
+
+    `source` and `destination` are the folders as written, after resolving case or Unicode
+    variants of existing folders. `moved_notes` lists every note, without an upper limit.
+    """
+
+    source: str
+    destination: str
+    commit_id: str = Field(pattern=r"^[0-9a-f]{40}$")
+    total_notes: int
+    moved_notes: List[GitMovedNote]
+
+
 class DeleteDirectoryRequestV2(BaseModel):
     """V2 request schema for deleting all entities in a directory.
 

@@ -28,6 +28,7 @@ from basic_memory.services.link_resolver import normalize_link_text
 from basic_memory.services import directory_moves
 from basic_memory.services.directory_deletes import DirectoryDeleteServiceError
 from basic_memory.services.note_content_writes import NoteContentMutationServiceError
+from basic_memory.services.git_directory_moves import GitDirectoryMoveRefused
 from basic_memory.ignore_utils import (
     IGNORED_PATH_REJECTION_DETAIL,
     load_gitignore_patterns,
@@ -41,6 +42,7 @@ from basic_memory.markdown.sections import (
     parse_section_selector,
     slice_note_content,
 )
+from basic_memory.deps.git import GitRuntimeDep
 from basic_memory.deps import (
     AppConfigDep,
     EntityServiceV2ExternalDep,
@@ -106,6 +108,8 @@ from basic_memory.schemas.v2 import (
     GraphResponse,
     MoveEntityRequestV2,
     MoveDirectoryRequestV2,
+    GitDirectoryMoveResult,
+    GitMovedNote,
     DeleteDirectoryRequestV2,
     OrphanEntitiesResponse,
     IndexFileRequest,
@@ -1385,6 +1389,71 @@ async def move_directory(
             f"total={result.total_files}, success={result.successful_moves}, failed={result.failed_moves}"
         )
         return result
+
+
+## Git folder move endpoint
+
+
+@router.post("/git-move-directory", response_model=GitDirectoryMoveResult)
+async def move_git_directory(
+    data: MoveDirectoryRequestV2, git_runtime: GitRuntimeDep
+) -> GitDirectoryMoveResult:
+    """Move a folder inside one Git project as one commit, all or nothing (V1).
+
+    Every note keeps its id, permalink and created/modified; the answer lists all of them,
+    without an upper limit. A refusal changes nothing and names every offender in
+    `detail.conflicts`; `detail.reason` says what kind of refusal it is.
+    """
+    with logfire.span(
+        "api.request.knowledge.move_git_directory",
+        entrypoint="api",
+        domain="knowledge",
+        action="move_git_directory",
+    ):
+        # Trigger: a host without Git publication.
+        # Why: there is no commit to publish; move-directory serves such a host.
+        # Outcome: 404, so a caller can tell the route from a refused move.
+        if git_runtime is None:
+            raise HTTPException(404, "Folder moves in one commit need a local Git host")
+        try:
+            outcome = await git_runtime.move_directory(
+                data.source_directory, data.destination_directory
+            )
+        except GitDirectoryMoveRefused as error:
+            # No db_checksum here: a client would read the refusal as a revision conflict.
+            raise HTTPException(
+                error.status_code,
+                {
+                    "message": error.message,
+                    "reason": error.reason,
+                    "conflicts": [
+                        {"path": conflict.path, "reason": conflict.reason, "other": conflict.other}
+                        for conflict in error.conflicts
+                    ],
+                },
+            ) from error
+        except NoteContentMutationServiceError as error:
+            raise HTTPException(status_code=error.status_code, detail=error.detail) from error
+        plan = outcome.plan
+        logger.info(
+            f"API v2 response: move_git_directory source='{plan.source}' "
+            f"destination='{plan.destination}' notes={len(plan.moves)} commit={outcome.commit_id}"
+        )
+        return GitDirectoryMoveResult(
+            source=plan.source,
+            destination=plan.destination,
+            commit_id=outcome.commit_id,
+            total_notes=len(plan.moves),
+            moved_notes=[
+                GitMovedNote(
+                    previous_file_path=move.previous_file_path,
+                    file_path=move.file_path,
+                    external_id=str(move.external_id),
+                    permalink=move.permalink,
+                )
+                for move in plan.moves
+            ],
+        )
 
 
 ## Delete directory endpoint

@@ -529,3 +529,55 @@ async def test_a_published_move_keeps_times_and_repoints_conflict_keys(
         # The same instants, not the UTC wall time read back as local time.
         assert entity.created_at == datetime(2025, 1, 2, 3, 4, 5, tzinfo=UTC)
         assert entity.updated_at == datetime(2025, 2, 3, 4, 5, 6, tzinfo=UTC)
+
+
+@pytest.mark.asyncio
+async def test_a_known_published_basis_proves_moved_notes_without_history(
+    repository, markdown, test_project, session_maker, monkeypatch
+):
+    """A folder move publishes on top of a basis it read; that basis is the proof (V1)."""
+    note_id = uuid4()
+    publish(repository, markdown, note_id)
+    await project_git_content(repository, project_id=test_project.id, session_maker=session_maker)
+    basis = repository.snapshot()
+    publish(repository, markdown, note_id, path="archive/a.md")
+
+    def no_history(*args, **kwargs):
+        pytest.fail("A note held by the known basis needs no search through history")
+
+    monkeypatch.setattr(GitProjectRepository, "contains_published_note_identity", no_history)
+    moved = await project_git_content(
+        repository,
+        project_id=test_project.id,
+        session_maker=session_maker,
+        known_ancestor=basis,
+    )
+
+    assert moved.notes_moved == 1
+    async with session_maker() as session:
+        entity = await session.scalar(select(Entity).where(Entity.external_id == str(note_id)))
+        assert entity is not None and entity.file_path == "archive/a.md"
+
+
+@pytest.mark.asyncio
+async def test_a_known_basis_outside_the_targets_history_is_refused(
+    repository, markdown, test_project, session_maker
+):
+    # A private candidate exists in the repository but was never published.
+    private = repository.candidate_snapshot(
+        repository.prepare(
+            transaction_id=uuid4(),
+            base_commit=repository.head(),
+            files={"notes/private.md": markdown},
+            note_ids={"notes/private.md": uuid4()},
+        )
+    )
+    publish(repository, markdown, uuid4())
+
+    with pytest.raises(GitProjectionConflict, match="not published ancestry"):
+        await project_git_content(
+            repository,
+            project_id=test_project.id,
+            session_maker=session_maker,
+            known_ancestor=private,
+        )

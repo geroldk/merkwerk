@@ -175,7 +175,11 @@ class GitProjectionPipeline:
         await self.require_head(commit_id)
 
     async def recover_content(
-        self, commit_id: str, *, redrive_materialization: bool = True
+        self,
+        commit_id: str,
+        *,
+        redrive_materialization: bool = True,
+        known_ancestor: GitSnapshot | None = None,
     ) -> None:
         await self.require_registration()
         await project_git_content(
@@ -185,6 +189,7 @@ class GitProjectionPipeline:
             read_cache=self.read_cache,
             commit_id=commit_id,
             redrive_materialization=redrive_materialization,
+            known_ancestor=known_ancestor,
         )
 
     async def retire_old_files(self, snapshot: GitSnapshot) -> None:

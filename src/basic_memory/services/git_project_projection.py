@@ -21,7 +21,7 @@ from basic_memory.markdown.entity_parser import EntityParser
 from basic_memory.models import Entity
 from basic_memory.read_cache import ReadCacheInvalidator, invalidate_cache
 from basic_memory.repository.entity_repository import AcceptedPendingEntityWrite
-from basic_memory.repository.git_project_repository import GitProjectRepository
+from basic_memory.repository.git_project_repository import GitProjectRepository, GitSnapshot
 from basic_memory.repository.git_graph_inputs import git_graph_identities_unchanged
 from basic_memory.repository.git_progress_repository import invalidate_git_graphs
 from basic_memory.repository.git_layout_repository import GitLayoutRepository, GitPreparedNote
@@ -49,15 +49,44 @@ async def project_git_content(
     read_cache: ReadCacheInvalidator | None = None,
     commit_id: str | None = None,
     redrive_materialization: bool = True,
+    known_ancestor: GitSnapshot | None = None,
 ) -> GitContentProjection:
     """Restore portable UUIDs and exact NoteContent, leaving file/index work pending.
 
     Call the existing materialization recovery and project index after this returns.
     The result confirms SQL content preparation, not complete file/graph/vector progress.
+    `known_ancestor` is a published snapshot the caller read itself and built the target
+    on (a folder move publishes on top of the basis it read); local notes it holds with
+    the same UUID, path and bytes need no search through Git history.
     """
     snapshot = await asyncio.to_thread(repository.snapshot, commit_id)
     if snapshot.commit_id != await asyncio.to_thread(repository.head):
         raise GitProjectionConflict("Projection requires the current published Git head")
+    if known_ancestor is not None and not await asyncio.to_thread(
+        repository.is_ancestor, known_ancestor.commit_id, snapshot.commit_id
+    ):
+        raise GitProjectionConflict("The known basis is not published ancestry of the target")
+    ancestor_ids = known_ancestor.manifest.note_ids if known_ancestor is not None else {}
+
+    async def published_identity(external_id: UUID, path: str, content: str) -> bool:
+        # Trigger: the ancestor the caller published on holds this UUID, path and bytes.
+        # Why: proving it through history runs one rev-list over the whole history per
+        #   note; a folder move of N notes would pay that N times under the write gate.
+        # Outcome: the same proof (a published commit holds the triple) without Git I/O.
+        if (
+            known_ancestor is not None
+            and ancestor_ids.get(path) == external_id
+            and known_ancestor.files.get(path) == content
+        ):
+            return True
+        return await asyncio.to_thread(
+            repository.contains_published_note_identity,
+            snapshot.commit_id,
+            external_id,
+            path,
+            content,
+        )
+
     projection = GitProjectionRepository(project_id)
     layout = GitLayoutRepository(project_id)
     async with session_maker() as session:
@@ -87,12 +116,8 @@ async def project_git_content(
             if (
                 local.content is None
                 or local.content.checksum != await compute_checksum(local.content.markdown_content)
-                or not await asyncio.to_thread(
-                    repository.contains_published_note_identity,
-                    snapshot.commit_id,
-                    local.external_id,
-                    local.file_path,
-                    local.content.markdown_content,
+                or not await published_identity(
+                    local.external_id, local.file_path, local.content.markdown_content
                 )
             ):
                 raise GitProjectionConflict(
@@ -109,9 +134,7 @@ async def project_git_content(
         if (
             basis is not None
             and basis.markdown_content != content
-            and not await asyncio.to_thread(
-                repository.contains_published_note_identity,
-                snapshot.commit_id,
+            and not await published_identity(
                 note.external_id,
                 local.file_path if local is not None else note.path,
                 basis.markdown_content,

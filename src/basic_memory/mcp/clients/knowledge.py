@@ -25,6 +25,7 @@ from basic_memory.schemas.v2.graph import GraphNode, OrphanEntitiesResponse
 from basic_memory.schemas.v2.entity import (
     EntityResolveResponse,
     EntityResponseV2,
+    GitDirectoryMoveResult,
     LinkResolveResponse,
 )
 from basic_memory.schemas.v2.accepted_content import (
@@ -395,6 +396,37 @@ class KnowledgeClient:
                 path_template="/v2/projects/{project_id}/knowledge/move-directory",
             )
         return DirectoryMoveResult.model_validate(response.json())
+
+    async def move_git_directory(
+        self, source_directory: str, destination_directory: str
+    ) -> GitDirectoryMoveResult:
+        """Move a folder inside a Git project as one commit, all or nothing.
+
+        Only a local Git host serves this route; it answers 404 elsewhere. A refusal
+        carries `detail.reason` and `detail.conflicts`, every offender at once.
+
+        Raises:
+            ToolError: If the request fails
+        """
+        from basic_memory.mcp.tools.utils import call_post
+
+        with debug_span(
+            "mcp.client.knowledge.move_git_directory",
+            client_name="knowledge",
+            operation="move_git_directory",
+        ):
+            response = await call_post(
+                self.http_client,
+                f"{self._base_path}/git-move-directory",
+                json={
+                    "source_directory": source_directory,
+                    "destination_directory": destination_directory,
+                },
+                client_name="knowledge",
+                operation="move_git_directory",
+                path_template="/v2/projects/{project_id}/knowledge/git-move-directory",
+            )
+        return GitDirectoryMoveResult.model_validate(response.json())
 
     async def delete_directory(self, directory: str) -> DirectoryDeleteResult:
         """Delete all entities in a directory.

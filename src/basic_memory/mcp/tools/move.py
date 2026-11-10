@@ -12,6 +12,7 @@ from typing import Annotated, Any
 
 from fastmcp import Context
 from fastmcp.exceptions import ToolError
+from httpx import HTTPStatusError
 from pydantic import AliasChoices, Field
 
 from basic_memory.mcp.async_client import local_project_path
@@ -24,9 +25,10 @@ from basic_memory.mcp.note_targets import (
     resolve_note,
 )
 from basic_memory.mcp.note_writes import NoteChange
-from basic_memory.mcp.refusals import note_change_failure, refusal
+from basic_memory.mcp.refusals import RefusalCode, note_change_failure, refusal
 from basic_memory.mcp.server import mcp
 from basic_memory.mcp.tool_params import OutputFormat, ProjectParam
+from basic_memory.runtime.git_routing import git_local_routing_active
 from basic_memory.runtime.storage import RUNTIME_MARKDOWN_FILE_SUFFIXES
 from basic_memory.schemas.memory import memory_url_path
 from basic_memory.utils import generate_permalink, validate_caller_note_path
@@ -43,8 +45,10 @@ from basic_memory.utils import generate_permalink, validate_caller_note_path
         "bm_read) to move a note only if it is still the revision you read. "
         "`destination_project` moves into another project: the note is written there as a "
         "new note (new id, its own history, a permalink formed from its new path, links not "
-        "rewritten) and deleted here; the result names the old and the new permalink. A "
-        "directory moves note by note."
+        "rewritten) and deleted here; the result names the old and the new permalink. On a "
+        "host that publishes through Git, a directory moves within its project as one "
+        "commit, all or nothing, and the result lists every note; elsewhere it moves note by "
+        "note."
     ),
     tags={"notes"},
     annotations={
@@ -356,6 +360,12 @@ async def _move_directory(
             f"'{target.paths.path(source)}' is already there; name a different destination.",
             output_format=output_format,
         )
+    # Trigger: this host publishes its projects through Git.
+    # Why: the upstream route moves note by note and is refused there; Git moves the
+    #   whole folder as one commit instead, so it moves completely or not at all.
+    # Outcome: one call, one commit, and every moved note in the result.
+    if git_local_routing_active():
+        return await _move_git_directory(target, source, destination, output_format)
     try:
         moved = await KnowledgeClient(target.client, target.project.external_id).move_directory(
             source, destination
@@ -420,4 +430,185 @@ async def _move_directory(
         return result
     return (
         f"Moved directory {result['path']} to {result['destination']} ({moved.total_files} files)"
+    )
+
+
+# --- Directories on a Git host ---
+# A refusal names every offender; `detail.reason` says which kind it is, so a stale basis
+# (409) is not reported as an occupied destination (also 409).
+
+_GIT_MOVE_CODES: dict[str, RefusalCode] = {
+    "project_root": "INVALID_ARGUMENTS",
+    "invalid_path": "INVALID_ARGUMENTS",
+    "same_path": "INVALID_ARGUMENTS",
+    "case_only": "INVALID_ARGUMENTS",
+    "inside_source": "INVALID_ARGUMENTS",
+    "invalid_draft": "INVALID_ARGUMENTS",
+    "not_found": "NOT_FOUND",
+    "ambiguous_source": "AMBIGUOUS",
+    "occupied": "ALREADY_EXISTS",
+    "unpublished_file": "UNSUPPORTED",
+    "unsupported_config": "UNSUPPORTED",
+    "base_advanced": "REVISION_CONFLICT",
+    "not_accepting": "UNAVAILABLE",
+}
+
+
+async def _move_git_directory(
+    target: ProjectTarget, source: str, destination: str, output_format: OutputFormat
+) -> str | dict[str, Any]:
+    try:
+        moved = await KnowledgeClient(target.client, target.project.external_id).move_git_directory(
+            source, destination
+        )
+    except ToolError as error:
+        raise _git_move_failure(error, target, source, destination, output_format) from error
+
+    paths = target.paths
+    notes = [
+        {
+            "previous_file_path": paths.path(note.previous_file_path),
+            "file_path": paths.path(note.file_path),
+            "external_id": note.external_id,
+            "permalink": note.permalink,
+        }
+        for note in moved.moved_notes
+    ]
+    # The keys of a note-by-note move stay, so a caller reads both the same way;
+    # moved_files keeps its meaning (the new paths) and nothing ever fails half-way.
+    result: dict[str, Any] = {
+        "action": "moved",
+        "path": paths.path(moved.source),
+        "destination": paths.path(moved.destination),
+        "total_files": moved.total_notes,
+        "moved_files": [note["file_path"] for note in notes],
+        "failed": [],
+        "commit_id": moved.commit_id,
+        "moved_notes": notes,
+    }
+    if moved.source != source:
+        result["requested_path"] = paths.path(source)
+    if moved.destination != destination:
+        result["requested_destination"] = paths.path(destination)
+    if output_format == "json":
+        return result
+    # Every note, one line each and no upper limit (Gerold's decision): the caller has
+    # no other record of where each note went.
+    lines = [
+        f"Moved directory {result['path']} to {result['destination']} "
+        f"({moved.total_notes} notes, one commit {moved.commit_id[:12]})"
+    ]
+    if "requested_destination" in result:
+        lines.append(f"requested: {result['requested_destination']}")
+    lines += [
+        f"- {note['previous_file_path']} -> {note['file_path']} "
+        f"(id {note['external_id']}, permalink {note['permalink']})"
+        for note in notes
+    ]
+    return "\n".join(lines)
+
+
+def _git_move_failure(
+    error: ToolError,
+    target: ProjectTarget,
+    source: str,
+    destination: str,
+    output_format: OutputFormat,
+) -> ToolError:
+    """Word a refused folder move by its reason, with every offender it named."""
+    cause = error.__cause__
+    answer = cause.response if isinstance(cause, HTTPStatusError) else None
+    detail = (
+        answer.json().get("detail")
+        if answer is not None and "application/json" in answer.headers.get("content-type", "")
+        else None
+    )
+    paths = target.paths
+    scope = f", project={target.project_ref!r}"
+    source_address, destination_address = paths.path(source), paths.path(destination)
+    if not isinstance(detail, dict) or detail.get("reason") not in _GIT_MOVE_CODES:
+        # Trigger: Git published the move, but SQL did not follow before the answer.
+        # Why: the move happened; only reads and search may still show the old paths.
+        # Outcome: the commit is named, and the caller waits instead of moving again.
+        if isinstance(detail, dict) and isinstance(detail.get("published_commit"), str):
+            return refusal(
+                "OUTCOME_UNKNOWN",
+                f"The move of '{source_address}' was published as commit "
+                f"{detail['published_commit']}, but the index has not caught up: "
+                f"{detail.get('message')}",
+                try_instead=(
+                    f"bm_project(command='status'{scope}) until it has caught up, then "
+                    f"bm_list(path={destination_address!r}{scope}); do not repeat the move"
+                ),
+                output_format=output_format,
+            )
+        return note_change_failure(
+            error,
+            action="move",
+            address=source_address,
+            unchanged="Nothing was moved.",
+            occupied=destination_address,
+            output_format=output_format,
+            subject="directory",
+            project=target.project.external_id,
+        )
+    reason = detail["reason"]
+    message = str(detail.get("message", error))
+    conflicts = [
+        {
+            "path": paths.path(conflict["path"]),
+            "reason": conflict["reason"],
+            "other": paths.path(conflict["other"]) if conflict.get("other") else None,
+        }
+        for conflict in detail.get("conflicts", [])
+    ]
+    parent = paths.path(source.rpartition("/")[0]) or "/"
+    match reason:
+        case "not_found":
+            # A retry after a lost answer lands here: the folder is already gone.
+            message = (
+                f"No published notes under '{source_address}' in project "
+                f"'{target.project.name}'. If an earlier move of it got no answer, it may "
+                "already have moved."
+            )
+            try_instead = (
+                f"bm_list(path={destination_address!r}{scope}) to see whether it moved, or "
+                f"bm_list(path={parent!r}{scope}) to find the folder"
+            )
+        case "occupied":
+            try_instead = (
+                f"bm_list(path={destination_address!r}{scope}) to see what is there, or "
+                "another destination"
+            )
+        case "unpublished_file":
+            try_instead = (
+                f"move the files that are not notes out of '{source_address}' and save or "
+                "undo editor changes, then repeat the same bm_move"
+            )
+        case "unsupported_config":
+            try_instead = "bm_move(identifier=...) for each note, which follows that setting"
+        case "ambiguous_source":
+            try_instead = f"bm_list(path={parent!r}{scope}), then name one folder exactly"
+        case "base_advanced":
+            try_instead = "repeat the same bm_move"
+        case "case_only":
+            interim = f"{destination_address}-moving"
+            try_instead = (
+                f"two moves: bm_move(path={source_address!r}, destination={interim!r}{scope}), "
+                f"then bm_move(path={interim!r}, destination={destination_address!r}{scope})"
+            )
+        case "invalid_draft":
+            try_instead = "bm_read the named note and repair its frontmatter, then repeat"
+        case "not_accepting":
+            try_instead = f"bm_project(command='status'{scope}), then repeat the same bm_move"
+        case _:
+            try_instead = None
+    if "nothing was moved" not in message.lower():
+        message = f"{message.rstrip('.')}. Nothing was moved."
+    return refusal(
+        _GIT_MOVE_CODES[reason],
+        message,
+        try_instead=try_instead,
+        output_format=output_format,
+        details={"reason": reason, "conflicts": conflicts},
     )

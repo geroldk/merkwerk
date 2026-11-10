@@ -2088,6 +2088,29 @@ async def test_move_directory_v2_validation_error(client: AsyncClient, v2_projec
     assert response.status_code == 422
 
 
+@pytest.mark.asyncio
+async def test_git_folder_move_needs_a_git_host(client: AsyncClient, v2_project_url):
+    """Without Git publication the one-commit route is absent; move-directory serves."""
+    response = await client.post(
+        f"{v2_project_url}/knowledge/entities",
+        json={"title": "Stays", "directory": "v2-git-source", "content": "Body"},
+    )
+    assert response.status_code == 202
+
+    response = await client.post(
+        f"{v2_project_url}/knowledge/git-move-directory",
+        json={"source_directory": "v2-git-source", "destination_directory": "v2-git-dest"},
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Folder moves in one commit need a local Git host"
+    moved = await client.post(
+        f"{v2_project_url}/knowledge/move-directory",
+        json={"source_directory": "v2-git-source", "destination_directory": "v2-git-dest"},
+    )
+    assert DirectoryMoveResult.model_validate(moved.json()).successful_moves == 1
+
+
 # --- Delete directory tests (V2) ---
 
 

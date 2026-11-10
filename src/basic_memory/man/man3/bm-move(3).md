@@ -58,6 +58,37 @@ the destination is never replaced, and a locked note is refused. A directory
 moves note by note; files that are not notes stay, and the result lists
 whatever did not move.
 
+On a host that publishes its projects through Git, a directory moves within
+its project as one commit, all or nothing. Every note keeps its id, its
+permalink and its `created` and `modified`; a note that lacks those keys gets
+its indexed times written in, as for a single move. There is no upper limit on
+the number of notes, and the result lists every one: old path, new path, id and
+permalink, one line each in the text form, and in the JSON form `moved_notes`
+(`previous_file_path`, `file_path`, `external_id`, `permalink`) next to
+`moved_files` (the new paths) and `commit_id`. The answer grows with the
+folder: with paths of about 95 characters it takes about 380 bytes per note as
+text and 530 as JSON, so 600 notes answer with about 225 KB of text or 320 KB
+of JSON. While the move runs, every other write to the project waits; moving
+600 notes took about 15 seconds in a project with a short history and about 23
+seconds in one with 770 commits and 900 notes.
+
+Nothing changes, and the refusal names every offender (in the JSON form in
+`details.conflicts`), when a destination path is taken (by a note outside the
+folder, by a note whose name differs only in case, Unicode form or the
+permalink it would get, or by a file on disk); when the folder holds anything
+that is not a published note (an attachment, `.DS_Store`, an editor's swap
+file, a symlink) or a note that was changed on disk outside Basic Memory; when
+the destination lies inside the source; when the folder has no notes; when the
+project changed during the move (repeat it); or when the host sets
+`update_permalinks_on_move`, because a folder move never changes a permalink
+and would otherwise disagree with a single move. A folder may move up into its
+parent (`a/b` to `a`), even when a moved note lands where another one was.
+
+Links inside notes are not rewritten. A link by permalink (`[[folder/note]]`)
+or by title still finds the moved note; a link by file path
+(`[[/folder/note.md]]`, `[[../other.md]]`) names the old place and no longer
+resolves.
+
 A `destination` that starts with another project's name, without
 `destination_project`, is refused rather than becoming a folder of that name.
 
@@ -80,6 +111,12 @@ bm_move(identifier="plans/release-checklist.md", destination="archive/", project
 bm_move(path="archive", destination="old", project="demo")
 # → Moved directory archive to old (1 files)
 
+# The same on a Git host: one commit, every note listed.
+bm_move(path="drafts", destination="archive/", project="demo")
+# → Moved directory drafts to archive/drafts (2 notes, one commit 3f2a9c1d0b7e)
+#   - drafts/a.md -> archive/drafts/a.md (id 0b6e5d1c-…, permalink demo/drafts/a)
+#   - drafts/b.md -> archive/drafts/b.md (id 5c1d7a2e-…, permalink demo/drafts/b)
+
 bm_move(identifier="plans/launch.md", destination="inbox/", project="demo",
         destination_project="research")
 # → Moved plans/launch.md (project demo) to inbox/launch.md (project research)
@@ -89,8 +126,18 @@ bm_move(identifier="plans/launch.md", destination="inbox/", project="demo",
 
 - A destination with no file extension is refused for a note; end it with `/`
   to move into a folder.
-- A directory move is file by file. If some files fail, the error lists which
-  moved and which did not; bm_list the destination before retrying.
+- Off a Git host a directory move is file by file. If some files fail, the
+  error lists which moved and which did not; bm_list the destination before
+  retrying.
+- On a Git host, a folder that differs from the destination only in case
+  (`archive` to `Archive`) is refused: move it twice, through a different name.
+- On a Git host the old folders stay on disk, empty; nothing removes them.
+  After the move the files on disk follow within moments, old files first and
+  new ones after, so in a large folder some notes are briefly missing on disk.
+- A note moved away keeps its permalink, so a new note written later at the old
+  path gets a permalink with a suffix (`drafts/a-1`).
+- If a folder move gets no answer, do not repeat it blindly: a repeat that
+  finds the folder empty is refused as not found. bm_list the destination.
 
 ## SEE ALSO
 

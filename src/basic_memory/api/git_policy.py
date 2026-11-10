@@ -13,6 +13,9 @@ GIT_NOTE_WRITES = frozenset(
         "edit_entity_by_id",
         "delete_entity_by_id",
         "move_entity",
+        # A folder move inside one project, published as one commit (V1). The upstream
+        # move_directory stays refused: it moves note by note and bytes outside Git.
+        "move_git_directory",
     }
 )
 GIT_TRANSACTION_WRITES = frozenset(

@@ -5,11 +5,16 @@ The composition root suppresses legacy writers/materializers/imports before admi
 """
 
 import asyncio
-from collections.abc import AsyncIterator
+import hashlib
+from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import replace
+from datetime import datetime
 from typing import assert_never
 from uuid import UUID, uuid4
+
+from loguru import logger
+from sqlalchemy import select
 
 from basic_memory import db
 from basic_memory.file_utils import compute_checksum
@@ -28,16 +33,19 @@ from basic_memory.indexing.accepted_note_mutation_runner import (
     run_accepted_note_move,
     run_accepted_note_update,
 )
-from basic_memory.models import NoteContent
+from basic_memory.models import Entity, NoteContent
 from basic_memory.repository.git_layout_repository import GitLayoutRepository
 from basic_memory.repository.git_graph_inputs import git_graph_identities_unchanged
 from basic_memory.repository.git_progress_repository import invalidate_git_graphs
 from basic_memory.repository.git_project_repository import (
     GitPublication,
     GitPublicationConflict,
+    GitPublicationError,
+    GitSnapshot,
     settle_git_publication,
 )
 from basic_memory.repository.git_projection_repository import GitProjectionConflict
+from basic_memory.repository.git_transaction_repository import GitTransactionError
 from basic_memory.runtime.project_partition import RuntimeProjectNoteOperation
 from basic_memory.services.note_content_writes import (
     AcceptedNoteChange,
@@ -45,7 +53,19 @@ from basic_memory.services.note_content_writes import (
     NoteContentPublicationConflict,
     NoteContentMutationServiceError,
 )
-from basic_memory.services.git_transactions import GitTransactionService
+from basic_memory.services.git_directory_moves import (
+    GitDirectoryMoveConflict,
+    GitDirectoryMoveDisk,
+    GitDirectoryMoveOutcome,
+    GitDirectoryMovePlan,
+    GitDirectoryMoveRefused,
+    disk_conflicts,
+    normalize_note_directory,
+    plan_git_directory_move,
+    unpublished_source_files,
+)
+from basic_memory.services.git_transactions import GitTransactionService, validate_git_draft
+from basic_memory.services.note_times import stamp_markdown_times, wanted_note_times
 from basic_memory.schemas.git_sync import GitSyncRemote
 from basic_memory.services.git_sync import GitSyncService
 
@@ -245,3 +265,218 @@ class GitProjectRuntime:
                 # Even a cancelled/lost publication response or failed SQL commit
                 # must wake durable Git recovery. Polling covers process death.
                 self.worker.notify()
+
+    # --- Folder moves (V1) ---
+
+    async def move_directory(self, source: str, destination: str) -> GitDirectoryMoveOutcome:
+        """Move every note under `source` to `destination` as ONE published commit.
+
+        This follows accept(): the immutable basis is captured inside the admission, every
+        check runs before anything changes, and SQL follows the publication before the gate
+        opens. There is no transaction record (a departure from the ENTWURF sketch): no
+        caller could resume this one-shot, and Git's compare-and-swap already makes the
+        publication all or nothing. Permalinks, ids and created/modified stay as they were.
+        """
+        # Trigger: the host is configured to give a moved note a new permalink.
+        # Why: a folder move keeps every permalink, so single and folder moves would
+        #   silently disagree.
+        # Outcome: refused before anything is read, until the setting is off.
+        if self.dependencies.move_policy.update_permalinks_on_move:
+            raise GitDirectoryMoveRefused(
+                409,
+                "unsupported_config",
+                "This host gives moved notes new permalinks (update_permalinks_on_move); "
+                "a folder move in one commit keeps them, so it is refused.",
+            )
+        try:
+            async with self.admission():
+                return await self._move_directory_admitted(source, destination)
+        except GitProjectionConflict as error:
+            # Every projection conflict after publication is answered as 503 below, so
+            # one here (admission, or catching SQL up to the basis) means nothing moved.
+            raise GitDirectoryMoveRefused(
+                409, "not_accepting", f"{error}. Nothing was moved."
+            ) from error
+        finally:
+            # A cancelled or lost answer may still have published; wake durable recovery.
+            self.worker.notify()
+
+    async def _move_directory_admitted(
+        self, source: str, destination: str
+    ) -> GitDirectoryMoveOutcome:
+        repository = self.pipeline.repository
+        base = await asyncio.to_thread(repository.snapshot)
+        if self._sql_commit != base.commit_id:
+            await self.pipeline.apply("content", base.commit_id)
+            self._sql_commit = base.commit_id
+        disk = await self._directory_move_disk(base)
+
+        # --- Plan and refusals: nothing has changed yet ---
+        try:
+            plan = plan_git_directory_move(base.files, base.manifest.note_ids, source, destination)
+        except GitDirectoryMoveRefused as refused:
+            # Trigger: no published note is under the source.
+            # Why: a folder holding only attachments must be refused by name, not "missing".
+            # Outcome: files found there are listed; otherwise the folder is not found.
+            if refused.reason == "not_found":
+                directory = normalize_note_directory(source, role="source")
+                if stray := await asyncio.to_thread(unpublished_source_files, disk, directory):
+                    raise _unclean_source(stray) from refused
+            raise
+        unclean, taken = await asyncio.to_thread(disk_conflicts, disk, plan)
+        if unclean:
+            raise _unclean_source(unclean)
+        if taken:
+            raise GitDirectoryMoveRefused(
+                409,
+                "occupied",
+                f"{len(taken)} destination path(s) are taken on disk: "
+                + "; ".join(conflict.describe() for conflict in taken),
+                taken,
+            )
+        files, note_ids = await self._moved_tree(base, plan)
+        try:
+            await validate_git_draft(
+                {move.file_path: files[move.file_path] for move in plan.moves},
+                self.pipeline.file_service.base_path,
+            )
+        except GitTransactionError as error:
+            raise GitDirectoryMoveRefused(
+                422, "invalid_draft", f"{error}. Nothing was moved."
+            ) from error
+
+        # --- Publication: one commit, then SQL before the gate opens ---
+        transaction_id = uuid4()
+        try:
+            try:
+                prepared = await asyncio.to_thread(
+                    repository.prepare,
+                    transaction_id=transaction_id,
+                    base_commit=base.commit_id,
+                    files=files,
+                    note_ids=note_ids,
+                    message=plan.message,
+                )
+            except ValueError as error:
+                raise GitDirectoryMoveRefused(
+                    422, "invalid_draft", f"{error}. Nothing was moved."
+                ) from error
+            try:
+                publication = await settle_git_publication(repository, prepared)
+            except GitPublicationConflict as error:
+                raise GitDirectoryMoveRefused(
+                    409,
+                    "base_advanced",
+                    "The Git project advanced during the move; nothing was moved. "
+                    "Repeat the same move.",
+                ) from error
+            self.last_publication = publication
+            try:
+                # The basis is the parent of this commit: its notes prove themselves.
+                await self.pipeline.recover_content(publication.commit_id, known_ancestor=base)
+            except Exception as error:
+                raise NoteContentMutationServiceError(
+                    503,
+                    {
+                        "message": "Git published; SQL pending. Check status before retry.",
+                        "published_commit": publication.commit_id,
+                    },
+                ) from error
+            # Constraint for I1: if projection learns to defer (a UUID still owned by another
+            # project) instead of raising, this must answer "SQL pending" rather than move
+            # _sql_commit forward over a projection that did not happen.
+            self._sql_commit = publication.commit_id
+        finally:
+            await self._drop_candidate(transaction_id)
+        return GitDirectoryMoveOutcome(plan, publication.commit_id)
+
+    async def _directory_move_disk(self, base: GitSnapshot) -> GitDirectoryMoveDisk:
+        """The bytes the files stage may find on disk for each published path.
+
+        Like accept(), first prove that SQL holds exactly the basis: a commit SQL could not
+        follow must not be published.
+        """
+        layout = GitLayoutRepository(self.pipeline.project_id)
+        async with self.pipeline.session_maker() as session:
+            local = {note.file_path: note for note in await layout.local_notes(session)}
+            retired = {
+                retirement.file_path: frozenset(retirement.expected_checksums)
+                for retirement in await layout.retirements(session)
+            }
+        if {path: note.external_id for path, note in local.items()} != base.manifest.note_ids:
+            raise GitProjectionConflict("SQL content is outside the captured Git basis")
+        for path, note in local.items():
+            if (
+                note.content is None
+                or note.content.markdown_content != base.files[path]
+                or note.content.checksum != await compute_checksum(note.content.markdown_content)
+            ):
+                raise GitProjectionConflict("SQL content is outside the captured Git basis")
+        published: dict[str, frozenset[str]] = {}
+        for path, text in base.files.items():
+            # The same set retain_old_file stores, so the later guarded delete succeeds.
+            accepted = {hashlib.sha256(text.encode()).hexdigest()}
+            if (note := local.get(path)) is not None:
+                if note.content is not None:
+                    accepted.add(note.content.checksum)
+                if note.file_checksum is not None:
+                    accepted.add(note.file_checksum)
+            published[path] = frozenset(accepted) | retired.get(path, frozenset())
+        return GitDirectoryMoveDisk(self.pipeline.file_service.base_path, published, retired)
+
+    async def _moved_tree(
+        self, base: GitSnapshot, plan: GitDirectoryMovePlan
+    ) -> tuple[dict[str, str], dict[str, UUID]]:
+        """The whole project after the move: same bytes, only missing times stamped."""
+        async with self.pipeline.session_maker() as session:
+            rows = await session.execute(
+                select(Entity.external_id, Entity.created_at, Entity.updated_at).where(
+                    Entity.project_id == self.pipeline.project_id
+                )
+            )
+            times = {
+                UUID(external_id): (created, updated) for external_id, created, updated in rows
+            }
+        files, note_ids = dict(base.files), dict(base.manifest.note_ids)
+        # Remove every source before adding any target: a target may be another note's
+        # source when the folder moves up into its parent ('a/b' -> 'a').
+        texts = {move.file_path: files.pop(move.previous_file_path) for move in plan.moves}
+        for move in plan.moves:
+            del note_ids[move.previous_file_path]
+        now = datetime.now().astimezone()
+        for move in plan.moves:
+            text = texts[move.file_path]
+            created, modified = times.get(move.external_id, (None, None))
+            # A plain move keeps both times; a note without them gets its indexed ones,
+            # as a single move and a transaction move do (BM-010).
+            wanted = wanted_note_times(
+                text,
+                now=now,
+                current_markdown=text,
+                fallback_created=created,
+                fallback_modified=modified,
+            )
+            files[move.file_path] = text if wanted is None else stamp_markdown_times(text, wanted)
+            note_ids[move.file_path] = move.external_id
+        return files, note_ids
+
+    async def _drop_candidate(self, transaction_id: UUID) -> None:
+        """Remove the private candidate ref prepare() leaves, published or not."""
+        try:
+            await asyncio.to_thread(self.pipeline.repository.remove_candidates, transaction_id)
+        except GitPublicationError as error:  # pragma: no cover - a failing local git binary
+            # A leftover candidate ref is harmless residue; the move's outcome stands.
+            logger.warning(
+                "Git candidate cleanup failed", transaction_id=str(transaction_id), error=str(error)
+            )
+
+
+def _unclean_source(conflicts: Sequence[GitDirectoryMoveConflict]) -> GitDirectoryMoveRefused:
+    """Refuse a source folder that holds anything but published notes, naming each file."""
+    return GitDirectoryMoveRefused(
+        422,
+        "unpublished_file",
+        f"{len(conflicts)} file(s) in the folder are not clean published notes: "
+        + "; ".join(conflict.describe() for conflict in conflicts),
+        conflicts,
+    )
