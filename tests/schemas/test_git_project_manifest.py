@@ -20,6 +20,20 @@ def test_duplicate_notes_are_rejected(duplicate: str) -> None:
         GitProjectManifest(project_external_id=uuid4(), notes=(first, second))
 
 
+@pytest.mark.parametrize(
+    "first,second",
+    [("a.md", "A.md"), ("Notes/x.md", "notes/x.md"), ("caf\u00e9.md", "cafe\u0301.md")],
+)
+def test_paths_that_one_file_system_would_merge_are_rejected(first: str, second: str) -> None:
+    """macOS and Windows store these as one file; one note would overwrite the other (C1)."""
+    notes = (
+        GitNoteIdentity(path=first, external_id=uuid4()),
+        GitNoteIdentity(path=second, external_id=uuid4()),
+    )
+    with pytest.raises(ValidationError, match="differ only by case or Unicode form"):
+        GitProjectManifest(project_external_id=uuid4(), notes=notes)
+
+
 def test_manifest_has_canonical_order_and_roundtrips_uuids() -> None:
     first = GitNoteIdentity(path="überblick.md", external_id=uuid4())
     second = GitNoteIdentity(path="a.md", external_id=uuid4())

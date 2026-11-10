@@ -9,6 +9,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
+from basic_memory.utils import portable_path_key
+
 GIT_PROJECT_MANIFEST_PATH = ".basic-memory/project.json"
 
 
@@ -50,6 +52,15 @@ class GitProjectManifest(BaseModel):
     def require_unique_notes(self) -> Self:
         if len({note.path for note in self.notes}) != len(self.notes):
             raise ValueError("Duplicate note path in Git project manifest")
+        # Trigger: two paths differ only by case or Unicode normalization.
+        # Why: macOS and Windows store them as one file, so one note would overwrite the
+        #   other and the files stage could not tell an old path from a live one (C1).
+        # Outcome: such a manifest is never published or projected.
+        if len({portable_path_key(note.path) for note in self.notes}) != len(self.notes):
+            raise ValueError(
+                "Note paths in the Git project manifest differ only by case or "
+                "Unicode form; they would be one file on macOS and Windows"
+            )
         if len({note.external_id for note in self.notes}) != len(self.notes):
             raise ValueError("Duplicate note identity in Git project manifest")
         return self
