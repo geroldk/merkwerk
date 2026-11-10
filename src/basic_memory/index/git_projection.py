@@ -9,6 +9,7 @@ import errno
 import hashlib
 import json
 import os
+import stat
 from collections import defaultdict
 from collections.abc import Iterable
 from contextlib import nullcontext
@@ -137,8 +138,13 @@ def read_projection_disk(root: Path, live: Iterable[str], retired: Iterable[str]
     retired = tuple(retired)
     files: dict[str, str] = {}
     directories: set[str] = set()
+    live_paths = set(live)
     for path in {*live, *retired}:
         full = root / path
+        if path not in live_paths and full.is_symlink():
+            # Basic Memory writes regular files only: a link at a path a note left is
+            # someone else's, never deleted or renamed; the row is simply completed.
+            continue
         if full.is_dir():
             directories.add(path)
         elif full.is_file():
@@ -172,8 +178,8 @@ def read_projection_disk(root: Path, live: Iterable[str], retired: Iterable[str]
                         foreign.add(path)
         folder_files[path] = tuple(sorted(found))
 
-    # A live path that reaches a retired file: a case- or Unicode-only rename on a file
-    # system that folds them (C1). On Linux only a hard link behaves like this.
+    # A live path that is a retired file's own entry: a case- or Unicode-only rename on a
+    # file system that folds them (C1). On Linux only a hard link behaves like this.
     retired_by_key: dict[str, list[str]] = defaultdict(list)
     for path in retired:
         retired_by_key[portable_path_key(path)].append(path)
@@ -182,7 +188,7 @@ def read_projection_disk(root: Path, live: Iterable[str], retired: Iterable[str]
         if path not in files:
             continue
         for other in retired_by_key.get(portable_path_key(path), ()):
-            if other != path and (root / other).exists() and (root / path).samefile(root / other):
+            if other != path and one_regular_file(root, path, other):
                 aliases[path] = other
                 break
     return DiskView(
@@ -195,25 +201,94 @@ def read_projection_disk(root: Path, live: Iterable[str], retired: Iterable[str]
     )
 
 
+def one_regular_file(root: Path, left: str, right: str) -> bool:
+    """Whether two project paths are one directory entry of a regular file (C1).
+
+    lstat, never stat: a symlink reads the same bytes but is an entry of its own, and
+    renaming it over the note would replace the note with a link to itself.
+    """
+    try:
+        first, second = os.lstat(root / left), os.lstat(root / right)
+    except OSError:
+        return False
+    return (
+        stat.S_ISREG(first.st_mode)
+        and stat.S_ISREG(second.st_mode)
+        and (first.st_dev, first.st_ino) == (second.st_dev, second.st_ino)
+    )
+
+
+def drop_second_name(root: Path, old: str, live: str) -> None:
+    """After the alias rename, remove `old` if it is still a name of its own.
+
+    rename(2) between two hard links of one file does nothing (POSIX), so on Linux the
+    old spelling would stay as an unmanaged second name. On macOS or Windows the
+    rename leaves one entry under the published spelling, and `old` is not listed.
+    Only a name listed under its exact spelling, beside the live one, is unlinked;
+    unlinking a second hard link never touches the note's bytes.
+    """
+    old_full, live_full = root / old, root / live
+    if old_full.name == live_full.name and old_full.parent.samefile(live_full.parent):
+        return  # one folder reached through two spellings: one entry
+    if (
+        old_full.name in os.listdir(old_full.parent)
+        and live_full.name in os.listdir(live_full.parent)
+        and one_regular_file(root, old, live)
+    ):
+        old_full.unlink()
+
+
 def prune_empty_folders(root: Path, path: str) -> None:
     """Remove the folders that deleting `path` left empty, deepest first.
 
-    Never the project root, never a hidden folder (so never .basic-memory), and only a
-    folder that is truly empty: rmdir refuses anything else.
+    Never the project root, never a hidden folder (so never .basic-memory), never a
+    folder reached through a symlink, and only a folder that is truly empty: rmdir
+    refuses anything else.
     """
-    parent = PurePosixPath(path).parent
-    while parent != PurePosixPath("."):
+    parents = [parent for parent in PurePosixPath(path).parents if parent != PurePosixPath(".")]
+    # Trigger: a folder on the way is a symlink.
+    # Why: rmdir through it would remove empty folders outside the project.
+    # Outcome: nothing is pruned for this path.
+    if any((root / parent).is_symlink() for parent in parents):
+        return
+    for parent in parents:
         if parent.name.startswith("."):
             return
         try:
             (root / parent).rmdir()
         except OSError as error:
-            # Not empty (another file, or one an editor just created), already gone, or
-            # not a folder: everything above it stays as well.
-            if error.errno in {errno.ENOTEMPTY, errno.EEXIST, errno.ENOENT, errno.ENOTDIR}:
-                return
-            raise
-        parent = parent.parent
+            # Trigger: not empty (another file, or one an editor just created), already
+            #   gone, not a folder, or refused (a folder open in another program).
+            # Why: the delete that emptied it already happened; failing the pass here
+            #   gains nothing and would only repeat the pass.
+            # Outcome: this folder and everything above it stay.
+            if error.errno not in {errno.ENOTEMPTY, errno.EEXIST, errno.ENOENT, errno.ENOTDIR}:
+                logger.warning(
+                    "Git files stage left a folder it could not remove",
+                    folder=parent.as_posix(),
+                    error=str(error),
+                )
+            return
+
+
+def clear_empty_folder(root: Path, path: str) -> bool:
+    """Remove an empty folder tree where a note's file must go; True when the path is free.
+
+    Only folders that hold nothing at all go, deepest first, with rmdir. A file, a
+    symlink or a hidden folder anywhere inside keeps the tree, and the path stays
+    blocked (C8).
+    """
+    top = root / path
+    if top.is_symlink():
+        return False
+    for current, _folders, _files in os.walk(top, topdown=False):
+        if any(part.startswith(".") for part in Path(current).relative_to(top).parts):
+            continue
+        try:
+            os.rmdir(current)
+        except OSError:
+            pass  # anything left inside keeps the path blocked; reported by the caller
+    return not os.path.lexists(top)
 
 
 class PublishedGitIndexWriter:
@@ -500,27 +575,30 @@ class GitProjectionPipeline:
         conflicts = [reason for _, reason in plan.conflicts]
         stale = [SQL_BEHIND] if plan.stale else []
         final_paths = {step.path for step in plan.steps if step.final}
-        final_open: bool | None = None
+        others_on_disk: bool | None = None
         for step in plan.steps:
             if step.final:
                 # Trigger: the owner of the bytes this step deletes is unknown.
-                # Why: only when every other note is on disk can no note lose its copy.
+                # Why: only when every other note is on disk, and no write of this pass
+                #   failed (also one of these steps), can no note lose its copy.
                 # Outcome: after any conflict these old bytes simply stay.
-                if final_open is None:
-                    final_open = (
-                        not conflicts
-                        and not stale
-                        and all(
-                            note.path in verified for note in notes if note.path not in final_paths
-                        )
+                if others_on_disk is None:
+                    # Final steps run last, so the other notes' state no longer changes.
+                    others_on_disk = all(
+                        note.path in verified for note in notes if note.path not in final_paths
                     )
-                if not final_open:
+                if conflicts or stale or not others_on_disk:
                     break
             if not (step.requires <= verified and step.clears <= cleared):
                 continue
             if step.kind is StepKind.complete:
                 await self._complete(retirements[step.path])
                 cleared.add(step.path)
+                if step.path not in snapshot.files:
+                    # A crash between an old file's delete and its prune left the folders.
+                    await asyncio.to_thread(
+                        prune_empty_folders, self.file_service.base_path, step.path
+                    )
                 continue
             if step.kind is StepKind.delete:
                 if await self._retire_file(storage, step):
@@ -539,9 +617,18 @@ class GitProjectionPipeline:
                 if deleted is RuntimeGuardedFileDeleteOutcome.changed:
                     conflicts.append(CHANGED_DURING_CLEANUP)
                     continue
-            elif step.clears and (self.file_service.base_path / step.path).is_dir():
-                conflicts.append(BLOCKED_PATH)
-                continue
+            elif (self.file_service.base_path / step.path).is_dir():
+                # Trigger: a folder stands where this note's file goes (directory to file,
+                #   C8): left by the retired files that just went, by a crash before their
+                #   prune, or by an editor.
+                # Why: the materializer cannot write onto a folder; anything inside that
+                #   Basic Memory does not own must stay.
+                # Outcome: an empty tree is removed and the note written; else blocked.
+                if not await asyncio.to_thread(
+                    clear_empty_folder, self.file_service.base_path, step.path
+                ):
+                    conflicts.append(BLOCKED_PATH)
+                    continue
             if step.breaks_cycle:
                 logger.info(
                     "Git files stage writes one note of a path cycle first",
@@ -594,14 +681,18 @@ class GitProjectionPipeline:
 
     async def _retire_file(self, storage: LocalNoteContentStorage, step: FileStep) -> bool:
         """Remove a path a note left; False when an editor changed its bytes meanwhile."""
+        root = self.file_service.base_path
         for live_path in step.aliases:
-            # Trigger: the old path and a live path are one file (case- or Unicode-only
-            #   rename on macOS/Windows; on Linux only a hard link).
+            # Trigger: the old path and a live path are one directory entry of a regular
+            #   file (case- or Unicode-only rename on macOS/Windows; on Linux only a hard
+            #   link). A symlink is not: it is an entry of its own.
             # Why: deleting the old spelling would delete the note itself (C1).
             # Outcome: no delete; the entry takes the published spelling, as a case-only
-            #   rename does in the local runtime (InlineNoteFileDeleteEnqueuer).
-            if self.file_service.paths_share_storage_target(step.path, live_path):
+            #   rename does in the local runtime (InlineNoteFileDeleteEnqueuer). A second
+            #   hard link, which the rename leaves in place, is unlinked.
+            if await asyncio.to_thread(one_regular_file, root, step.path, live_path):
                 await self.file_service.move_file(step.path, live_path)
+                await asyncio.to_thread(drop_second_name, root, step.path, live_path)
                 return True
         assert step.expected_checksum is not None
         deleted = await storage.delete_file_if_matches(
@@ -609,7 +700,7 @@ class GitProjectionPipeline:
         )
         if deleted is RuntimeGuardedFileDeleteOutcome.changed:
             return False
-        await asyncio.to_thread(prune_empty_folders, self.file_service.base_path, step.path)
+        await asyncio.to_thread(prune_empty_folders, root, step.path)
         return True
 
     async def _complete(self, retirement: GitRetiredFile) -> None:

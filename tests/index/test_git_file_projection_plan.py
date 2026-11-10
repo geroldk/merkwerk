@@ -1,11 +1,14 @@
 """The files stage order (F2): new files first, old files after, never a lost only copy."""
 
+import pytest
+
 from basic_memory.index.git_file_projection_plan import (
     BLOCKED_PATH,
     EDITOR_CHANGE,
     FOREIGN_FILE,
     BaseFile,
     DiskView,
+    FileProjectionPlan,
     FileStep,
     LiveNote,
     Occupant,
@@ -347,6 +350,84 @@ def test_changed_bytes_behind_an_alias_are_replaced_not_reported():
     )
     assert kinds(result) == [(StepKind.replace, "A.md"), (StepKind.delete, "a.md")]
     assert not result.conflicts and not step(result, "A.md").retire
+    # The note at the alias owns the old bytes itself: it waits for nothing.
+    assert step(result, "A.md").requires == frozenset() and not step(result, "A.md").final
+
+
+def test_old_bytes_behind_an_alias_with_no_known_owner_wait_for_the_end():
+    result = plan(
+        [LiveNote("A.md", "a2"), LiveNote("z.md", "z")],
+        [retired("a.md", "a1")],
+        files={"A.md": "a1", "a.md": "a1"},
+        aliases={"A.md": "a.md"},
+    )
+    assert kinds(result) == [
+        (StepKind.write, "z.md"),
+        (StepKind.replace, "A.md"),
+        (StepKind.delete, "a.md"),
+    ]
+    assert step(result, "A.md").final and step(result, "a.md").final
+
+
+def alias_taken_by_another_note(archive: str) -> FileProjectionPlan:
+    """U moves from notes/Source.md to archive/; a new note V takes notes/source.md.
+
+    On macOS or Windows both spellings are one directory entry that holds U's old bytes.
+    """
+    notes = [
+        LiveNote("archive/Source.md", "u", ready=archive != "stale", file_checksum="u"),
+        LiveNote("notes/source.md", "v"),
+    ]
+    files = {"notes/Source.md": "u", "notes/source.md": "u"}
+    if archive == "editor":
+        files["archive/Source.md"] = "editor"
+    return plan(
+        notes,
+        [retired("notes/Source.md", "u")],
+        files=files,
+        aliases={"notes/source.md": "notes/Source.md"},
+    )
+
+
+def test_a_different_note_at_an_alias_waits_for_the_moved_notes_new_copy():
+    result = alias_taken_by_another_note("free")
+    assert kinds(result) == [
+        (StepKind.write, "archive/Source.md"),
+        (StepKind.replace, "notes/source.md"),
+        (StepKind.delete, "notes/Source.md"),
+    ]
+    assert step(result, "notes/source.md").requires == {"archive/Source.md"}
+    assert step(result, "notes/Source.md").requires == {"archive/Source.md", "notes/source.md"}
+
+
+@pytest.mark.parametrize("archive", ["editor", "stale"])
+def test_a_different_note_at_an_alias_never_deletes_a_blocked_notes_only_copy(archive):
+    result = alias_taken_by_another_note(archive)
+    # The single entry holds U's only copy: neither spelling is touched.
+    assert result.steps == ()
+    if archive == "editor":
+        assert result.conflicts == (("archive/Source.md", FOREIGN_FILE),)
+    else:
+        assert result.stale == {"archive/Source.md"}
+
+
+def test_an_old_spelling_that_reads_the_live_file_is_renamed_not_reported():
+    """The live note was written through the alias, then the pass died before the rename.
+
+    The old spelling now reads the new bytes, which its row never expected.
+    """
+    notes = [LiveNote("notes/source.md", "n", synced=True)]
+    rows = [retired("notes/Source.md", "o")]
+    view = DiskView(
+        files={"notes/source.md": "n", "notes/Source.md": "n"},
+        aliases={"notes/source.md": "notes/Source.md"},
+    )
+    assert publication_proof_candidates(notes, rows, view) == ()
+    result = plan_file_projection(notes, rows, view, identify_occupants(notes, rows, view))
+    assert not result.conflicts and result.done == {"notes/source.md"}
+    old = step(result, "notes/Source.md")
+    assert old.kind is StepKind.delete and old.aliases == ("notes/source.md",)
+    assert old.requires == {"notes/source.md"} and not old.final
 
 
 # --- Bytes Basic Memory published but SQL does not explain (C7) ---

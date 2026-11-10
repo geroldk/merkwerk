@@ -350,8 +350,8 @@ async def test_layout_process_death_resumes_without_lost_old_file_permission(
     assert result.returncode == CRASH_EXIT.get(stage, 73), result.stderr
     root = pipeline.file_service.base_path
     if stage == "after_writes":
-        # Died at the first old file: every new file is written and published, the old
-        # file and its permission are still there.
+        # Died at the first old file to go, right after its note's new file was written
+        # and published; the old file and its permission are still there.
         assert (root / "notes/Source.md").read_bytes() == content.encode()
         async with pipeline.session_maker() as session:
             assert await session.scalar(select(GitFileRetirement.file_path)) == "notes/Source.md"
@@ -414,11 +414,18 @@ async def test_death_between_a_reused_paths_delete_and_its_write_converges(
         publish(pipeline, files, ids)
     result = await child_worker(pipeline, app_config, engine_factory, tmp_path, "reused_delete")
     assert result.returncode == 79, result.stderr
-    assert not (pipeline.file_service.base_path / "notes/Source.md").exists() or (
-        operation == "swap"
-    )
-    await settle(replace(pipeline, repository=GitProjectRepository(pipeline.repository.path)))
     root = pipeline.file_service.base_path
+    if operation == "swap":
+        # Died after the one delete that breaks the cycle: exactly one of the two paths
+        # was cleared, and the other note's old file is still there.
+        present = [
+            path for path in ("notes/Source.md", "notes/Target.md") if (root / path).exists()
+        ]
+        assert len(present) == 1, present
+        assert (root / present[0]).read_bytes() == snapshot.files[present[0]].encode()
+    else:
+        assert not (root / "notes/Source.md").exists()
+    await settle(replace(pipeline, repository=GitProjectRepository(pipeline.repository.path)))
     head = pipeline.repository.snapshot()
     for path, text in head.files.items():
         assert (root / path).read_bytes() == text.encode()
@@ -479,6 +486,15 @@ async def test_death_after_a_write_before_its_publish_is_not_an_editor_change(
         assert (root / path).read_bytes() == text.encode()
     if then == "edit_then_move":
         assert not (root / "notes/Source.md").exists()
+    if then == "edit_then_move":
+        # The recovery wrote the moved note before it removed anything: no gap.
+        assert events and all(not event.absent for event in events), events
+    else:
+        # In place, the bytes Git proved are cleared and the note written right after.
+        assert [(event.action, event.path, bool(event.absent)) for event in events] == [
+            ("delete", "notes/Source.md", True),
+            ("write", "notes/Source.md", False),
+        ]
     async with pipeline.session_maker() as session:
         statuses.update(await session.scalars(select(NoteContent.file_write_status)))
         assert "external_change_detected" not in statuses

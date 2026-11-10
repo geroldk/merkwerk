@@ -135,9 +135,13 @@ bm_move(identifier="plans/launch.md", destination="inbox/", project="demo",
   (`archive` to `Archive`) is refused: move it twice, through a different name.
 - On a Git host the files on disk follow the commit within moments. Each
   note's new file is written before its old file is removed, so a moved note
-  is never missing on disk; for a moment it can be there twice, with the same
-  permalink. Folders the move leaves empty are removed; a folder that still
-  holds anything else (an attachment, a hidden file) stays.
+  is not missing on disk; for a moment it can be there twice, with the same
+  permalink. One exception: when moves that disk has not caught up with yet
+  make two notes trade paths (folder moves onto paths whose old files are
+  still waiting to go), one of the two notes is briefly missing. Folders the
+  move leaves empty are removed; a folder that still holds anything else (an
+  attachment, a hidden folder) stays, and so does one the system refuses to
+  remove (for example while it is open in another program).
 - A note moved away keeps its permalink, so a new note written later at the old
   path gets a permalink with a suffix (`drafts/a-1`).
 - If a folder move gets no answer, do not repeat it blindly: a repeat that

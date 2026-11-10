@@ -128,10 +128,16 @@ materializations. A missing file is already retired; a reused path containing it
 exact current Git bytes is kept and its row still published as synced. Unexpected
 editor bytes keep the retirement and files progress pending, while the other notes
 are still written. Bytes nothing in SQL explains are replaced only when Git published
-them at that path. A case- or Unicode-only alias of a live file is renamed, never
-deleted; manifests whose paths would merge on such file systems are refused. Files
-and folders may trade places, and folders the stage's own deletions left empty are
-removed (never the root or a hidden folder). A final check reads every note.
+them at that path. A case- or Unicode-only alias of a live file (the same directory
+entry, never a symlink) is renamed, never deleted, and waits like any other old file
+for the note its bytes belong to; manifests whose paths would merge on such file
+systems are refused. Files and folders may trade places: folders the stage's own
+deletions left empty are removed (never the root, a hidden folder or one reached
+through a symlink), also on the pass after a crash, and an empty folder where a note
+must go is removed before the write. A folder the system refuses to remove simply
+stays. An unknown owner's old file is not deleted once any write of the pass has
+failed; in a swap whose first write fails, that note stays absent until the next
+pass. A final check reads every note.
 The graph stage purges orphan full-text rows; the vector stage removes stale
 manifest/physical vectors through the normal repository cleanup/reconciliation.
 These guards do not replace the preproduction requirement to control all writers.
@@ -140,8 +146,8 @@ These guards do not replace the preproduction requirement to control all writers
 empty project, path reuse, coalesced moves and rapid round trips without intervening
 file work. It verifies preserved identities, incoming unresolved relations, FTS and
 physical vector cleanup. Child processes terminate after layout/file work,
-immediately after file deletion but before retirement acknowledgement, after all new
-files are written but before the first old one goes, between a reused path's delete
+immediately after file deletion but before retirement acknowledgement, at the first
+old file to go (right after its note's new file is written), between a reused path's delete
 and its write, and after a write before its publish. Restart repeats safely,
 including when an old file has disappeared or a new file now owns its path. Editor
 conflicts remain visible and preserve the editor's bytes.

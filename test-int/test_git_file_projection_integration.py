@@ -20,7 +20,13 @@ from sqlalchemy import select, update
 from basic_memory import db
 from basic_memory.api.container import resolve_container
 from basic_memory.index import git_projection
-from basic_memory.index.git_file_projection_plan import BaseFile, DiskView
+from basic_memory.index.git_file_projection_plan import (
+    BaseFile,
+    DiskView,
+    FileProjectionPlan,
+    FileStep,
+    StepKind,
+)
 from basic_memory.index.git_projection import GitProjectionPipeline, build_git_projection_pipeline
 from basic_memory.index.git_projection_worker import GitProjectionWorker
 from basic_memory.index.local_dependencies import LocalMarkdownFileIndexer
@@ -30,11 +36,14 @@ from basic_memory.indexing.note_materialization_runner import (
 )
 from basic_memory.models import GitFileRetirement, GitProjectionProgress, NoteContent
 from basic_memory.repository.git_project_repository import GitProjectRepository
+from basic_memory.repository.git_projection_repository import GitProjectionConflict
 from basic_memory.runtime.note_content import (
     RuntimeNoteMaterializationResult,
     RuntimeNoteMaterializationStatus,
 )
+from basic_memory.services import FileService
 from basic_memory.services.git_project_projection import project_git_content
+from basic_memory.utils import portable_path_key
 
 from tests.git_host_support import HostSetup, host_setup as host_setup
 from tests.git_host_support import ready as host_ready
@@ -427,12 +436,62 @@ async def test_a_swap_with_an_editor_file_at_one_end_deletes_nothing(pipeline):
     assert await retirement_rows(pipeline) == 2
 
 
-# --- Case- and Unicode-only renames (C1), simulated with a hard link ---
+# --- Case- and Unicode-only renames (C1), with one directory entry for both spellings ---
+
+
+def fold_case(monkeypatch, root: Path) -> list[tuple[str, str, str]]:
+    """Make two hard-linked spellings behave like one entry on macOS or Windows.
+
+    A hard link alone hides what matters there: unlinking either spelling removes the
+    note, and a write through one spelling is what the other one reads. Returns the
+    deletes and moves the stage made, so a test can name the spelling each one touched.
+    """
+    calls: list[tuple[str, str, str]] = []
+    delete = FileService.delete_file
+    write = LocalNoteContentStorage.write_file
+    move = FileService.move_file
+
+    def other_spellings(full: Path) -> list[Path]:
+        if not full.is_file():
+            return []
+        key, inode = portable_path_key(full.name), full.stat().st_ino
+        return [
+            other
+            for other in full.parent.iterdir()
+            if other.name != full.name
+            and portable_path_key(other.name) == key
+            and not other.is_symlink()
+            and other.stat().st_ino == inode
+        ]
+
+    async def folded_delete(self, path):
+        calls.append(("delete", str(path), ""))
+        others = other_spellings(root / path)
+        await delete(self, path)
+        for other in others:
+            other.unlink()
+
+    async def folded_write(self, path, content, *, metadata=None):
+        others = other_spellings(root / path)
+        checksum = await write(self, path, content, metadata=metadata)
+        for other in others:
+            other.unlink()
+            os.link(root / path, other)
+        return checksum
+
+    async def recorded_move(self, source, destination):
+        calls.append(("move", str(source), str(destination)))
+        await move(self, source, destination)
+
+    monkeypatch.setattr(FileService, "delete_file", folded_delete)
+    monkeypatch.setattr(LocalNoteContentStorage, "write_file", folded_write)
+    monkeypatch.setattr(FileService, "move_file", recorded_move)
+    return calls
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("changed", [False, True])
-async def test_a_case_only_rename_through_an_alias_keeps_the_note(pipeline, changed):
+async def test_a_case_only_rename_through_an_alias_keeps_the_note(pipeline, monkeypatch, changed):
     files = {"notes/Source.md": note("notes/Source.md"), "notes/Target.md": note("notes/Target.md")}
     ids = seed(pipeline, files)
     await settle(pipeline)
@@ -447,19 +506,67 @@ async def test_a_case_only_rename_through_an_alias_keeps_the_note(pipeline, chan
         {"notes/source.md": ids["notes/Source.md"], "notes/Target.md": ids["notes/Target.md"]},
     )
     root = pipeline.file_service.base_path
-    # On macOS or Windows the new spelling reaches the old file; a hard link does on Linux.
     os.link(root / "notes/Source.md", root / "notes/source.md")
+    calls = fold_case(monkeypatch, root)
     await settle(pipeline)
     on_disk(pipeline, renamed)
     assert await retirement_rows(pipeline) == 0
     assert await statuses(pipeline) == {"synced"}
-    old = root / "notes/Source.md"
-    if changed:
-        # The new bytes went to a new file; the old one held only the old bytes.
-        assert not old.exists()
-    else:
-        # The old spelling is the live file itself: renamed in place, never deleted.
-        assert not old.exists() or old.samefile(root / "notes/source.md")
+    # The old spelling is never deleted (that would delete the note), and no second name
+    # of the note is left behind. Unchanged bytes: the entry is renamed. Changed bytes:
+    # the note's own old file is cleared through the new spelling and written at once.
+    assert not any(kind == "delete" and path == "notes/Source.md" for kind, path, _ in calls)
+    if not changed:
+        assert ("move", "notes/Source.md", "notes/source.md") in calls
+    assert sorted(os.listdir(root / "notes")) == ["Target.md", "source.md"]
+
+
+@pytest.mark.asyncio
+async def test_a_pass_that_died_between_the_write_and_the_rename_converges(pipeline, monkeypatch):
+    """The new bytes went through the alias; the old spelling now reads them."""
+    files = {"notes/Source.md": note("notes/Source.md")}
+    ids = seed(pipeline, files)
+    await settle(pipeline)
+    renamed = {"notes/source.md": files["notes/Source.md"] + "Changed with the rename\n"}
+    publish(pipeline, renamed, {"notes/source.md": ids["notes/Source.md"]})
+    await project_git_content(
+        pipeline.repository, project_id=pipeline.project_id, session_maker=pipeline.session_maker
+    )
+    root = pipeline.file_service.base_path
+    # What the earlier pass left on macOS: one entry, written with the new bytes, still
+    # reachable under the old spelling, and the old spelling's row not yet completed.
+    (root / "notes/Source.md").unlink()
+    (root / "notes/source.md").write_bytes(renamed["notes/source.md"].encode())
+    os.link(root / "notes/source.md", root / "notes/Source.md")
+    assert await retirement_rows(pipeline) == 1
+    calls = fold_case(monkeypatch, root)
+    await settle(pipeline, timeout=10)
+    on_disk(pipeline, renamed)
+    assert await retirement_rows(pipeline) == 0
+    assert ("move", "notes/Source.md", "notes/source.md") in calls
+    assert not any(kind == "delete" for kind, _, _ in calls)
+    assert sorted(os.listdir(root / "notes")) == ["source.md"]
+
+
+@pytest.mark.asyncio
+async def test_a_symlink_at_the_old_spelling_is_not_the_note(pipeline):
+    """C1 means one directory entry; a symlink only reads the same bytes."""
+    files = {"notes/Foo.md": note("notes/Foo.md")}
+    ids = seed(pipeline, files)
+    await settle(pipeline)
+    publish(
+        pipeline, {"notes/foo.md": files["notes/Foo.md"]}, {"notes/foo.md": ids["notes/Foo.md"]}
+    )
+    root = pipeline.file_service.base_path
+    # A sync tool already renamed the file and left a compatibility link behind.
+    (root / "notes/Foo.md").rename(root / "notes/foo.md")
+    (root / "notes/Foo.md").symlink_to("foo.md")
+    await settle(pipeline)
+    live = root / "notes/foo.md"
+    assert not live.is_symlink() and live.read_bytes() == files["notes/Foo.md"].encode()
+    # Basic Memory never wrote the link: it neither renames over the note nor deletes it.
+    assert (root / "notes/Foo.md").is_symlink()
+    assert await retirement_rows(pipeline) == 0
 
 
 # --- Files and folders trading places (C8) ---
@@ -642,6 +749,10 @@ async def test_a_hidden_folder_left_inside_blocks_a_file_where_the_folder_was(pi
     # The old note went; the hidden folder stays, so the new file cannot take the path.
     assert "does not own blocks the published path" in error
     assert not (root / "a.md/b.md").exists() and (root / "a.md/.cache").is_dir()
+    # Every later pass reports the same, and never hands the folder to the materializer.
+    with pytest.raises(GitProjectionConflict, match="does not own blocks the published path"):
+        await pipeline.apply("files", pipeline.repository.head())
+    assert (root / "a.md/.cache").is_dir()
 
 
 @pytest.mark.asyncio
@@ -662,6 +773,95 @@ async def test_a_symlink_inside_a_folder_where_a_file_must_be_blocks_the_path(pi
     assert "does not own blocks the published path" in error
     # The deleted note's file went; the symlink stays, so the new file cannot take the path.
     assert (root / "a.md/link").is_symlink() and not (root / "a.md/b.md").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("left_by", ["a_crash_before_the_prune", "an_editor"])
+async def test_an_empty_folder_where_a_file_must_go_is_removed(pipeline, left_by):
+    files = {"a.md/b.md": note("a.md/b.md"), "other.md": note("other.md")}
+    ids = seed(pipeline, files)
+    await settle(pipeline)
+    root = pipeline.file_service.base_path
+    target = {"a.md": note("a.md"), "new.md": note("new.md"), "other.md": files["other.md"]}
+    publish(pipeline, target, {"a.md": uuid4(), "new.md": uuid4(), "other.md": ids["other.md"]})
+    await project_git_content(
+        pipeline.repository, project_id=pipeline.project_id, session_maker=pipeline.session_maker
+    )
+    assert await retirement_rows(pipeline) == 1
+    if left_by == "a_crash_before_the_prune":
+        # The old file was deleted, then the process died before its folder went.
+        (root / "a.md/b.md").unlink()
+    else:
+        (root / "new.md/sub/deeper").mkdir(parents=True)
+    await settle(pipeline, timeout=10)
+    on_disk(pipeline, target)
+    assert await retirement_rows(pipeline) == 0
+
+
+@pytest.mark.asyncio
+async def test_a_folder_left_by_a_crash_before_the_prune_goes_with_its_row(pipeline):
+    files = {"old/x/n.md": note("old/x/n.md")}
+    ids = seed(pipeline, files)
+    await settle(pipeline)
+    root = pipeline.file_service.base_path
+    publish(pipeline, {"new/n.md": files["old/x/n.md"]}, {"new/n.md": ids["old/x/n.md"]})
+    await project_git_content(
+        pipeline.repository, project_id=pipeline.project_id, session_maker=pipeline.session_maker
+    )
+    # The new file was written and the old one deleted; the folders were not pruned.
+    (root / "new").mkdir()
+    (root / "old/x/n.md").rename(root / "new/n.md")
+    await settle(pipeline)
+    on_disk(pipeline, {"new/n.md": files["old/x/n.md"]})
+    assert not (root / "old").exists()
+    assert await retirement_rows(pipeline) == 0
+
+
+@pytest.mark.asyncio
+async def test_a_failed_write_among_unknown_owners_stops_the_remaining_deletes(
+    pipeline, monkeypatch
+):
+    """C4: an old file whose owner is unknown goes only while nothing has failed."""
+    files = {"notes/a.md": note("notes/a.md"), "notes/b.md": note("notes/b.md")}
+    ids = seed(pipeline, files)
+    await settle(pipeline)
+    swapped = {
+        "notes/a.md": files["notes/b.md"] + "Edit\n",
+        "notes/b.md": files["notes/a.md"] + "Edit\n",
+    }
+    commit = publish(
+        pipeline, swapped, {"notes/a.md": ids["notes/b.md"], "notes/b.md": ids["notes/a.md"]}
+    )
+    await project_git_content(
+        pipeline.repository, project_id=pipeline.project_id, session_maker=pipeline.session_maker
+    )
+    snapshot = pipeline.repository.snapshot(commit)
+    notes, requests, retirements = await pipeline._read_files_state(snapshot)
+    old = {path: hashlib.sha256(text.encode()).hexdigest() for path, text in files.items()}
+    plan = FileProjectionPlan(
+        steps=tuple(
+            FileStep(StepKind.replace, path, expected_checksum=old[path], final=True)
+            for path in ("notes/a.md", "notes/b.md")
+        ),
+        done=frozenset(),
+        stale=frozenset(),
+        conflicts=(),
+    )
+
+    async def stale(request, **kwargs):
+        return RuntimeNoteMaterializationResult(
+            entity_id=request.entity_id,
+            status=RuntimeNoteMaterializationStatus.stale,
+            reason="a newer accept() moved the note",
+        )
+
+    monkeypatch.setattr(git_projection, "materialize_published_note", stale)
+    with pytest.raises(GitProjectionConflict, match="materialization: stale"):
+        await pipeline._carry_out(plan, snapshot, notes, requests, retirements)
+    root = pipeline.file_service.base_path
+    # The first write failed after its delete; the second old file is still there.
+    assert not (root / "notes/a.md").exists()
+    assert (root / "notes/b.md").read_bytes() == files["notes/b.md"].encode()
 
 
 @pytest.mark.asyncio
@@ -969,7 +1169,7 @@ def publish_host(
 
 @pytest.mark.asyncio
 async def test_a_local_case_only_rename_through_an_alias_keeps_the_note(host_setup, monkeypatch):
-    """C1 through accept(): the old spelling reaches the live file (here a hard link)."""
+    """C1 through accept(): the old spelling reaches the live file (one entry, simulated)."""
     from basic_memory.api.app import app
 
     project_id = host_setup.project.external_id
@@ -987,14 +1187,18 @@ async def test_a_local_case_only_rename_through_an_alias_keeps_the_note(host_set
             assert moved.status_code in {200, 202}, moved.text
             assert set(host_setup.repository.snapshot().files) == {"src/A.md"}
             os.link(root / "src/a.md", root / "src/A.md")
+            calls = fold_case(monkeypatch, root)
             release.set()
             await host_files_written(project_id)
             await host_ready(client, project_id)
     (row,) = await host_rows(host_setup)
     assert row.file_write_status == "synced" and row.file_path == "src/A.md"
     assert (root / "src/A.md").read_text() == row.markdown_content
-    old = root / "src/a.md"
-    assert not old.exists() or old.samefile(root / "src/A.md")
+    # Written through the alias, then the entry renamed: never a delete of the old
+    # spelling, and no second name left.
+    assert ("move", "src/a.md", "src/A.md") in calls
+    assert not any(kind == "delete" and path == "src/a.md" for kind, path, _ in calls)
+    assert os.listdir(root / "src") == ["A.md"]
     assert await host_retirements(host_setup) == 0
 
 

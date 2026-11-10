@@ -58,7 +58,7 @@ async def main() -> None:
         self: LocalNoteContentStorage, path: str, *, expected_checksum: str
     ):
         if fault_stage == "after_writes" and path not in live:
-            # Every new file is written; the first old file is about to go.
+            # The first old file to go, right after its note's new file was written.
             os._exit(77)
         outcome = await delete(self, path, expected_checksum=expected_checksum)
         if fault_stage == "reused_delete" and path in live:

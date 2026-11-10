@@ -208,10 +208,13 @@ def publication_proof_candidates(
         if checksum not in accepted:
             candidates.append(note.path)
     live = {note.path for note in notes}
+    # An old spelling that is the live file's own entry reads the live bytes: nothing to prove.
+    shared = set(disk.aliases.values())
     for retirement in retired.values():
         checksum = disk.files.get(retirement.path)
         if (
             retirement.path not in live
+            and retirement.path not in shared
             and checksum is not None
             and checksum not in retirement.expected_checksums
         ):
@@ -248,14 +251,24 @@ def plan_file_projection(
     done: set[str] = set()
     stale: set[str] = set()
 
-    def needs(path: str) -> tuple[frozenset[str], bool]:
-        """What must happen before the bytes at `path` may be deleted (C4)."""
+    def needs(path: str, alias: str | None = None) -> tuple[frozenset[str], bool]:
+        """What must happen before the bytes at `path` may be deleted (C4).
+
+        For a live path that is one entry with a retired `alias`, the bytes are the
+        alias's old file, so the alias's occupant names their owner when the path's own
+        does not (the owner may be the note at `path` itself: then nothing is needed).
+        """
         occupant = occupants.get(path)
+        if occupant is None and alias is not None:
+            occupant = occupants.get(alias)
         if occupant is None:
             return frozenset(), True
         if occupant.live_path is None or occupant.live_path == path:
             return frozenset(), False
         return frozenset({occupant.live_path}), False
+
+    # Retired path -> the live path that is the same directory entry (C1).
+    shared = {alias: path for path, alias in disk.aliases.items()}
 
     # --- Paths notes left: delete what Basic Memory wrote, keep an editor's file ---
     keys: dict[str, list[str]] = defaultdict(list)
@@ -268,6 +281,24 @@ def plan_file_projection(
         if checksum is None:
             # Gone already (or a folder now stands there): only the row is left.
             steps[path] = FileStep(StepKind.complete, path)
+        elif (live_path := shared.get(path)) is not None:
+            # Trigger: this old spelling and a live path are one directory entry.
+            # Why: its bytes are whatever the live path holds, the note's new bytes too
+            #   once it was written through the alias (and a pass died before the
+            #   rename); they are never an editor change, and deleting them would
+            #   delete the live note.
+            # Outcome: after the live note is verified, the stage renames the entry.
+            requires, final = (
+                needs(path) if checksum in retirement.expected_checksums else (frozenset(), False)
+            )
+            steps[path] = FileStep(
+                StepKind.delete,
+                path,
+                expected_checksum=checksum,
+                requires=requires | {live_path},
+                aliases=(live_path,),
+                final=final,
+            )
         elif checksum in retirement.expected_checksums or path in disk.published:
             requires, final = needs(path)
             steps[path] = FileStep(
@@ -338,9 +369,17 @@ def plan_file_projection(
         elif (alias := disk.aliases.get(path)) is not None and checksum in _expected(
             retired, alias
         ):
-            # Case-only rename on a case-insensitive file system: this path reaches the
-            # note's old file. Its own retirement row is completed by the alias's step.
-            steps[path] = FileStep(StepKind.replace, path, expected_checksum=checksum)
+            # Case- or Unicode-only alias on a file system that folds them: this path is
+            # the alias's old file. Its owner may be this very note (a case-only rename)
+            # or another one that moved on (C4); the alias's own step completes its row.
+            requires, final = needs(path, alias)
+            steps[path] = FileStep(
+                StepKind.replace,
+                path,
+                expected_checksum=checksum,
+                requires=requires,
+                final=final,
+            )
         else:
             # Never hand foreign bytes to the materializer: it would stamp the row as an
             # external change (C9).
