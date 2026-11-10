@@ -27,7 +27,9 @@ Prints one note through `bm_read`, resolved by path, permalink, memory://
 URL, or exact title. The content can be sliced by a 1-indexed inclusive line range (`--lines
 "20-40"`, `"20-"` to the end, `"20"` for one line), by a heading
 (`--section Decisions`, path form `Auth/Decisions`, or `Heading[1]` for a
-duplicate), or truncated to an approximate token budget (`--max-tokens`).
+duplicate; a heading named exactly as given, "/" included, such as `KI/ML`,
+wins over the path form), or truncated to an approximate token budget
+(`--max-tokens`).
 
 A text file that is not a note (an indexed `.txt` source, say) takes
 `--lines` too; `--section` and `--max-tokens` are for notes. Line numbers count
@@ -50,7 +52,7 @@ has_more, next_start_line, truncated, continue_line).
 ## OPTIONS
 
 - **--lines** — Line range "N-M", "N-" (to end), or "N" (one line); 1-indexed, frontmatter included
-- **--section** — Heading slice: "Decisions", "Auth/Decisions", or "Heading[1]"
+- **--section** — Heading slice: "Decisions", "Auth/Decisions", or "Heading[1]"; a heading named exactly as given, "/" included ("KI/ML"), wins over the path form
 - **--max-tokens** — Approximate token budget; cuts at a section or paragraph boundary
 - **--frontmatter / --no-frontmatter** (default: --frontmatter) — Include the YAML frontmatter in a whole-note read
 - **--project** — Project name, 'workspace/project', or project id. Defaults to the default project.

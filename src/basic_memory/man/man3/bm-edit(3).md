@@ -48,7 +48,7 @@ missing note is an error; create notes with bm_write.
 - **command** (required) — The edit.
 - **project** (string, required) — Required project name, 'workspace/project', or project external id. Discover projects with bm_project(command='list'). Paths are relative to this project; a qualified path must agree with it.
 - **content** (string | null, optional, default: None) — The text to add or the replacement. Not used by set_metadata.
-- **section** (string | null, optional, default: None) — The heading for section commands: "Decisions", "Auth/Decisions" for one under "Auth", or "Decisions[1]" for the second of two.
+- **section** (string | null, optional, default: None) — The heading for section commands: "Decisions", "Auth/Decisions" for one under "Auth", or "Decisions[1]" for the second of two. A heading whose own text is exactly the given text, "/" included ("KI/ML"), wins over the path reading.
 - **find_text** (string | null, optional, default: None) — For find_replace: the exact, case-sensitive text to replace.
 - **expected_replacements** (integer, optional, default: 1) — For find_replace: how many times find_text must occur.
 - **replace_subsections** (boolean, optional, default: True) — For replace_section: true replaces the section's subsections too; false stops at the first subsection heading.
@@ -83,6 +83,10 @@ bm_edit(identifier="plans/launch-plan.md", command="append", content="x",
 
 - `section` belongs to the section commands only; `append` with a `section` is
   refused. Use `insert_after_section` to add under a heading.
+- A heading whose own text contains "/" (`KI/ML`) is named whole, as in
+  bm-read(3): a heading named exactly as `section` is written wins over the path
+  reading, and spaces around the "/" (`KI / ML`) still reach heading `ML` under
+  `KI`. A repeated one is named `KI/ML[1]`; the refusal lists these names.
 - `set_metadata` refuses `title` and `permalink`: they are the note's identity.
   Rename with bm_move.
 

@@ -179,7 +179,8 @@ class KnowledgeClient:
         Args:
             entity_id: Entity external_id (UUID)
             section: Optional heading selector ("Decisions", "Auth/Decisions",
-                "Heading[1]") returning one section slice
+                "Heading[1]") returning one section slice; a heading whose own text
+                is the whole selector ("KI/ML") wins over the path reading
             lines: Optional document-absolute line range ("N-M", "N-", or "N")
             max_tokens: Optional token budget truncating the returned content
 

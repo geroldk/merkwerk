@@ -80,7 +80,9 @@ async def bm_edit(
             validation_alias=AliasChoices("section", "heading", "section_heading"),
             description=(
                 'The heading for section commands: "Decisions", "Auth/Decisions" for one '
-                'under "Auth", or "Decisions[1]" for the second of two.'
+                'under "Auth", or "Decisions[1]" for the second of two. A heading whose '
+                'own text is exactly the given text, "/" included ("KI/ML"), wins over '
+                "the path reading."
             ),
         ),
     ] = None,

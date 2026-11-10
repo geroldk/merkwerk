@@ -101,7 +101,9 @@ def cat(
     section: Annotated[
         Optional[str],
         typer.Option(
-            "--section", help='Heading slice: "Decisions", "Auth/Decisions", or "Heading[1]"'
+            "--section",
+            help='Heading slice: "Decisions", "Auth/Decisions", or "Heading[1]"; a heading '
+            'named exactly as given, "/" included ("KI/ML"), wins over the path form',
         ),
     ] = None,
     max_tokens: Annotated[

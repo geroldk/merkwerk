@@ -61,7 +61,7 @@ The shell counterpart is cat(1).
 
 - **identifier** (string, required) — The note or file: a file path ('notes/plan.md'), permalink, memory:// URL, exact title, external id, or '<project>/path'.
 - **project** (string, required) — Required project name, 'workspace/project', or project external id. Discover projects with bm_project(command='list'). Paths are relative to this project; a qualified path must agree with it.
-- **section** (string | null, optional, default: None) — A heading to read: "Decisions", "Auth/Decisions" for a heading under "Auth", or "Decisions[1]" for the second "Decisions" heading.
+- **section** (string | null, optional, default: None) — A heading to read: "Decisions", "Auth/Decisions" for a heading under "Auth", or "Decisions[1]" for the second "Decisions" heading. A heading whose own text is exactly the given text, "/" included ("KI/ML"), wins over the path reading.
 - **start_line** (integer | null, optional, default: None)
 - **end_line** (integer | null, optional, default: None)
 - **max_tokens** (integer | null, optional, default: None) — Approximate token budget. Longer content is cut at a section or paragraph boundary, and the result says which line to continue from.
@@ -127,6 +127,13 @@ bm_read(identifier="plans/missing.md", project="demo")
   constraint, or a qualified identifier. A qualified path must agree with it.
 - A section read returns numbered lines, like `start_line`/`end_line`; a whole
   note comes back without line numbers.
+- A heading whose own text contains "/" (`KI/ML`) is named whole: when a heading
+  is named exactly as `section` is written, "/" included, that heading wins over
+  the path reading (heading `ML` under `KI`). Spaces around the "/" (`KI / ML`)
+  or an added ancestor (`Plan/KI/ML`) still reach the path, unless a heading is
+  named that way too. Such a heading cannot be qualified by its parents, so one
+  under two different parents stays ambiguous; `[n]` counts its repeats under
+  the same parent. A heading that itself ends in `[1]` is named `Heading[1][0]`.
 - The token budget is approximate. The first nonblank line is returned whole
   even when it exceeds the budget, so a read does not return only leading blank
   lines. Follow the returned line coordinates to continue.

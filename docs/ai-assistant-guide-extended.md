@@ -291,7 +291,9 @@ await bm_edit(
 
 Read before editing and pass `expected_checksum` when the change depends on the
 revision you read. For repeated headings use a section path (`Auth/Decisions`) or an
-occurrence (`Decisions[1]`). `expected_replacements` must match the actual count;
+occurrence (`Decisions[1]`). A heading whose own text contains "/" (`KI/ML`) is named
+whole: a heading named exactly as written wins over the path reading, and `KI / ML`
+with spaces still means heading `ML` under `KI`. `expected_replacements` must match the actual count;
 there is no `replace_all` parameter. Metadata updates preserve other fields and
 cannot remove keys with null or change title/permalink identity.
 

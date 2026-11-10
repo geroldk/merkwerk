@@ -64,7 +64,9 @@ async def bm_read(
         Field(
             description=(
                 'A heading to read: "Decisions", "Auth/Decisions" for a heading under '
-                '"Auth", or "Decisions[1]" for the second "Decisions" heading.'
+                '"Auth", or "Decisions[1]" for the second "Decisions" heading. A heading '
+                'whose own text is exactly the given text, "/" included ("KI/ML"), wins '
+                "over the path reading."
             )
         ),
     ] = None,
