@@ -1,6 +1,7 @@
 """Lifecycle-owned, bounded Git catch-up; Git + SQL survive lost wakeups/restarts."""
 
 import asyncio
+from asyncio import CancelledError, current_task
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, nullcontext
 from dataclasses import dataclass
@@ -193,6 +194,15 @@ class GitProjectionWorker:
                 # propagates; a failed checkpoint write can never acknowledge the stage.
                 logger.exception("Git projection pass failed", project_id=self.pipeline.project_id)
                 outcome = GitPassOutcome.failed
+            # Trigger: the stop cancelled this lane during the pass, but no CancelledError
+            #   came out of it: aiosqlite's cleanup of a statement cut by the cancel can
+            #   raise "Connection closed" in its place, which ends as a failed pass (here or
+            #   in a stage).
+            # Why: the lane would go on to its next poll, and the worker's task group, and
+            #   with it the whole stop, would wait for it until the process is killed.
+            # Outcome: the lane ends as cancelled, as the stop asked.
+            if (task := current_task()) is not None and task.cancelling():
+                raise CancelledError
             if outcome is GitPassOutcome.deferred:
                 # Trigger: notes wait for another project (I1).
                 # Why: nothing failed; the owner's completed content stage wakes this
