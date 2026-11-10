@@ -13,6 +13,10 @@ from basic_memory import __version__ as version
 from basic_memory.api.container import ApiContainer, installed_container
 from basic_memory.api.git_policy import enforce_git_api_policy
 from basic_memory.index.git_host import run_git_host
+from basic_memory.api.v2.routers.git_move_router import (
+    host_router as git_host_move_router,
+    router as git_move_router,
+)
 from basic_memory.api.v2.routers.git_router import router as git_router
 from basic_memory.api.v2.routers.git_transaction_router import router as git_transaction_router
 from basic_memory.repository.git_transaction_repository import GitTransactionError
@@ -161,6 +165,8 @@ async def workspace_permalink_context_middleware(request: Request, call_next):
 
 app.include_router(git_router, prefix="/v2/projects/{project_id}")
 app.include_router(git_transaction_router, prefix="/v2/projects/{project_id}")
+app.include_router(git_move_router, prefix="/v2/projects/{project_id}")
+app.include_router(git_host_move_router, prefix="/v2")
 
 # Include v2 routers FIRST (more specific paths must match before /{project} catch-all)
 app.include_router(v2_accepted_content, prefix="/v2/projects/{project_id}")

@@ -676,3 +676,31 @@ def test_one_batch_read_and_one_batch_write_keep_every_byte(
     calls.clear()
     repository._write_tree({})
     assert "hash-object" not in calls
+
+
+def test_removals_since_a_base_follow_every_line(repository: GitProjectRepository) -> None:
+    """A move's resume decides from history whether the source let go (I1)."""
+    note, other = uuid4(), uuid4()
+    text = "---\ntitle: N\ntype: note\npermalink: n\n---\n"
+
+    def publish(files: dict[str, str], ids: dict[str, UUID]) -> str:
+        prepared = repository.prepare(
+            transaction_id=uuid4(), base_commit=repository.head(), files=files, note_ids=ids
+        )
+        return repository.publish(prepared).commit_id
+
+    base = publish({"n.md": text}, {"n.md": note})
+    assert repository.removals_since(base, base, note) == []
+    unrelated = publish({"n.md": text, "o.md": text}, {"n.md": note, "o.md": other})
+    assert repository.removals_since(base, unrelated, note) == []
+    removed = publish({"o.md": text}, {"o.md": other})
+    back = publish({"n.md": text, "o.md": text}, {"n.md": note, "o.md": other})
+    # The removal stays visible after the note came back.
+    assert repository.removals_since(base, back, note) == [removed]
+    # A base that is not ancestry of the tip cannot decide anything.
+    orphan = (
+        repository._git("commit-tree", f"{base}^{{tree}}", input_bytes=b"Elsewhere\n")
+        .strip()
+        .decode()
+    )
+    assert repository.removals_since(orphan, back, note) is None

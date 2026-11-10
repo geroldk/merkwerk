@@ -233,3 +233,77 @@ async def test_process_death_during_restore_handover_is_resumable(
     await rebuild_restored_git_instance(target, timeout=30)
     assert (target / "READY.json").exists()
     assert not (target / "RESTORE_INCOMPLETE").exists()
+
+
+@pytest.mark.asyncio
+async def test_an_open_cross_project_move_survives_backup_and_finishes_after_restore(
+    host_setup, config_manager, tmp_path, monkeypatch
+):
+    """I1: the intent goes into the archive; the restored host's start finishes the move."""
+    from basic_memory.api.app import app
+    from basic_memory.repository.git_move_intent_repository import GitMoveIntentRepository
+    from basic_memory.services.git_project_create import GitProjectCreateError
+    from basic_memory.services.git_project_remove import remove_empty_git_projects
+    from tests.git_host_support import add_git_project
+
+    a = host_setup.project.external_id
+    second, b_repo = await add_git_project(host_setup, config_manager, "second")
+    b = second.external_id
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=ASGITransport(app), base_url="http://test") as client:
+            answer = await client.post(
+                f"/v2/projects/{a}/knowledge/write",
+                json={"note": {"title": "Mover", "directory": "notes", "content": "Inhalt\n"}},
+            )
+            assert answer.status_code == 200, answer.text
+            note = answer.json()["entity"]["external_id"]
+            await ready(client, a)
+            await ready(client, b)
+    request = tmp_path / "crash.json"
+    request.write_text(
+        json.dumps(
+            {
+                "fault": "after_delete_before_commit",
+                "source_repository": str(host_setup.repository.path),
+                "target_repository": str(b_repo.path),
+                "source_project_id": a,
+                "body": {
+                    "external_id": note,
+                    "target_project_id": b,
+                    "destination_path": "moved/Mover.md",
+                },
+            }
+        )
+    )
+    child = await asyncio.to_thread(
+        subprocess.run,
+        [sys.executable, "test-int/fixtures/git_cross_move_crash.py", str(request)],
+        capture_output=True,
+        timeout=90,
+    )
+    assert child.returncode == 83, child.stderr[-4000:]
+    (intent,) = GitMoveIntentRepository(b_repo, UUID(b)).load_all()
+    await db.shutdown_db()
+    # Neither project of an open move may be removed (the target is still empty here).
+    with pytest.raises(GitProjectCreateError, match="open cross-project move"):
+        await remove_empty_git_projects(["second"], manager=config_manager)
+    await db.shutdown_db()
+
+    backup, target = tmp_path / "backup.zip", tmp_path / "restored"
+    await asyncio.to_thread(create_git_backup, config_manager.config_file, backup)
+    await asyncio.to_thread(restore_git_backup, backup, target)
+    restored_config = BasicMemoryConfig.model_validate_json(
+        (target / "config/config.json").read_bytes()
+    )
+    restored_b = GitProjectRepository(restored_config.git_repositories[UUID(b)])
+    assert GitMoveIntentRepository(restored_b, UUID(b)).load_all() == [intent]
+    monkeypatch.setenv("BASIC_MEMORY_CONFIG_DIR", str(target / "config"))
+    monkeypatch.setenv("BASIC_MEMORY_HOME", str(target / "notes"))
+    await rebuild_restored_git_instance(target, timeout=60)
+    # The rebuild's host start resumed the move: the note arrived with its UUID.
+    assert restored_b.snapshot().manifest.note_ids == {"moved/Mover.md": UUID(note)}
+    assert GitMoveIntentRepository(restored_b, UUID(b)).load_all() == []
+    restored_a = GitProjectRepository(restored_config.git_repositories[UUID(a)])
+    assert UUID(note) not in restored_a.published_note_ids()
+    # The original profile still holds the open move until its own host starts.
+    assert GitMoveIntentRepository(b_repo, UUID(b)).load_all() == [intent]

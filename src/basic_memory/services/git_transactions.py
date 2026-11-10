@@ -83,6 +83,14 @@ def _draft_permalink(text: str) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+class GitNoteStillOwned(GitTransactionError):
+    """A commit would publish a note UUID another project (or open move) still holds.
+
+    A 409 like any refused commit; a cross-project move reads it as "the source has not
+    let go yet" and waits, instead of rebasing its draft.
+    """
+
+
 class GitTransactionService:
     def __init__(
         self,
@@ -127,9 +135,15 @@ class GitTransactionService:
         self, identity: UUID, key: str, *, keep_alive: bool = False
     ) -> GitTransactionStatus:
         async with self.runtime.admission():
-            return await self.call(
-                partial(self.repository.status, identity, key, keep_alive=keep_alive)
-            )
+            return await self.status_admitted(identity, key, keep_alive=keep_alive)
+
+    async def status_admitted(
+        self, identity: UUID, key: str, *, keep_alive: bool = False
+    ) -> GitTransactionStatus:
+        """`status` for a caller that already holds this runtime's admission gate."""
+        return await self.call(
+            partial(self.repository.status, identity, key, keep_alive=keep_alive)
+        )
 
     async def listing(
         self, identity: UUID, key: str, *, view: Literal["base", "draft"] = "draft"
@@ -447,7 +461,7 @@ class GitTransactionService:
                 if owned is not None:
                     raise GitNoteOwnedElsewhere(UUID(owned), "another project")
             except GitNoteOwnedElsewhere as error:
-                raise GitTransactionError(409, str(error)) from error
+                raise GitNoteStillOwned(409, str(error)) from error
 
     async def rollback(
         self, identity: UUID, key: str, request: GitTransactionControl

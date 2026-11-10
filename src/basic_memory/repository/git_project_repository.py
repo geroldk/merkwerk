@@ -717,6 +717,31 @@ class GitProjectRepository:
             for commit, notes in found.items()
         }
 
+    def removals_since(self, base: str, tip: str, external_id: UUID) -> list[str] | None:
+        """The commits after `base` (up to `tip`) that dropped `external_id`, oldest first.
+
+        A commit drops the note when one of its parents held it and it does not. Every
+        line after `base` counts, not only first parents: a fast-forward from a peer can
+        put the local line second. None when `base` is not published ancestry of `tip`.
+        """
+        _require_commit_id(base)
+        _require_commit_id(tip)
+        if not self.is_ancestor(base, tip):
+            return None
+        lineage = self._git("rev-list", "--topo-order", "--parents", f"{base}..{tip}")
+        entries = [line.split() for line in lineage.decode("ascii").splitlines()]
+        commits = list(dict.fromkeys(part for entry in entries for part in entry))
+        manifests: dict[str, frozenset[str]] = {}
+        for start in range(0, len(commits), _MANIFEST_BATCH):
+            manifests |= self._note_id_strings(commits[start : start + _MANIFEST_BATCH])
+        note = str(external_id)
+        return [
+            entry[0]
+            for entry in reversed(entries)
+            if note not in manifests[entry[0]]
+            and any(note in manifests[parent] for parent in entry[1:])
+        ]
+
     def last_introduction(self, tip: str, external_id: UUID) -> str | None:
         """The commit that last brought `external_id` into the line ending at `tip`."""
         return self.last_introductions(tip, [external_id])[external_id]

@@ -31,6 +31,17 @@ GIT_TRANSACTION_WRITES = frozenset(
 )
 
 
+# Cross-project moves that keep the note's UUID (I1), and their open intents.
+GIT_MOVE_WRITES = frozenset(
+    {
+        "move_git_note_across_projects",
+        "catch_up_git_project",
+        "resume_git_moves",
+        "resolve_git_move",
+    }
+)
+
+
 async def enforce_git_api_policy(request: Request, app_config: AppConfigDep) -> None:
     if not app_config.git_repositories:
         return
@@ -50,6 +61,8 @@ async def enforce_git_api_policy(request: Request, app_config: AppConfigDep) -> 
     if module.endswith(".git_transaction_router") and name in GIT_TRANSACTION_WRITES:
         return
     if module.endswith(".git_router") and name in {"sync_git_project", "merge_git_project"}:
+        return
+    if module.endswith(".git_move_router") and name in GIT_MOVE_WRITES:
         return
     if module.endswith((".knowledge_router", ".note_write_router")) and name in GIT_NOTE_WRITES:
         return

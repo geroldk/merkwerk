@@ -60,6 +60,27 @@ async def test_git_folder_move_route_passes_the_policy_and_upstream_does_not(app
 
 
 @pytest.mark.asyncio
+async def test_every_cross_project_move_write_passes_the_policy(app_config, tmp_path):
+    """I1: the move, its catch-up, resume and resolve are named Git writes; GET is a read."""
+    from basic_memory.api.git_policy import GIT_MOVE_WRITES
+    from basic_memory.api.v2.routers.git_move_router import host_router, router
+    from fastapi.routing import APIRoute
+
+    app_config.git_repositories = {uuid4(): tmp_path / "project.git"}
+    routes = {
+        route.name: route
+        for route in (*router.routes, *host_router.routes)
+        if isinstance(route, APIRoute)
+    }
+    writes = {name for name, route in routes.items() if "POST" in (route.methods or set())}
+    assert writes == GIT_MOVE_WRITES
+    for name in writes:
+        await enforce_git_api_policy(
+            Request({"type": "http", "method": "POST", "route": routes[name]}), app_config
+        )
+
+
+@pytest.mark.asyncio
 async def test_non_api_route_is_refused_on_git_host(app_config, tmp_path):
     app_config.git_repositories = {uuid4(): tmp_path / "project.git"}
 

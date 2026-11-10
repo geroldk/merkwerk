@@ -295,6 +295,36 @@ class GitProjectRuntime:
                 # must wake durable Git recovery. Polling covers process death.
                 self.worker.notify()
 
+    # --- SQL catch-up for cross-project moves (I1) ---
+
+    async def catch_up(self) -> GitProjectionDeferred | None:
+        """Bring SQL to the published head now, as accept() does before a write."""
+        async with self.admission():
+            return await self.catch_up_admitted()
+
+    async def catch_up_admitted(
+        self, *, known_ancestor: GitSnapshot | None = None
+    ) -> GitProjectionDeferred | None:
+        """`catch_up` for a caller that holds the admission gate.
+
+        A wait for other projects is returned, not raised: everything else is projected
+        then (the moved note included), only the waiting notes are missing from SQL.
+        `known_ancestor` is a published snapshot the head was built on (see
+        project_git_content).
+        """
+        head = await asyncio.to_thread(self.pipeline.repository.head)
+        if self._sql_commit == head:
+            return None
+        try:
+            await self.pipeline.recover_content(head, known_ancestor=known_ancestor)
+        except GitProjectionDeferred as deferral:
+            return deferral
+        finally:
+            # The files, graph and vector stages follow from the worker.
+            self.worker.notify()
+        self._sql_commit = head
+        return None
+
     async def _require_new_note_ids(self, session: AsyncSession, note_ids: set[UUID]) -> None:
         """A caller-chosen UUID must be free host-wide; without the host view, SQL's own
         unique index is the only check (an offline or test runtime)."""

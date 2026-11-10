@@ -25,6 +25,10 @@ from basic_memory.repository.git_host_identities import GitHostIdentities, GitHo
 from basic_memory.repository.git_project_repository import GitProjectRepository
 from basic_memory.repository.git_projection_repository import GitProjectionConflict
 from basic_memory.repository.project_repository import ProjectRepository
+from basic_memory.services.git_cross_project_move import (
+    reserve_open_moves,
+    resume_cross_project_moves,
+)
 from basic_memory.services.git_project_runtime import GitProjectRuntime
 
 
@@ -153,6 +157,14 @@ async def run_git_host(
     async with AsyncExitStack() as stack:
         for runtime in runtimes.values():
             await stack.enter_async_context(runtime.run())
+        host = GitHost(MappingProxyType(runtimes), identities)
+        # Trigger: a cross-project move was interrupted (crash, restart) (I1).
+        # Why: its note may be in no project's current state; its UUID must not be taken
+        #   by a write before the move finishes, and every startup recover has run now.
+        # Outcome: the UUIDs are reserved, then each move is finished, undone or kept as
+        #   stuck, one by one; a failing one is logged and never stops the host.
+        reserve_open_moves(host)
+        await resume_cross_project_moves(host)
         # Runtimes start in project order; one that waited for a later owner retries now.
         identities.nudge_waiting()
-        yield GitHost(MappingProxyType(runtimes), identities)
+        yield host
