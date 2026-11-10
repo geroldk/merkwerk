@@ -14,6 +14,7 @@ from sqlalchemy import select
 
 from basic_memory.file_utils import ParseError, parse_frontmatter
 from basic_memory.markdown import EntityParser
+from basic_memory.repository.git_host_identities import GitNoteOwnedElsewhere
 from basic_memory.repository.git_project_repository import (
     GitPublicationError,
     settle_git_operation,
@@ -37,6 +38,7 @@ from basic_memory.schemas.git_transactions import (
     GitTransactionWrite,
 )
 from basic_memory.models import Entity
+from basic_memory.schemas.git_project import validate_note_path
 from basic_memory.services.note_preparation import (
     PermalinkChangeError,
     apply_edit_operation,
@@ -115,7 +117,11 @@ class GitTransactionService:
 
     async def start(self, request: GitTransactionStart) -> GitTransactionStarted:
         async with self.runtime.admission():
-            return await self.call(partial(self.repository.start, request))
+            return await self.start_admitted(request)
+
+    async def start_admitted(self, request: GitTransactionStart) -> GitTransactionStarted:
+        """`start` for a caller that already holds this runtime's admission gate."""
+        return await self.call(partial(self.repository.start, request))
 
     async def status(
         self, identity: UUID, key: str, *, keep_alive: bool = False
@@ -270,41 +276,196 @@ class GitTransactionService:
                 )
             )
 
-    async def commit(
-        self, identity: UUID, key: str, request: GitTransactionCommit
+    # --- Internal: a draft note with a chosen UUID (I1), never routed ---
+
+    async def write_identified(
+        self,
+        identity: UUID,
+        key: str,
+        *,
+        path: str,
+        content: str,
+        note_id: UUID,
+        expected_revision: int,
+        created: datetime | None = None,
+        modified: datetime | None = None,
+        reservation: UUID | None = None,
     ) -> GitTransactionStatus:
         async with self.runtime.admission():
+            return await self.write_identified_admitted(
+                identity,
+                key,
+                path=path,
+                content=content,
+                note_id=note_id,
+                expected_revision=expected_revision,
+                created=created,
+                modified=modified,
+                reservation=reservation,
+            )
+
+    async def write_identified_admitted(
+        self,
+        identity: UUID,
+        key: str,
+        *,
+        path: str,
+        content: str,
+        note_id: UUID,
+        expected_revision: int,
+        created: datetime | None = None,
+        modified: datetime | None = None,
+        reservation: UUID | None = None,
+    ) -> GitTransactionStatus:
+        """Add a new draft note that keeps an existing UUID (a cross-project move).
+
+        The public write API never takes a UUID (GitTransactionWrite has none), so agents
+        cannot choose one. The note keeps its times as a plain move does: `created` and
+        `modified` stay as written, and a missing key is filled from `created`/`modified`
+        here (the source entity's times), never from the moment of the move.
+        The ownership check runs at commit, not here: at draft time the note still lives
+        in its source project. Only a reservation by another move refuses it now.
+        """
+        try:
+            validate_note_path(path)
+        except ValueError as error:
+            raise GitTransactionError(422, f"Invalid draft note path {path}: {error}") from error
+        if (identities := self.runtime.pipeline.identities) is not None:
             try:
-                current = await self.call(partial(self.repository.status, identity, key))
-                if current.state != "committed":
-                    record, snapshot = await self.call(partial(self.repository.read, identity, key))
-                    self.repository.require_writable(record, request.expected_revision)
-                    await validate_git_draft(
-                        snapshot.files, self.runtime.pipeline.file_service.base_path
-                    )
-                return await self.call(
-                    partial(
-                        self.repository.commit,
-                        identity,
-                        key,
-                        expected_revision=request.expected_revision,
-                        message=request.message,
-                    )
+                identities.require_unreserved({note_id}, holder=reservation)
+            except GitNoteOwnedElsewhere as error:
+                raise GitTransactionError(409, str(error)) from error
+        record, snapshot = await self.call(partial(self.repository.read, identity, key))
+        self.repository.require_writable(record, expected_revision)
+        files, note_ids = dict(snapshot.files), snapshot.manifest.note_ids
+        if path in files:
+            raise GitTransactionError(409, "Draft path is already occupied")
+        if note_id in note_ids.values():
+            raise GitTransactionError(409, "Draft already holds this note UUID")
+        wanted = wanted_note_times(
+            content,
+            now=datetime.now().astimezone(),
+            current_markdown=content,
+            fallback_created=created,
+            fallback_modified=modified,
+        )
+        files[path] = content if wanted is None else stamp_markdown_times(content, wanted)
+        note_ids[path] = note_id
+        await validate_git_draft(files, self.runtime.pipeline.file_service.base_path)
+        return await self.call(
+            partial(
+                self.repository.replace,
+                identity,
+                key,
+                expected_revision=expected_revision,
+                files=files,
+                note_ids=note_ids,
+            )
+        )
+
+    async def commit(
+        self,
+        identity: UUID,
+        key: str,
+        request: GitTransactionCommit,
+        *,
+        moved_notes: Mapping[UUID, UUID] | None = None,
+        reservation: UUID | None = None,
+    ) -> GitTransactionStatus:
+        async with self.runtime.admission():
+            return await self.commit_admitted(
+                identity, key, request, moved_notes=moved_notes, reservation=reservation
+            )
+
+    async def commit_admitted(
+        self,
+        identity: UUID,
+        key: str,
+        request: GitTransactionCommit,
+        *,
+        moved_notes: Mapping[UUID, UUID] | None = None,
+        reservation: UUID | None = None,
+    ) -> GitTransactionStatus:
+        """`commit` for a caller that already holds this runtime's admission gate.
+
+        `moved_notes` (note -> source project) adds BM's move trailers; `reservation` is
+        the cross-project move allowed to publish the UUIDs it reserves.
+        """
+        try:
+            current = await self.call(partial(self.repository.status, identity, key))
+            if current.state != "committed":
+                record, snapshot = await self.call(partial(self.repository.read, identity, key))
+                self.repository.require_writable(record, request.expected_revision)
+                await validate_git_draft(
+                    snapshot.files, self.runtime.pipeline.file_service.base_path
                 )
-            finally:
-                # A lost/cancelled response may have published. Only Git is input
-                # to the durable worker, so waking it cannot index private drafts.
-                self.runtime.worker.notify()
+                base = await self.call(
+                    partial(self.repository.repository.note_ids_at, record.base_commit)
+                )
+                await self._require_owned_here(
+                    set(snapshot.manifest.note_ids.values()) - base, reservation
+                )
+            return await self.call(
+                partial(
+                    self.repository.commit,
+                    identity,
+                    key,
+                    expected_revision=request.expected_revision,
+                    message=request.message,
+                    moved_notes=moved_notes,
+                )
+            )
+        finally:
+            # A lost/cancelled response may have published. Only Git is input
+            # to the durable worker, so waking it cannot index private drafts.
+            self.runtime.worker.notify()
+
+    async def _require_owned_here(self, new_ids: set[UUID], reservation: UUID | None) -> None:
+        """Ownership guard: a draft may not publish a UUID another project still holds.
+
+        Agent drafts get fresh UUIDs, so this refuses only a chosen one (a cross-project
+        move whose source has not let go yet). Publishing it anyway would leave the
+        twin in this project waiting for the other for good.
+        """
+        if not new_ids:
+            return
+        identities = self.runtime.pipeline.identities
+        project_id = self.runtime.pipeline.project_id
+        async with self.runtime.pipeline.session_maker() as session:
+            try:
+                if identities is not None:
+                    await identities.require_unowned(
+                        session, project_id=project_id, note_ids=new_ids, holder=reservation
+                    )
+                    return
+                owned = await session.scalar(
+                    select(Entity.external_id)
+                    .where(
+                        Entity.external_id.in_([str(note) for note in new_ids]),
+                        Entity.project_id != project_id,
+                    )
+                    .limit(1)
+                )
+                if owned is not None:
+                    raise GitNoteOwnedElsewhere(UUID(owned), "another project")
+            except GitNoteOwnedElsewhere as error:
+                raise GitTransactionError(409, str(error)) from error
 
     async def rollback(
         self, identity: UUID, key: str, request: GitTransactionControl
     ) -> GitTransactionStatus:
         async with self.runtime.admission():
-            return await self.call(
-                partial(
-                    self.repository.rollback,
-                    identity,
-                    key,
-                    expected_revision=request.expected_revision,
-                )
+            return await self.rollback_admitted(identity, key, request)
+
+    async def rollback_admitted(
+        self, identity: UUID, key: str, request: GitTransactionControl
+    ) -> GitTransactionStatus:
+        """`rollback` for a caller that already holds this runtime's admission gate."""
+        return await self.call(
+            partial(
+                self.repository.rollback,
+                identity,
+                key,
+                expected_revision=request.expected_revision,
             )
+        )

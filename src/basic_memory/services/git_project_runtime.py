@@ -49,6 +49,7 @@ from basic_memory.repository.git_project_repository import (
     GitSnapshot,
     settle_git_publication,
 )
+from basic_memory.repository.git_host_identities import GitNoteOwnedElsewhere
 from basic_memory.repository.git_projection_repository import (
     GitProjectionConflict,
     GitProjectionDeferred,
@@ -58,6 +59,7 @@ from basic_memory.runtime.project_partition import RuntimeProjectNoteOperation
 from basic_memory.services.note_content_writes import (
     AcceptedNoteChange,
     AcceptedNoteMutationRequest,
+    NoteContentIdentityTaken,
     NoteContentMutationServiceError,
     NoteContentProjectWaiting,
     NoteContentPublicationConflict,
@@ -213,6 +215,15 @@ class GitProjectRuntime:
                         return result.change
                     files, note_ids = dict(base.files), base.manifest.note_ids
                     note_id = UUID(change.note_external_id)
+                    if (
+                        isinstance(request, AcceptedNoteUpdateMutation)
+                        and change.operation is RuntimeProjectNoteOperation.created
+                    ):
+                        # Trigger: a PUT by UUID found no note here and creates one.
+                        # Why: the caller chose that UUID; another project's head or an
+                        #   open cross-project move may hold it while SQL does not (I1).
+                        # Outcome: 409 and nothing published; this session rolls back.
+                        await self._require_new_note_ids(session, {note_id})
                     if change.operation in {
                         RuntimeProjectNoteOperation.moved,
                         RuntimeProjectNoteOperation.deleted,
@@ -283,6 +294,19 @@ class GitProjectRuntime:
                 # Even a cancelled/lost publication response or failed SQL commit
                 # must wake durable Git recovery. Polling covers process death.
                 self.worker.notify()
+
+    async def _require_new_note_ids(self, session: AsyncSession, note_ids: set[UUID]) -> None:
+        identities = self.pipeline.identities
+        if identities is None:
+            return
+        try:
+            await identities.require_unowned(
+                session, project_id=self.pipeline.project_id, note_ids=note_ids
+            )
+        except GitNoteOwnedElsewhere as error:
+            raise NoteContentIdentityTaken(
+                {"message": f"{error}. Nothing was changed.", "kind": "owned_elsewhere"}
+            ) from error
 
     # --- Folder moves (V1) ---
 
