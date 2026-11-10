@@ -776,3 +776,51 @@ async def test_a_real_duplicate_still_refuses_the_snapshot_with_names(
         )
     assert f"{note} (owned by project 'other'" in str(refused.value)
     assert type(refused.value) is GitProjectionConflict
+
+
+@pytest.mark.asyncio
+async def test_an_unchanged_note_is_not_restored_again_and_removals_still_run(
+    repository, markdown, test_project, session_maker, monkeypatch
+):
+    """Only changed notes cost a restore; every pass used to touch the whole project."""
+    first, second = uuid4(), uuid4()
+    other = markdown.replace("notes/a", "notes/b").replace("title: A", "title: B")
+
+    def publish_tree(files: dict[str, str]) -> None:
+        ids = {"notes/a.md": first, "notes/b.md": second}
+        repository.publish(
+            repository.prepare(
+                transaction_id=uuid4(),
+                base_commit=repository.head(),
+                files=files,
+                note_ids={path: ids[path] for path in files},
+            )
+        )
+
+    publish_tree({"notes/a.md": markdown, "notes/b.md": other})
+    await project_git_content(repository, project_id=test_project.id, session_maker=session_maker)
+    restored: list[UUID] = []
+    restore = GitProjectionRepository.restore_note
+
+    async def recording(self, session, **arguments):
+        restored.append(arguments["external_id"])
+        return await restore(self, session, **arguments)
+
+    monkeypatch.setattr(GitProjectionRepository, "restore_note", recording)
+    publish_tree({"notes/a.md": markdown, "notes/b.md": other + "Neu\n"})
+    changed = await project_git_content(
+        repository, project_id=test_project.id, session_maker=session_maker
+    )
+    assert restored == [second] and changed.notes_changed == 1
+    publish_tree({"notes/a.md": markdown})
+    removed = await project_git_content(
+        repository, project_id=test_project.id, session_maker=session_maker
+    )
+    assert restored == [second] and removed.notes_removed == 1
+    async with session_maker() as session:
+        rows = await session.execute(
+            select(Entity.file_path, NoteContent.markdown_content)
+            .join(NoteContent, NoteContent.entity_id == Entity.id)
+            .where(Entity.project_id == test_project.id)
+        )
+        assert [tuple(row) for row in rows] == [("notes/a.md", markdown)]

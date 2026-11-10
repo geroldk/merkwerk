@@ -158,10 +158,26 @@ async def project_git_content(
                 )
     prepared: dict[UUID, GitPreparedNote] = {}
     bases: dict[UUID, GitProjectionContentBasis | None] = {}
+    unchanged: set[UUID] = set()
     for note in notes:
         content = snapshot.files[note.path]
         local = local_by_uuid.get(note.external_id)
         basis = local.content if local is not None else None
+        # Trigger: SQL already holds this note at this path with exactly these bytes.
+        # Why: parsing it again and checking the head before a restore that changes
+        #   nothing made every pass cost the whole project; a folder that arrives note
+        #   by note (a cross-project move) paid that once per note.
+        # Outcome: its rows stay untouched, as restore_note would leave them; the layout
+        #   step still compares every local note with what this pass read.
+        if (
+            local is not None
+            and basis is not None
+            and local.file_path == note.path
+            and basis.markdown_content == content
+            and basis.checksum == await compute_checksum(content)
+        ):
+            unchanged.add(note.external_id)
+            continue
         bases[note.external_id] = basis
         if (
             basis is not None
@@ -241,7 +257,9 @@ async def project_git_content(
                 target_ids,
             ):
                 await invalidate_git_graphs(session)
-            moved, removed = await layout.apply(session, expected=local_notes, target=prepared)
+            moved, removed = await layout.apply(
+                session, expected=local_notes, target=prepared, unchanged=unchanged
+            )
         changed += moved
         for local in local_notes:
             if (
@@ -255,6 +273,8 @@ async def project_git_content(
                     target.content,
                 )
         for note in notes:
+            if note.external_id in unchanged:
+                continue
             if snapshot.commit_id != await asyncio.to_thread(repository.head):
                 raise GitProjectionSuperseded(
                     "Published Git head advanced during projection; retry latest"

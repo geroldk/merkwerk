@@ -625,9 +625,9 @@ async def test_git_advance_after_layout_does_not_finish_the_stale_target(pipelin
     apply = GitLayoutRepository.apply
     advanced = False
 
-    async def advance_after_layout(self, session, *, expected, target):
+    async def advance_after_layout(self, session, **arguments):
         nonlocal advanced
-        result = await apply(self, session, expected=expected, target=target)
+        result = await apply(self, session, **arguments)
         if not advanced:
             advanced = True
             snapshot = pipeline.repository.snapshot()

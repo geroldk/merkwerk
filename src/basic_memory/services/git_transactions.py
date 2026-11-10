@@ -51,27 +51,44 @@ if TYPE_CHECKING:  # pragma: no cover
     from basic_memory.services.git_project_runtime import GitProjectRuntime
 
 
+# Notes that passed validation, by (root, path, sha256 of the text) -> their permalink.
+# Every draft write and commit validates the whole tree; in a project of a thousand notes
+# the parse cost a second each time, and a folder moved note by note paid it twice per
+# note. A note is only skipped once its exact bytes passed; uniqueness is checked always.
+_VALIDATED: dict[tuple[str, str, str], str] = {}
+_VALIDATED_LIMIT = 16384
+
+
 async def validate_git_draft(files: Mapping[str, str], root: Path) -> None:
     """Parse the complete proposed tree without consulting mutable SQL/disk notes."""
     parser = EntityParser(root)
     permalinks: set[str] = set()
+    passed: dict[tuple[str, str, str], str] = {}
     for path, content in files.items():
+        key = (str(root), path, hashlib.sha256(content.encode("utf-8")).hexdigest())
         try:
-            metadata = parse_frontmatter(content)
-            if any(
-                not isinstance(metadata.get(field), str) or not metadata[field].strip()
-                for field in ("title", "type", "permalink")
-            ):
-                raise ValueError("Canonical title/type/permalink frontmatter is required")
-            permalink = metadata["permalink"]
+            permalink = _VALIDATED.get(key)
+            if permalink is None:
+                metadata = parse_frontmatter(content)
+                if any(
+                    not isinstance(metadata.get(field), str) or not metadata[field].strip()
+                    for field in ("title", "type", "permalink")
+                ):
+                    raise ValueError("Canonical title/type/permalink frontmatter is required")
+                permalink = metadata["permalink"]
             if permalink in permalinks:
                 raise ValueError("Draft notes must have unique permalinks")
             permalinks.add(permalink)
-            await parser.parse_markdown_content(
-                file_path=Path(path), content=content, mtime=0, ctime=0
-            )
+            if key not in _VALIDATED:
+                await parser.parse_markdown_content(
+                    file_path=Path(path), content=content, mtime=0, ctime=0
+                )
+                passed[key] = permalink
         except (ParseError, ValueError) as error:
             raise GitTransactionError(422, f"Invalid draft note {path}: {error}") from error
+    if len(_VALIDATED) + len(passed) > _VALIDATED_LIMIT:
+        _VALIDATED.clear()
+    _VALIDATED.update(passed)
 
 
 def _draft_permalink(text: str) -> str | None:

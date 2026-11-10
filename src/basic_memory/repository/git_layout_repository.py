@@ -1,6 +1,6 @@
 """Guarded identity/path changes and durable old-file retirement permissions."""
 
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from uuid import UUID, uuid4
 
@@ -81,12 +81,14 @@ class GitLayoutRepository:
         *,
         expected: tuple[GitLocalNote, ...],
         target: Mapping[UUID, GitPreparedNote],
+        unchanged: Collection[UUID] = frozenset(),
     ) -> tuple[int, int]:
         """Relocate proven notes atomically in SQL; files/indexes stay asynchronous.
 
         One short layout transaction is needed for the unique path/permalink
         permutation. It adds no row locks and performs no filesystem/Git I/O.
         NoteContent CAS operations precede Entity changes, as in normal writes.
+        `unchanged` notes stay where they are with their bytes; they are kept, not removed.
         """
         if await self.local_notes(session) != expected:
             raise NoteContentVersionConflict("Local content advanced during Git layout projection")
@@ -96,7 +98,11 @@ class GitLayoutRepository:
             if note.external_id in target
             and target[note.external_id].fields.file_path != note.file_path
         ]
-        removed = [note for note in expected if note.external_id not in target]
+        removed = [
+            note
+            for note in expected
+            if note.external_id not in target and note.external_id not in unchanged
+        ]
         for note in (*moved, *removed):
             basis = note.content
             if basis is None:
