@@ -92,6 +92,14 @@ Attempts are a discriminated union:
 | `completed` | Outcome `equal`, `pushed`, `pulled`, `diverged`, `remote_rewritten`, `merged` or `needs_review` (the last two only with `git_sync_merge`). A release that does not know them cannot load a record that holds one: roll back only after the next sync has replaced it. |
 | `failed` | Reason `transport`, `invalid_incoming`, `local_changed` or `interrupted`. |
 
+`invalid_incoming` also covers incoming history that would give a note UUID to two
+projects. A UUID another project still holds only because a cross-project move is
+still travelling is let through, and the projection waits for it (see "Note UUIDs
+across projects" in [BM006_GIT_PUBLICATION.md](BM006_GIT_PUBLICATION.md)); a real
+duplicate is refused. The status of that attempt then carries `failure_detail`, which
+names the UUID and both projects. It is held in memory only (it is gone after a
+restart until the next attempt), so `bm-sync.json` keeps the format older releases read.
+
 Every finished attempt also carries its finish time. Expected transport/validation
 failures return HTTP 200 with `kind=failed`; callers must inspect the attempt. This
 does not mean the peer/index is synchronized. Unconfigured/busy peers return 409,

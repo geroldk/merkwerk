@@ -96,6 +96,80 @@ project/index progress. Proven moves/deletions are reconciled as described below
 Unproven local notes and raw imports lacking canonical BM `title`/`type`/`permalink`
 still require controlled preparation and are refused.
 
+## Note UUIDs across projects (I1)
+
+A note keeps its UUID when it moves to another project on a Git host (decisions I1 A
+and I2 A). The move (W2, built in part B) drafts the note in the target with the old
+UUID, deletes it in the source, then commits the target. Until both projects have
+caught up, on this host or on a peer that syncs the two projects in any order, one UUID
+can stand in two projects' published states. `repository/git_host_identities.py` sorts
+every such UUID with one rule, for the projection and for the sync guard alike:
+
+| Case | The owner (SQL holds the UUID there) | Result |
+| --- | --- | --- |
+| (a) | its published head no longer holds the note: only its SQL lags | wait |
+| (b) | its head still holds it, and the commit that introduced the note into the claiming history carries a move trailer for it | wait: the move is still travelling |
+| (c) | anything else | real duplicate, refused as before |
+
+The proof is the trailer `Basic-Memory-Moved-Note: <note uuid> from <source project uuid>`,
+which the target commit of a move carries. It proves a **move**, nothing else; this
+narrows I2 A ("wait while the source has not caught up") to moves BM itself recorded.
+It is read as a real Git trailer of BM's final trailer block, and only on the commit
+that last introduced the note into the claiming project's current history (first
+parents; a merge that keeps a note its first parent had dropped introduces it itself),
+so an old trailer from an earlier round trip proves nothing. Callers cannot forge it:
+the text `Basic-Memory-` in any case is refused anywhere in a commit message, both by
+the transaction API and by `prepare()`, and BM's own messages quote folder names with
+a non-breaking hyphen. Any well-formed trailer for the note counts, so a chain A -> B -> C
+converges; but when the owner itself took the note by a move from the same source the
+claim names, and no project on this host shows a move chain from the owner to that
+source, two hosts moved one note to two projects (a double move): that is case (c).
+Only manifests and trailers are read (`git cat-file` of the manifest, `git log -S`
+over it); introductions are cached per tip.
+
+**Projection.** With the host's identities, `project_git_content` projects everything
+except the waiting notes: removals and moves of local notes run as usual, which also
+releases the UUIDs this project gives away and breaks crossing moves (P6). It then
+raises `GitProjectionDeferred`, a subclass of `GitProjectionConflict`, so a caller
+without identities (offline tools) refuses as before. The structural graph check
+compares SQL with the projected part only: repeated waiting passes do not reset the
+graph and vector progress of every project. The worker counts a deferral as no
+failure, polls at six poll intervals (at most 60 s, never below one interval) and is
+woken when an owner's content stage completes (also its startup recovery), and once
+after every runtime has started. Host startup tolerates a deferral; a **real
+duplicate at startup still refuses the whole host start**, loudly, naming the UUID and
+the owner (decided: no per-project blocked state).
+
+**Writes.** A project that waits refuses writes with HTTP 409 `kind=deferred`, naming the
+waiting notes, the owners and an owner's own content error (MCP: `UNAVAILABLE`); this is
+not the 503 "Git published; SQL pending". A transaction commit that would publish a
+UUID another project still holds is refused (409), and so is a PUT upsert that would
+create one; a UUID an open cross-project move reserves is refused host-wide except for
+that move (the reservations are filled by the move service).
+
+**Sync.** `require_note_ownership` applies the same rule to a fast-forward tip and to a
+prepared merge: a waiting UUID may be published, a real duplicate stays
+`invalid_incoming`, and the status of that attempt names the UUID and both projects
+(`failure_detail`, held in memory; `bm-sync.json` keeps its format).
+
+Known limits:
+- Writes into a waiting project are refused until the owner releases (one sync of the
+  owner on a peer); transactions there can still commit, though they do no SQL catch-up.
+- The files, graph and vector stages of a waiting project do not run: files of notes it
+  removed stay on disk and search rows of notes it gave away remain until it resumes.
+- A double move on two hosts stays a named `invalid_incoming` with no recovery tool; a
+  person removes one copy.
+- A merge decision "keep" (`behalten`) for a note this host moved away (the peer edited
+  it in the source) would put its UUID back into the source: the sync guard refuses it
+  by name; "delete" converges. There is no re-key tool.
+- A claim through a project the owner itself took the note from earlier (a round trip
+  through a hub) is refused until that hub or the owner has synced; then it converges.
+- A move trailer forged in a peer's history only makes a duplicate wait instead of fail;
+  a UUID owned elsewhere is never inserted.
+- Deployment order: both hosts need this rule before the first such move. An older
+  peer refuses the target's incoming history as `invalid_incoming` until it is
+  upgraded, and recovers then; it does not stop that host.
+
 ## Guarded moves, deletions and old-file cleanup
 
 `repository/git_layout_repository.py` records all local note identities/content in
@@ -345,6 +419,9 @@ does not stop any external process or prove the productive cutover prerequisite.
 `GET /v2/projects/{project_uuid}/git/status` and
 `bm_project(command="status", project="...")` return the source SHA, separate
 stage targets/completions/running attempts, attempts/errors and `caught_up`.
+While notes wait for another project (see "Note UUIDs across projects"), the content
+stage also carries `deferred`: each waiting note with its owner project and that
+owner's own content error, if it has one.
 The response explicitly describes relaxed reads. It neither starts an index nor
 waits for one, and a completed checkpoint does not pin concurrent readers.
 

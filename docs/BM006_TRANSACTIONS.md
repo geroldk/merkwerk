@@ -76,7 +76,10 @@ freezes the draft as `conflicted`, retaining its base/content and observed
 `conflict_commit`. A publication in another project does not change this basis.
 Successful commit publishes one complete tree; an unchanged tree produces a local
 terminal receipt without an empty commit. Commit messages cannot contain the
-reserved transaction trailer, which would otherwise forge terminal evidence.
+text `Basic-Memory-` anywhere and in any case: BM reserves it for its own trailers
+(transaction, merge, moved note), which would otherwise forge evidence. A commit that
+would publish a note UUID another project still holds (its SQL rows or its published
+head) is refused with 409; ordinary drafts get fresh UUIDs and are not affected (I1).
 
 Git success is the canonical outcome. Commit wakes the existing durable worker
 and returns without waiting for SQL content, files, graph/full text or vectors.
