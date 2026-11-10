@@ -92,7 +92,8 @@ bm_edit(identifier="plans/launch-plan.md", command="append", content="x",
 - Where a name is ambiguous (a heading under two parents, one nested in itself,
   a top heading that recurs deeper), write its location from the top heading as
   the refusal offers it: `B > KI/ML`, `> Top` for a top heading, `B > KI/ML[1]`
-  for a repeat at the same location. See bm-read(3).
+  for a repeat at the same location; headings under such repeats are numbered
+  across them (`Day > Q/A > Note[2]`). See bm-read(3).
 - The `section` a JSON read returns names the same heading again, so it can be
   passed to the section commands as it is.
 - `set_metadata` refuses `title` and `permalink`: they are the note's identity.

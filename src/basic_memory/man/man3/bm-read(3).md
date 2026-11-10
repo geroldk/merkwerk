@@ -138,11 +138,15 @@ bm_read(identifier="plans/missing.md", project="demo")
   top heading `Top` itself (the leading "> " tells it from any heading named
   `Top`). The path starts at a heading with no heading above it, whatever its
   level (also a first `## Intro`); "/" is plain text inside it; only a ">" with
-  a space on each side separates, so `a>b` stays one heading; `[n]` at the end
-  counts, in document order, the sections with that same location. It names
-  what other forms leave ambiguous: a heading under two parents, one nested in
-  itself, a top heading that recurs deeper. An old "/" path through a heading
-  whose own text contains " > " keeps its meaning.
+  a space on each side separates, so `a>b` stays one heading; each heading in
+  it is trimmed, while case and inner spaces count, as in every selector. `[n]`
+  at the end counts, in document order, the sections with that same location,
+  so twins are `A > Log[0]` and `A > Log[1]`, and the headings under twins are
+  numbered across them: the `Note` under a second `Q/A` that follows two under
+  the first is `Day > Q/A > Note[2]`. It names what other forms leave
+  ambiguous: a heading under two parents, one nested in itself, a top heading
+  that recurs deeper. An old "/" path through a heading whose own text
+  contains " > " keeps its meaning (`A > B/C`); `> A > B/C` is the location.
 - The `section` of a JSON section read is a selector that reads back to the
   same heading, so bm-edit(3) can take it as it is: usually the heading path
   (`Plan/Decisions`, `Plan/Log[1]`), else a heading's own text (`KI/ML`) or its
