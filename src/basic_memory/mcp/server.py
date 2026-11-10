@@ -18,6 +18,7 @@ from basic_memory.index.note_content_materialization import drain_pending_materi
 from basic_memory.index.git_host import run_git_host
 from basic_memory.db import scoped_session
 from basic_memory.index.local_schedulers import drain_background_tasks
+from basic_memory.mcp.cancelled_calls import CancelledCallMiddleware
 from basic_memory.mcp.client_info import MCPClientInfoMiddleware
 from basic_memory.mcp.container import McpContainer, installed_container as installed_mcp_container
 from basic_memory.mcp.empty_results import EmptyListResultMiddleware
@@ -272,6 +273,8 @@ mcp = FastMCP(
     instructions=BASIC_MEMORY_INSTRUCTIONS,
     lifespan=lifespan,
 )
+# Outermost, so a cancelled call is logged with whatever the other middleware did.
+mcp.add_middleware(CancelledCallMiddleware())
 mcp.add_middleware(MCPClientInfoMiddleware())
 mcp.add_middleware(EmptyListResultMiddleware())
 mcp.add_middleware(MissingProjectMiddleware())
