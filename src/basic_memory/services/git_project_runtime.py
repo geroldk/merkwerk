@@ -10,7 +10,8 @@ import subprocess
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timedelta
+from functools import partial
 from typing import assert_never
 from uuid import UUID, uuid4
 
@@ -42,6 +43,7 @@ from basic_memory.repository.git_progress_repository import (
     GitProgressRepository,
     invalidate_git_graphs,
 )
+from basic_memory.repository.git_move_intent_repository import GitMoveIntentRepository
 from basic_memory.repository.git_project_repository import (
     GitPublication,
     GitPublicationConflict,
@@ -80,6 +82,11 @@ from basic_memory.services.git_transactions import GitTransactionService, valida
 from basic_memory.services.note_times import stamp_markdown_times, wanted_note_times
 from basic_memory.schemas.git_sync import GitSyncRemote
 from basic_memory.services.git_sync import GitSyncService
+
+
+# An unpublished candidate ref without a record is swept only once it is this old: a
+# process outside the transaction lock may still be about to publish a younger one.
+CANDIDATE_SWEEP_AGE = timedelta(hours=1)
 
 
 class GitProjectRuntime:
@@ -126,6 +133,7 @@ class GitProjectRuntime:
             self._running = True
             try:
                 await self.transactions.maintain()
+                await self._sweep_candidates()
                 await self.sync.recover()
                 yield self
             finally:
@@ -559,6 +567,45 @@ class GitProjectRuntime:
             files[move.file_path] = text if wanted is None else stamp_markdown_times(text, wanted)
             note_ids[move.file_path] = move.external_id
         return files, note_ids
+
+    async def _sweep_candidates(self) -> None:
+        """At start, drop the candidate refs that nothing refers to any more.
+
+        Before B4 every accept() left its candidate ref behind, one per write, and a
+        crash still can. Nothing of this process can hold one yet: requests are not
+        admitted before run() yields. A ref named by a transaction record or by an open
+        move intent stays; the transaction lock keeps out offline transaction tools.
+        """
+        intents, problems = await asyncio.to_thread(
+            GitMoveIntentRepository(
+                self.pipeline.repository, UUID(self.pipeline.project_external_id)
+            ).load_each
+        )
+        repository = self.pipeline.repository.path.name
+        # Trigger: an intent file cannot be read, so the draft it names is unknown.
+        # Why: dropping that draft's ref could lose the bytes of an unfinished move.
+        # Outcome: nothing is swept this time; the start goes on.
+        if problems:
+            logger.warning(
+                "Git candidate sweep skipped in {}: {} unreadable move intent file(s)",
+                repository,
+                len(problems),
+            )
+            return
+        try:
+            removed = await self.transactions.call(
+                partial(
+                    self.transactions.repository.sweep_candidates,
+                    kept=frozenset(intent.transaction_id for intent in intents),
+                    older_than=CANDIDATE_SWEEP_AGE,
+                )
+            )
+        except GitTransactionError as error:
+            # A leftover ref is residue, never a reason to refuse the start.
+            logger.warning("Git candidate sweep failed in {}: {}", repository, error)
+            return
+        if removed:
+            logger.info("Git candidate sweep removed {} unused ref(s) in {}", removed, repository)
 
     async def _drop_candidate(self, transaction_id: UUID) -> None:
         """Remove the private candidate ref prepare() leaves, published or not."""

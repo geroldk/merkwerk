@@ -105,6 +105,18 @@ class GitPublication:
     already_committed: bool
 
 
+@dataclass(frozen=True, slots=True)
+class GitCandidateRef:
+    """One private candidate ref (`refs/bm/candidates/<transaction>/<commit>`)."""
+
+    reference: str
+    transaction_id: UUID
+    commit_id: str
+    # Published history already holds the commit: dropping the ref loses nothing.
+    published: bool
+    committed_at: datetime
+
+
 def _require_commit_id(commit_id: str) -> None:
     if _COMMIT_ID.fullmatch(commit_id) is None:
         raise ValueError("Expected a full SHA-1 Git commit ID")
@@ -565,6 +577,34 @@ class GitProjectRepository:
             UUID(reference.split("/")[3]) for reference in refs.decode("ascii").splitlines()
         )
 
+    def candidate_refs(self) -> list[GitCandidateRef]:
+        """Every private candidate ref, in two Git calls: published commits, then the rest."""
+        found: list[GitCandidateRef] = []
+        for published, reachable in ((True, "--merged"), (False, "--no-merged")):
+            refs = self._git(
+                "for-each-ref",
+                "--format=%(refname) %(objectname) %(committerdate:raw)",
+                f"{reachable}={PUBLISHED_REF}",
+                "refs/bm/candidates/",
+            )
+            for line in refs.decode("ascii").splitlines():
+                reference, commit_id, timestamp, _zone = line.split()
+                found.append(
+                    GitCandidateRef(
+                        reference,
+                        UUID(reference.split("/")[3]),
+                        commit_id,
+                        published,
+                        datetime.fromtimestamp(int(timestamp), tz=UTC),
+                    )
+                )
+        return found
+
+    def remove_candidate_refs(self, refs: Iterable[GitCandidateRef]) -> None:
+        """Delete candidate refs in one Git transaction: all of them, or none if one moved."""
+        commands = "".join(f"delete {ref.reference} {ref.commit_id}\n" for ref in refs)
+        if commands:
+            self._git("update-ref", "--stdin", input_bytes=commands.encode("ascii"))
 
     def _read_snapshot(self, commit_id: str) -> GitSnapshot:
         tree = self._git("ls-tree", "-r", "-z", "--full-tree", commit_id)
