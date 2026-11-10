@@ -343,7 +343,6 @@ async def _remove_copy(
 _KEPT_ID_CODES: dict[str, RefusalCode] = {
     "not_found": "NOT_FOUND",
     "locked": "LOCKED",
-    "unsupported": "UNSUPPORTED",
     "invalid_path": "INVALID_ARGUMENTS",
     "invalid_draft": "INVALID_ARGUMENTS",
     "same_project": "INVALID_ARGUMENTS",

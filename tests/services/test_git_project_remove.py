@@ -97,3 +97,21 @@ def test_drafts_and_transaction_pointers_count_as_work(tmp_path):
     (other.path / "bm-transactions" / f"{uuid4()}.json").write_text("{}")
     with pytest.raises(GitProjectCreateError, match="1 transaction pointer"):
         _require_unused_repository("ake", other.path)
+
+
+def test_open_moves_that_cannot_be_read_refuse_the_removal(tmp_path):
+    """I1: an unreadable intent might name the project; nothing is removed then."""
+    from uuid import uuid4
+
+    from basic_memory.config import BasicMemoryConfig
+    from basic_memory.repository.git_project_repository import GitProjectRepository
+    from basic_memory.services.git_project_create import GitProjectCreateError
+    from basic_memory.services.git_project_remove import _require_no_open_moves
+
+    project = uuid4()
+    repository = GitProjectRepository.create(tmp_path / "p.git", project_external_id=project)
+    (repository.path / "bm-moves").mkdir(mode=0o700)
+    (repository.path / "bm-moves" / "kaputt.json").write_text("{}")
+    config = BasicMemoryConfig.model_construct(git_repositories={project: repository.path})
+    with pytest.raises(GitProjectCreateError, match="cannot be read"):
+        _require_no_open_moves(config, {project: "p"})

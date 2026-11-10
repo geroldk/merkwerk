@@ -122,3 +122,12 @@ def test_the_intent_schema_is_strict_and_the_view_keeps_the_secrets(store):
     view = GitMoveIntentView.of(saved).model_dump()
     assert "target_content" not in view and "transaction_key" not in view
     assert view["transaction_id"] == saved.transaction_id
+
+
+def test_an_intent_file_named_in_another_spelling_is_refused(store):
+    saved = intent(store)
+    store.save(saved)
+    path = store.path / f"{saved.move_id}.json"
+    path.rename(store.path / f"{str(saved.move_id).upper()}.json")
+    with pytest.raises(GitMoveIntentError, match="Unknown file"):
+        store.move_ids()

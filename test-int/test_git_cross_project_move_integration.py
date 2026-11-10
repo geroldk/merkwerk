@@ -469,3 +469,123 @@ async def test_a_move_that_cannot_commit_yet_is_reported_and_resumes(
     assert [move["move_id"] for move in listed] == [error["details"]["move_id"]]
     assert [outcome["outcome"] for outcome in resumed] == ["completed"]
     assert second_repo.snapshot().manifest.note_ids == {"archive/Haengt.md": note}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("output_format", ["json", "text"])
+async def test_a_folder_lists_what_moved_what_stayed_and_what_is_still_open(
+    host_setup, second_repository, monkeypatch, output_format
+):
+    from fastmcp.exceptions import ToolError
+
+    from basic_memory.mcp.clients.git_moves import GitMoveClient
+    from basic_memory.mcp.server import mcp
+    from basic_memory.services.git_transactions import GitNoteStillOwned, GitTransactionService
+    import basic_memory.mcp.tools  # noqa: F401
+
+    second, second_repo = second_repository
+    first_repo = host_setup.repository
+    commit = GitTransactionService.commit_admitted
+    async with Client(mcp) as client:
+        for title in ("Drei", "Eins", "Zwei"):
+            await written_note(client, title, directory="ordner")
+        twin = await client.call_tool(
+            "bm_write",
+            {"project": "second", "title": "zwei", "directory": "da", "content": "x\n"},
+        )
+        assert not twin.is_error
+        await caught_up(host_setup.project.external_id, second.external_id)
+        ids = first_repo.snapshot().manifest.note_ids
+        held = ids["ordner/Drei.md"]
+
+        async def holding_drei(self, *arguments, **options):
+            if held in (options.get("moved_notes") or {}):
+                raise GitNoteStillOwned(409, "Note UUID is still owned by project 'test-project'")
+            return await commit(self, *arguments, **options)
+
+        async def index_busy(self):
+            raise ToolError("index busy")
+
+        monkeypatch.setattr(GitTransactionService, "commit_admitted", holding_drei)
+        monkeypatch.setattr(GitMoveClient, "catch_up", index_busy)
+        moved = await client.call_tool(
+            "bm_move",
+            {
+                "path": "ordner",
+                "destination": "ziel",
+                "project": "test-project",
+                "destination_project": "second",
+                "output_format": output_format,
+            },
+            raise_on_error=False,
+        )
+    assert moved.is_error
+    text = moved.content[0].text  # type: ignore[union-attr]
+    if output_format == "json":
+        details = json.loads(text)["details"]
+        assert [entry["external_id"] for entry in details["moved_notes"]] == [
+            str(ids["ordner/Eins.md"])
+        ]
+        assert details["moved_notes"][0]["previous_external_id"] == str(ids["ordner/Eins.md"])
+        failed = {entry["path"]: entry["error"] for entry in details["failed"]}
+        assert failed["ordner/Drei.md"].startswith("pending (move_id ")
+        assert "ALREADY_EXISTS" in failed["ordner/Zwei.md"]
+        assert [entry["external_id"] for entry in details["pending"]] == [str(held)]
+    else:
+        assert f"id {ids['ordner/Eins.md']} kept" in text
+        assert "pending (move_id " in text
+    assert second_repo.snapshot().manifest.note_ids["ziel/Eins.md"] == ids["ordner/Eins.md"]
+
+
+@pytest.mark.asyncio
+async def test_a_folder_in_json_lists_every_kept_id_and_says_when_the_index_lags(
+    host_setup, second_repository, monkeypatch
+):
+    from basic_memory.mcp.clients.git_moves import GitMoveClient
+    from basic_memory.mcp.server import mcp
+    import basic_memory.mcp.tools  # noqa: F401
+
+    second, second_repo = second_repository
+    first_repo = host_setup.repository
+    catch_up = GitMoveClient.catch_up
+
+    async def lagging(self):
+        caught = await catch_up(self)
+        return caught.model_copy(update={"index_pending": True, "message": "waits for 'x'"})
+
+    monkeypatch.setattr(GitMoveClient, "catch_up", lagging)
+    async with Client(mcp) as client:
+        for title in ("Alpha", "Beta"):
+            await written_note(client, title, directory="ordner")
+        await caught_up(host_setup.project.external_id)
+        source = first_repo.snapshot().manifest.note_ids
+        as_json = await client.call_tool(
+            "bm_move",
+            {
+                "path": "ordner",
+                "destination": "ziel",
+                "project": "test-project",
+                "destination_project": "second",
+                "output_format": "json",
+            },
+        )
+        as_text = await client.call_tool(
+            "bm_move",
+            {
+                "path": "ziel",
+                "destination": "zurueck",
+                "project": "second",
+                "destination_project": "test-project",
+            },
+        )
+    result = as_json.data
+    assert result["pending"] == [] and result["failed"] == []
+    assert {entry["external_id"] for entry in result["moved_notes"]} == {
+        str(note) for note in source.values()
+    }
+    assert all(e["external_id"] == e["previous_external_id"] for e in result["moved_notes"])
+    assert "still catching up (waits for 'x')" in as_text.content[0].text  # type: ignore[union-attr]
+    assert first_repo.snapshot().manifest.note_ids == {
+        path.replace("ordner/", "zurueck/", 1): note for path, note in source.items()
+    }
+    assert second_repo.snapshot().files == {}

@@ -655,7 +655,9 @@ async def test_an_intent_whose_source_left_the_host_stays_stuck_and_goes_to_the_
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("answer", ["fails", "published_sql_pending", "says_nothing"])
+@pytest.mark.parametrize(
+    "answer", ["fails", "published_sql_pending", "published_catch_up_fails", "says_nothing"]
+)
 async def test_the_source_delete_is_judged_from_its_history_not_its_answer(
     host_setup, two_projects, monkeypatch, answer
 ):
@@ -667,6 +669,9 @@ async def test_the_source_delete_is_judged_from_its_history_not_its_answer(
 
     a, a_repo, b, b_repo = two_projects
     delete = NoteContentMutationService.delete_note
+
+    async def failing_catch_up(self):
+        raise RuntimeError("SQL is busy")
 
     async def answered(self, **arguments):
         if answer == "fails":
@@ -684,8 +689,13 @@ async def test_the_source_delete_is_judged_from_its_history_not_its_answer(
             await ready(client, a)
             await ready(client, b)
             monkeypatch.setattr(NoteContentMutationService, "delete_note", answered)
+            if answer == "published_catch_up_fails":
+                from basic_memory.services.git_project_runtime import GitProjectRuntime
+
+                # The delete's own SQL commit already let go; a failed catch-up is harmless.
+                monkeypatch.setattr(GitProjectRuntime, "catch_up", failing_catch_up)
             moved = await move(client, a, note, b, "archive/Mover.md")
-    if answer == "published_sql_pending":
+    if answer.startswith("published"):
         # The delete published: the move goes on and completes.
         assert moved.status_code == 200 and moved.json()["state"] == "completed", moved.text
         assert UUID(note) in b_repo.published_note_ids()
@@ -696,3 +706,399 @@ async def test_the_source_delete_is_judged_from_its_history_not_its_answer(
         assert UUID(note) in a_repo.published_note_ids()
         assert open_drafts(b_repo, b) == []
     assert intents(b_repo, b) == []
+
+
+# --- Edges: every refusal before the delete, every outcome after it ---
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case",
+    [
+        "unknown_target",
+        "target_not_accepting",
+        "draft_refused",
+        "on_disk",
+        "unnormalized",
+        "refused_plainly",
+        "source_unsettled",
+    ],
+)
+async def test_more_refusals_move_nothing(host_setup, two_projects, monkeypatch, case):
+    from basic_memory.api.app import app
+    from basic_memory.index.git_projection_worker import GitProjectionWorker
+    from basic_memory.repository.git_projection_repository import GitProjectionConflict
+    from basic_memory.repository.git_transaction_repository import GitTransactionError
+    from basic_memory.services.git_project_runtime import GitProjectRuntime
+    from basic_memory.services.git_transactions import GitTransactionService
+    from basic_memory.services.note_content_writes import (
+        NoteContentMutationService,
+        NoteContentMutationServiceError,
+    )
+
+    a, a_repo, b, b_repo = two_projects
+    if case == "source_unsettled":
+
+        async def paused(self, *, vectors):
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(GitProjectionWorker, "_loop", paused)
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=ASGITransport(app), base_url="http://test") as client:
+            note = (await write(client, a, "Mover"))["external_id"]
+            if case != "source_unsettled":
+                await ready(client, a)
+                await ready(client, b)
+            target, path = b, "archive/Mover.md"
+            if case == "unknown_target":
+                target = str(uuid4())
+            if case == "target_not_accepting":
+
+                async def refusing(self, **_):
+                    raise GitProjectionConflict("Target projection failed")
+
+                monkeypatch.setattr(GitProjectRuntime, "catch_up_admitted", refusing)
+            if case == "draft_refused":
+
+                async def invalid(self, *arguments, **options):
+                    raise GitTransactionError(422, "Invalid draft note archive/Mover.md")
+
+                monkeypatch.setattr(GitTransactionService, "write_identified_admitted", invalid)
+            if case == "on_disk":
+                root = b_repo.path.parent / "second"
+                (root / "archive").mkdir(parents=True)
+                (root / "archive" / "Mover.md").write_text("A file nobody published\n")
+            if case == "unnormalized":
+                path = "frage?/Mover.md"  # a folder name keeps no "?": stored elsewhere
+            if case == "refused_plainly":
+
+                async def plain(self, **arguments):
+                    raise NoteContentMutationServiceError(403, "You cannot change this project")
+
+                monkeypatch.setattr(NoteContentMutationService, "delete_note", plain)
+            if case == "source_unsettled":
+                # Git is ahead of SQL (the worker is held back): the draft would not hold
+                # the bytes the delete removes.
+                snapshot = a_repo.snapshot()
+                (path_a,) = snapshot.files
+                publish_into(a_repo, add={path_a: (snapshot.files[path_a] + "\nNeu\n", UUID(note))})
+            before = a_repo.head(), b_repo.head()
+            answer = await move(client, a, note, target, path)
+            assert reservations() == {}
+    expected = {
+        "unknown_target": (404, "not_found"),
+        "target_not_accepting": (409, "not_accepting"),
+        "draft_refused": (422, "invalid_draft"),
+        "on_disk": (409, "occupied"),
+        "unnormalized": (422, "invalid_path"),
+        "refused_plainly": (403, "refused_by_source"),
+        "source_unsettled": (409, "not_accepting"),
+    }[case]
+    assert (answer.status_code, answer.json()["detail"]["kind"]) == expected, answer.text
+    assert "Nothing was moved" in answer.json()["detail"]["message"]
+    assert (a_repo.head(), b_repo.head()) == before
+    assert intents(b_repo, b) == [] and open_drafts(b_repo, b) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "after", ["answer_lost", "draft_refused", "keeps_changing", "catch_up_fails", "crashes"]
+)
+async def test_every_outcome_after_the_source_let_go(host_setup, two_projects, monkeypatch, after):
+    from basic_memory.api.app import app
+    from basic_memory.repository.git_transaction_repository import GitTransactionError
+    from basic_memory.services import git_cross_project_move
+    from basic_memory.services.git_project_runtime import GitProjectRuntime
+    from basic_memory.services.git_transactions import GitTransactionService
+
+    a, a_repo, b, b_repo = two_projects
+    commit = GitTransactionService.commit_admitted
+    catch_up = GitProjectRuntime.catch_up_admitted
+    draft_status, commit_step = git_cross_project_move._draft_status, git_cross_project_move._commit
+    calls = {"catch_up": 0}
+
+    async def lost(self, *arguments, **options):
+        await commit(self, *arguments, **options)
+        raise GitTransactionError(503, "Transaction operation interrupted")
+
+    async def refused(self, *arguments, **options):
+        raise GitTransactionError(422, "Invalid draft note")
+
+    async def conflicted(self, *arguments, **options):
+        raise GitTransactionError(409, "Project advanced; draft preserved")
+
+    async def failing_after_commit(self, **options):
+        calls["catch_up"] += 1
+        if options.get("known_ancestor") is not None:
+            raise RuntimeError("SQL is busy")
+        return await catch_up(self, **options)
+
+    async def crashing(*arguments, **options):
+        raise RuntimeError("Unexpected failure")
+
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=ASGITransport(app), base_url="http://test") as client:
+            note = (await write(client, a, "Mover"))["external_id"]
+            await ready(client, a)
+            await ready(client, b)
+            match after:
+                case "answer_lost":
+                    monkeypatch.setattr(GitTransactionService, "commit_admitted", lost)
+                case "draft_refused":
+                    monkeypatch.setattr(GitTransactionService, "commit_admitted", refused)
+                case "keeps_changing":
+                    monkeypatch.setattr(GitTransactionService, "commit_admitted", conflicted)
+
+                    async def always_conflicted(target, intent):
+                        status = await target.transactions.status_admitted(
+                            intent.transaction_id, intent.transaction_key
+                        )
+                        return status.model_copy(update={"state": "conflicted"})
+
+                    monkeypatch.setattr(git_cross_project_move, "_draft_status", always_conflicted)
+                case "catch_up_fails":
+                    monkeypatch.setattr(
+                        GitProjectRuntime, "catch_up_admitted", failing_after_commit
+                    )
+                case "crashes":
+                    monkeypatch.setattr(git_cross_project_move, "_commit", crashing)
+            answer = await move(client, a, note, b, "archive/Mover.md")
+            # Only this test's own patches go; the fixtures keep theirs.
+            monkeypatch.setattr(GitTransactionService, "commit_admitted", commit)
+            monkeypatch.setattr(GitProjectRuntime, "catch_up_admitted", catch_up)
+            monkeypatch.setattr(git_cross_project_move, "_draft_status", draft_status)
+            monkeypatch.setattr(git_cross_project_move, "_commit", commit_step)
+            listed = (await client.get("/v2/git/moves")).json()["moves"]
+            resumed = (await client.post("/v2/git/moves/resume")).json()["outcomes"]
+    assert answer.status_code == 200, answer.text
+    state = answer.json()["state"]
+    assert UUID(note) not in a_repo.published_note_ids()
+    if after in {"answer_lost", "catch_up_fails"}:
+        assert state == "completed" and listed == [] and resumed == []
+        assert answer.json()["index_pending"] is (after == "catch_up_fails")
+    else:
+        # The source let go; the move stays open and resume finishes it.
+        assert state == "pending", answer.text
+        assert [move["move_id"] for move in listed] == [answer.json()["move_id"]]
+        assert [outcome["outcome"] for outcome in resumed] == ["completed"]
+    assert b_repo.snapshot().manifest.note_ids == {"archive/Mover.md": UUID(note)}
+
+
+@pytest.mark.asyncio
+async def test_a_stuck_move_cannot_go_to_a_taken_path_and_its_uuid_cannot_be_moved_again(
+    host_setup, two_projects, tmp_path
+):
+    from basic_memory.api.app import app
+
+    a, a_repo, b, b_repo = two_projects
+    note = await seeded(app, a, b)
+    await crash(tmp_path, "after_delete_before_commit", a, a_repo, b, b_repo, note, "m/Mover.md")
+    publish_into(b_repo, add={"m/Mover.md": (canonical("Besetzt", "m/Mover.md"), uuid4())})
+    publish_into(a_repo, add={"notes/Mover.md": (canonical("Mover", "notes/mover.md"), UUID(note))})
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=ASGITransport(app), base_url="http://test") as client:
+            await ready(client, a)
+            (stuck,) = (await client.get("/v2/git/moves")).json()["moves"]
+            again = await move(client, a, note, b, "anders/Mover.md")
+    assert again.status_code == 409 and again.json()["detail"]["kind"] == "reserved"
+    assert stuck["move_id"] in again.json()["detail"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_resolving_into_a_taken_path_is_refused_and_keeps_the_move(
+    host_setup, two_projects, tmp_path
+):
+    from basic_memory.api.app import app
+
+    a, a_repo, b, b_repo = two_projects
+    note = await seeded(app, a, b)
+    await crash(tmp_path, "after_delete_before_commit", a, a_repo, b, b_repo, note, "m/Mover.md")
+    publish_into(b_repo, add={"m/Mover.md": (canonical("Besetzt", "m/Mover.md"), uuid4())})
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=ASGITransport(app), base_url="http://test") as client:
+            (stuck,) = (await client.get("/v2/git/moves")).json()["moves"]
+            taken = await client.post(
+                f"/v2/git/moves/{stuck['move_id']}/resolve", json={"choice": "target"}
+            )
+            (still,) = (await client.get("/v2/git/moves")).json()["moves"]
+    assert taken.status_code == 409 and taken.json()["detail"]["kind"] == "occupied"
+    assert still["move_id"] == stuck["move_id"] and still["state"] == "stuck"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("choice", ["target", "source"])
+async def test_resolving_a_move_that_already_published_finishes_or_refuses(
+    host_setup, two_projects, tmp_path, monkeypatch, choice
+):
+    from basic_memory.api.app import app
+    from basic_memory.index import git_host
+
+    a, a_repo, b, b_repo = two_projects
+    note = await seeded(app, a, b)
+    await crash(
+        tmp_path, "after_target_publish_before_record", a, a_repo, b, b_repo, note, "m/Mover.md"
+    )
+
+    async def no_resume(host):
+        return []
+
+    # The start-up resume would finish it first; here a person comes first.
+    monkeypatch.setattr(git_host, "resume_cross_project_moves", no_resume)
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=ASGITransport(app), base_url="http://test") as client:
+            (open_move,) = (await client.get("/v2/git/moves")).json()["moves"]
+            resolved = await client.post(
+                f"/v2/git/moves/{open_move['move_id']}/resolve", json={"choice": choice}
+            )
+    if choice == "target":
+        assert resolved.status_code == 200 and resolved.json()["state"] == "completed"
+        assert intents(b_repo, b) == []
+    else:
+        assert resolved.status_code == 409 and resolved.json()["detail"]["kind"] == "completed"
+    assert b_repo.snapshot().manifest.note_ids == {"m/Mover.md": UUID(note)}
+
+
+@pytest.mark.asyncio
+async def test_a_lost_draft_record_is_rebuilt_and_an_unreadable_intent_is_listed(
+    host_setup, two_projects, tmp_path
+):
+    from basic_memory.api.app import app
+
+    a, a_repo, b, b_repo = two_projects
+    note = await seeded(app, a, b)
+    await crash(tmp_path, "after_delete_before_commit", a, a_repo, b, b_repo, note, "m/Mover.md")
+    (planned,) = intents(b_repo, b)
+    # The draft's pointer is gone (a damaged copy); the intent still holds the bytes.
+    (b_repo.path / "bm-transactions" / f"{planned.transaction_id}.json").unlink()
+    # And a file nobody can read sits next to the intents of the other project.
+    stray = a_repo.path / "bm-moves"
+    stray.mkdir(mode=0o700)
+    (stray / "kaputt.json").write_text("{}")
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=ASGITransport(app), base_url="http://test") as client:
+            await ready(client, b)
+            listing = (await client.get("/v2/git/moves")).json()
+            read = await client.get(f"/v2/projects/{b}/knowledge/entities/{note}")
+    assert read.status_code == 200, read.text
+    assert listing["moves"] == []
+    assert len(listing["unreadable"]) == 1 and "kaputt.json" in listing["unreadable"][0]
+
+
+@pytest.mark.asyncio
+async def test_a_base_outside_the_source_history_keeps_the_move_stuck(
+    host_setup, two_projects, tmp_path
+):
+    from basic_memory.api.app import app
+
+    a, a_repo, b, b_repo = two_projects
+    note = await seeded(app, a, b)
+    await crash(tmp_path, "after_delete_before_commit", a, a_repo, b, b_repo, note, "m/Mover.md")
+    (planned,) = intents(b_repo, b)
+    elsewhere = (
+        a_repo._git("commit-tree", f"{a_repo.head()}^{{tree}}", input_bytes=b"Elsewhere\n")
+        .strip()
+        .decode()
+    )
+    GitMoveIntentRepository(b_repo, UUID(b)).save(
+        planned.model_copy(update={"state": "drafted", "source_base_commit": elsewhere})
+    )
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=ASGITransport(app), base_url="http://test") as client:
+            (stuck,) = (await client.get("/v2/git/moves")).json()["moves"]
+    assert stuck["state"] == "stuck" and "history" in stuck["stuck_reason"]
+    assert UUID(note) not in b_repo.published_note_ids()
+
+
+@pytest.mark.asyncio
+async def test_a_catch_up_of_a_failing_project_is_refused_by_name(
+    host_setup, two_projects, monkeypatch
+):
+    from basic_memory.api.app import app
+    from basic_memory.repository.git_projection_repository import GitProjectionConflict
+    from basic_memory.services.git_project_runtime import GitProjectRuntime
+
+    _, _, b, _ = two_projects
+
+    async def failing(self):
+        raise GitProjectionConflict("Projection requires canonical BM frontmatter")
+
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=ASGITransport(app), base_url="http://test") as client:
+            fine = await client.post(f"/v2/projects/{b}/git/moves/catch-up")
+            monkeypatch.setattr(GitProjectRuntime, "catch_up", failing)
+            refused = await client.post(f"/v2/projects/{b}/git/moves/catch-up")
+    assert fine.status_code == 200 and fine.json()["index_pending"] is False
+    assert refused.status_code == 409 and refused.json()["detail"]["kind"] == "not_accepting"
+
+
+@pytest.mark.asyncio
+async def test_a_note_the_target_already_waits_for_is_refused_as_already_there(
+    host_setup, two_projects
+):
+    from basic_memory.api.app import app
+
+    a, a_repo, b, b_repo = two_projects
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=ASGITransport(app), base_url="http://test") as client:
+            note = (await write(client, a, "Mover"))["external_id"]
+            await ready(client, a)
+            # A peer already published the move's target commit; the source has not let go.
+            publish_into(
+                b_repo,
+                add={"moved/mover.md": (canonical("Mover", "moved/mover.md"), UUID(note))},
+                moved={UUID(note): UUID(a)},
+            )
+            answer = await move(client, a, note, b, "anders/Mover.md")
+    assert answer.status_code == 409 and answer.json()["detail"]["kind"] == "already_in_target"
+    assert UUID(note) in a_repo.published_note_ids()
+
+
+@pytest.mark.asyncio
+async def test_an_intent_that_cannot_be_saved_leaves_the_source_untouched(
+    host_setup, two_projects, monkeypatch
+):
+    from basic_memory.api.app import app
+
+    a, a_repo, b, b_repo = two_projects
+
+    def full_disk(self, intent):
+        raise OSError(28, "No space left on device")
+
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=ASGITransport(app), base_url="http://test") as client:
+            note = (await write(client, a, "Mover"))["external_id"]
+            await ready(client, a)
+            await ready(client, b)
+            save = GitMoveIntentRepository.save
+            monkeypatch.setattr(GitMoveIntentRepository, "save", full_disk)
+            with pytest.raises(OSError, match="No space"):
+                await move(client, a, note, b, "archive/Mover.md")
+            monkeypatch.setattr(GitMoveIntentRepository, "save", save)
+            assert reservations() == {}
+    assert UUID(note) in a_repo.published_note_ids()
+    assert open_drafts(b_repo, b) == [] and intents(b_repo, b) == []
+
+
+@pytest.mark.asyncio
+async def test_a_rebuilt_draft_the_target_refuses_makes_the_move_stuck(
+    host_setup, two_projects, tmp_path, monkeypatch
+):
+    from basic_memory.api.app import app
+    from basic_memory.repository.git_transaction_repository import GitTransactionError
+    from basic_memory.services.git_transactions import GitTransactionService
+
+    a, a_repo, b, b_repo = two_projects
+    note = await seeded(app, a, b)
+    await crash(tmp_path, "after_delete_before_commit", a, a_repo, b, b_repo, note, "m/Mover.md")
+    # The target advanced while the host was down, so the old draft must be rebuilt.
+    publish_into(b_repo, add={"other.md": (canonical("Andere", "other.md"), uuid4())})
+
+    async def refusing(self, *arguments, **options):
+        raise GitTransactionError(422, "Invalid draft note m/Mover.md")
+
+    monkeypatch.setattr(GitTransactionService, "write_identified_admitted", refusing)
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=ASGITransport(app), base_url="http://test") as client:
+            (stuck,) = (await client.get("/v2/git/moves")).json()["moves"]
+    assert stuck["state"] == "stuck" and "Invalid draft" in stuck["stuck_reason"]
+    assert UUID(note) not in b_repo.published_note_ids()

@@ -51,7 +51,6 @@ from basic_memory.repository.git_move_intent_repository import (
 from basic_memory.repository.git_project_repository import GitSnapshot, quote_in_message
 from basic_memory.repository.git_projection_repository import GitProjectionConflict
 from basic_memory.repository.git_transaction_repository import GitTransactionError
-from basic_memory.runtime.storage import runtime_file_path_is_markdown_note
 from basic_memory.schemas.base import Entity as EntitySchema
 from basic_memory.schemas.git_moves import (
     GitCrossProjectMoveRequest,
@@ -384,7 +383,11 @@ async def _publish(
 async def _source_note(
     source: GitProjectRuntime, request: GitCrossProjectMoveRequest
 ) -> _SourceNote:
-    """The note as SQL and the source head both hold it; refuse anything else."""
+    """The note as SQL and the source head both hold it; refuse anything else.
+
+    A Git project's notes are Markdown by its manifest's path rule, so no other file
+    kind can be addressed here.
+    """
     async with source.pipeline.session_maker() as session:
         entity = await session.scalar(
             select(Entity).where(
@@ -398,10 +401,6 @@ async def _source_note(
             404,
             "not_found",
             f"Note {request.external_id} is not in project '{_project_name(source)}'. {UNCHANGED}",
-        )
-    if not runtime_file_path_is_markdown_note(entity.file_path):
-        raise GitMoveRefused(
-            415, "unsupported", f"'{entity.file_path}' is not a Markdown note. {UNCHANGED}"
         )
     if request.expected_checksum is not None and content.db_checksum != request.expected_checksum:
         raise GitMoveRefused(

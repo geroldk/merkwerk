@@ -59,7 +59,6 @@ async def move_answered(
     [
         (404, "not_found", "NOT_FOUND"),
         (423, "locked", "LOCKED"),
-        (415, "unsupported", "UNSUPPORTED"),
         (422, "invalid_path", "INVALID_ARGUMENTS"),
         (409, "occupied", "ALREADY_EXISTS"),
         (409, "already_in_target", "ALREADY_EXISTS"),
