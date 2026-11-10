@@ -296,17 +296,17 @@ class GitProjectRuntime:
                 self.worker.notify()
 
     async def _require_new_note_ids(self, session: AsyncSession, note_ids: set[UUID]) -> None:
-        identities = self.pipeline.identities
-        if identities is None:
-            return
-        try:
-            await identities.require_unowned(
-                session, project_id=self.pipeline.project_id, note_ids=note_ids
-            )
-        except GitNoteOwnedElsewhere as error:
-            raise NoteContentIdentityTaken(
-                {"message": f"{error}. Nothing was changed.", "kind": "owned_elsewhere"}
-            ) from error
+        """A caller-chosen UUID must be free host-wide; without the host view, SQL's own
+        unique index is the only check (an offline or test runtime)."""
+        if (identities := self.pipeline.identities) is not None:
+            try:
+                await identities.require_unowned(
+                    session, project_id=self.pipeline.project_id, note_ids=note_ids
+                )
+            except GitNoteOwnedElsewhere as error:
+                raise NoteContentIdentityTaken(
+                    {"message": f"{error}. Nothing was changed.", "kind": "owned_elsewhere"}
+                ) from error
 
     # --- Folder moves (V1) ---
 

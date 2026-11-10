@@ -188,3 +188,77 @@ def test_server_receive_policy_still_rejects_a_push(tmp_path):
     with pytest.raises(GitPublicationError):
         local.push_published(str(peer.path), head)
     assert peer.head() == initial
+
+
+@pytest.mark.asyncio
+async def test_note_ownership_refuses_only_real_duplicates(test_project, session_maker, tmp_path):
+    """Without the host view any foreign UUID is refused; with it, a proven move passes (I1)."""
+    from uuid import UUID
+
+    from basic_memory.models import Entity, Project
+    from basic_memory.repository.git_host_identities import GitHostIdentities, GitHostProject
+
+    moved, twin = uuid4(), uuid4()
+    async with session_maker() as session, session.begin():
+        target = Project(name="target", path=str(tmp_path / "target"), is_active=True)
+        session.add(target)
+        await session.flush()
+        target_id, target_uuid = target.id, UUID(target.external_id)
+        for note in (moved, twin):
+            session.add(
+                Entity(
+                    project_id=test_project.id,
+                    external_id=str(note),
+                    title=str(note),
+                    note_type="note",
+                    content_type="text/markdown",
+                    file_path=f"{note}.md",
+                )
+            )
+    source_uuid = UUID(test_project.external_id)
+    source = GitProjectRepository.create(tmp_path / "source.git", project_external_id=source_uuid)
+    source.publish(
+        source.prepare(
+            transaction_id=uuid4(),
+            base_commit=source.head(),
+            files={"moved.md": "m", "twin.md": "t"},
+            note_ids={"moved.md": moved, "twin.md": twin},
+        )
+    )
+    incoming = GitProjectRepository.create(tmp_path / "target.git", project_external_id=target_uuid)
+    identities = GitHostIdentities(
+        [
+            GitHostProject(test_project.id, source_uuid, test_project.name, source),
+            GitHostProject(target_id, target_uuid, "target", incoming),
+        ]
+    )
+    records = GitSyncRepository(incoming, target_uuid, None)
+
+    async def check(note_ids: dict[str, object], moved_notes=None, *, host=True):
+        tip = incoming.prepare(
+            transaction_id=uuid4(),
+            base_commit=incoming.head(),
+            files={path: path for path in note_ids},
+            note_ids=note_ids,  # ty: ignore[invalid-argument-type]
+            moved_notes=moved_notes,
+        ).commit_id
+        async with session_maker() as session:
+            await records.require_note_ownership(
+                session,
+                target_id,
+                incoming.read_snapshot(tip).manifest,
+                identities=identities if host else None,
+                history=(incoming, tip) if host else None,
+            )
+
+    # The target commit of a move the source has not caught up with: let through.
+    await check({"moved.md": moved}, {moved: source_uuid})
+    # Without the host view the old rule refuses it, and passes a fresh note.
+    with pytest.raises(ValueError, match="already owned by another project"):
+        await check({"moved.md": moved}, {moved: source_uuid}, host=False)
+    await check({"fresh.md": uuid4()}, host=False)
+    # A twin without a move proof is refused by name.
+    with pytest.raises(ValueError) as refused:
+        await check({"twin.md": twin})
+    assert f"{twin} (owned by project '{test_project.name}'" in str(refused.value)
+    assert "incoming for project 'target'" in str(refused.value)

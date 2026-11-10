@@ -427,8 +427,6 @@ class GitTransactionService:
         move whose source has not let go yet). Publishing it anyway would leave the
         twin in this project waiting for the other for good.
         """
-        if not new_ids:
-            return
         identities = self.runtime.pipeline.identities
         project_id = self.runtime.pipeline.project_id
         async with self.runtime.pipeline.session_maker() as session:

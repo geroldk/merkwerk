@@ -589,3 +589,57 @@ async def test_real_api_append_reindexes_only_the_changed_note(runtime, client, 
         assert response.status_code == 202, response.text
         await wait_ready(runtime)
         assert calls == [changed.file_path]
+
+
+@pytest.mark.asyncio
+async def test_without_host_identities_the_commit_guard_still_checks_sql(
+    runtime, engine_factory, tmp_path
+):
+    """A runtime built without the host view (tests, tools) still refuses a UUID that
+    another project's SQL holds when a draft with a chosen UUID commits (I1)."""
+    from basic_memory.repository.git_transaction_repository import GitTransactionError
+    from basic_memory.schemas.git_transactions import (
+        GitTransactionCommit,
+        GitTransactionControl,
+        GitTransactionStart,
+    )
+
+    note = uuid4()
+    async with engine_factory[1]() as session, session.begin():
+        other = Project(name="other", path=str(tmp_path / "other"), is_active=True)
+        session.add(other)
+        await session.flush()
+        session.add(
+            Entity(
+                project_id=other.id,
+                external_id=str(note),
+                title="Other",
+                note_type="note",
+                content_type="text/markdown",
+                file_path="other.md",
+            )
+        )
+    assert runtime.pipeline.identities is None
+    async with runtime.run():
+        transactions = runtime.transactions
+        started = await transactions.start(GitTransactionStart())
+        await transactions.write_identified(
+            started.transaction_id,
+            started.transaction_key,
+            path="kept.md",
+            content="---\ntitle: Kept\ntype: note\npermalink: kept\n---\n\nBody\n",
+            note_id=note,
+            expected_revision=0,
+        )
+        with pytest.raises(GitTransactionError, match=f"Note UUID {note} is still owned"):
+            await transactions.commit(
+                started.transaction_id,
+                started.transaction_key,
+                GitTransactionCommit(expected_revision=1),
+            )
+        rolled_back = await transactions.rollback_admitted(
+            started.transaction_id,
+            started.transaction_key,
+            GitTransactionControl(expected_revision=1),
+        )
+        assert rolled_back.state == "rolled_back"
