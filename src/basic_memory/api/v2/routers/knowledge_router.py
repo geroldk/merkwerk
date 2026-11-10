@@ -825,6 +825,20 @@ def _parse_note_slice_params(
     return selector, line_range
 
 
+def _refuse_selector_without_headings(selector: SectionSelector | None) -> None:
+    """Refuse a selector malformed as a path when no note text is there to bear it."""
+    # Trigger: the entity is missing, or it has no markdown content to slice.
+    # Why: "A//B" can only be valid as a heading's whole text, and with no note there
+    #   is no heading; before headings could contain "/" such a selector was refused
+    #   with 422 before the entity was even looked up.
+    # Outcome: the same 422 as before, ahead of the 404 for the missing note or content.
+    if selector is not None and selector.segments is None:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid section selector: '{selector.raw}'",
+        )
+
+
 def _apply_note_slice(
     result: EntityResponseV2,
     *,
@@ -842,6 +856,7 @@ def _apply_note_slice(
     if selector is None and line_range is None and max_tokens is None:
         return result
     if result.content is None:
+        _refuse_selector_without_headings(selector)
         raise HTTPException(
             status_code=404,
             detail=f"Entity '{result.external_id}' has no markdown content to slice",
@@ -954,6 +969,7 @@ async def get_entity_by_id(
         else:
             entity = await entity_repository.get_by_external_id(session, entity_id)
             if not entity:
+                _refuse_selector_without_headings(selector)
                 raise HTTPException(
                     status_code=404,
                     detail=f"Entity with external_id '{entity_id}' not found",

@@ -532,6 +532,37 @@ async def test_repeated_slash_heading_is_offered_by_its_own_text(client, test_pr
     )
 
 
+@pytest.mark.asyncio
+async def test_section_name_a_read_returns_edits_that_section(client, test_project):
+    """Review of B3, finding 1: the name bm_read returns must edit the section it read.
+
+    "Plan/KI/ML[1]" spells the second "ML" under "KI"; returned for the second
+    "KI/ML", it made replace_section overwrite "y" and keep "two".
+    """
+    note = "# Plan\n## KI/ML\none\n## KI/ML\ntwo\n## KI\n### ML\nx\n### ML\ny\n"
+    await bm_write(identifier="specs/names.md", content=note, project=test_project.name)
+
+    read = await bm_read(
+        "specs/names.md", section="KI/ML[1]", output_format="json", project=test_project.name
+    )
+    assert isinstance(read, dict)
+    assert read["content"] == "## KI/ML\ntwo"
+
+    await bm_edit(
+        identifier="specs/names.md",
+        command="replace_section",
+        section=read["section"],
+        content="REPLACED",
+        project=test_project.name,
+    )
+
+    text = await bm_read("specs/names.md", include_frontmatter=False, project=test_project.name)
+    assert isinstance(text, str)
+    assert text.lstrip("\n") == (
+        "# Plan\n## KI/ML\none\n## KI/ML\nREPLACED\n## KI\n### ML\nx\n### ML\ny\n"
+    )
+
+
 # --- find_replace counts ---
 
 

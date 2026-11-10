@@ -134,6 +134,12 @@ bm_read(identifier="plans/missing.md", project="demo")
   named that way too. Such a heading cannot be qualified by its parents, so one
   under two different parents stays ambiguous; `[n]` counts its repeats under
   the same parent. A heading that itself ends in `[1]` is named `Heading[1][0]`.
+- The `section` of a JSON section read is a selector that reads back to the
+  same heading, so bm-edit(3) can take it as it is: usually the heading path
+  (`Plan/Decisions`, `Plan/Log[1]`), or a heading's own text (`KI/ML`) when its
+  path would spell another heading. Error messages list a heading that no
+  selector reaches by its location (`A > KI/ML`); read it with
+  `start_line`/`end_line`.
 - The token budget is approximate. The first nonblank line is returned whole
   even when it exceeds the budget, so a read does not return only leading blank
   lines. Follow the returned line coordinates to continue.

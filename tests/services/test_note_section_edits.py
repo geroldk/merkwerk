@@ -200,3 +200,17 @@ def test_repeated_slash_heading_is_offered_by_its_own_text():
     assert replace_section_content(note, "KI/ML[1]", "TWO") == (
         "## KI/ML\none\n## KI/ML\nTWO\n## KI\n### ML\nx\n### ML\ny\n"
     )
+
+
+def test_edit_refuses_paths_that_join_to_one_string():
+    """Review of B3, finding 5: "X" ends two different paths that both join to "R/A/B/X".
+
+    Before, the edit took the first "X" it met (the one under "A/B") without asking.
+    """
+    note = "# R\n## A/B\n### X\nx-under-slash\n## A\n### B\n#### X\nx-under-path\n"
+
+    with pytest.raises(ValueError, match=r"Section 'X' is ambiguous\. Qualify it: R/A/B/X\."):
+        replace_section_content(note, "X", "new")
+    assert replace_section_content(note, "R/A/B/X", "new") == (
+        "# R\n## A/B\n### X\nx-under-slash\n## A\n### B\n#### X\nnew\n"
+    )

@@ -177,7 +177,8 @@ async def test_section_names_a_slash_heading_whole(client, test_project):
     payload = await read_json("notes/Slash.md", project=test_project.name, section="KI/ML")
 
     assert payload["content"] == "## KI/ML\nliteral\n"
-    assert payload["section"] == "Plan/KI/ML"
+    # "Plan/KI/ML" would read back as heading "ML" under "KI" (review of B3).
+    assert payload["section"] == "KI/ML"
 
 
 @pytest.mark.asyncio

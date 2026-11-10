@@ -85,8 +85,12 @@ bm_edit(identifier="plans/launch-plan.md", command="append", content="x",
   refused. Use `insert_after_section` to add under a heading.
 - A heading whose own text contains "/" (`KI/ML`) is named whole, as in
   bm-read(3): a heading named exactly as `section` is written wins over the path
-  reading, and spaces around the "/" (`KI / ML`) still reach heading `ML` under
-  `KI`. A repeated one is named `KI/ML[1]`; the refusal lists these names.
+  reading. Spaces around the "/" (`KI / ML`) or an added ancestor (`Plan/KI/ML`)
+  still reach heading `ML` under `KI`, unless a heading is named that way too;
+  when the whole-heading reading is refused, the message names the path's
+  selector. A repeated one is named `KI/ML[1]`; the refusal lists these names.
+- The `section` a JSON read returns names the same heading again, so it can be
+  passed to the section commands as it is.
 - `set_metadata` refuses `title` and `permalink`: they are the note's identity.
   Rename with bm_move.
 

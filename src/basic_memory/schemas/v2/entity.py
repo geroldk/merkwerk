@@ -246,8 +246,10 @@ class EntityResponseV2(BaseModel):
     # model is untouched.
     section: Optional[str] = Field(
         None,
-        description="Canonical heading path of the returned section slice "
-        "(bracket-suffixed when a duplicate heading was addressed)",
+        description="Section selector that reads back to the returned slice: its heading "
+        "path (bracket-suffixed when a duplicate heading was addressed), or a shorter "
+        "spelling when that path would name another heading ('KI/ML' for a heading whose "
+        "own text contains '/')",
     )
     content_start_line: Optional[int] = Field(
         None, description="Document-absolute 1-indexed first line of the returned content"

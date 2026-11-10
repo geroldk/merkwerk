@@ -292,8 +292,11 @@ await bm_edit(
 Read before editing and pass `expected_checksum` when the change depends on the
 revision you read. For repeated headings use a section path (`Auth/Decisions`) or an
 occurrence (`Decisions[1]`). A heading whose own text contains "/" (`KI/ML`) is named
-whole: a heading named exactly as written wins over the path reading, and `KI / ML`
-with spaces still means heading `ML` under `KI`. `expected_replacements` must match the actual count;
+whole: a heading named exactly as written wins over the path reading. `KI / ML` with
+spaces, or an added ancestor (`Plan/KI/ML`), still means heading `ML` under `KI`,
+unless a heading is named that way too. The `section` that a JSON `bm_read` returns
+names the same heading again and can be passed to `bm_edit` unchanged.
+`expected_replacements` must match the actual count;
 there is no `replace_all` parameter. Metadata updates preserve other fields and
 cannot remove keys with null or change title/permalink identity.
 

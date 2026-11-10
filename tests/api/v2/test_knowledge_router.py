@@ -3050,12 +3050,59 @@ async def test_get_entity_malformed_selector_keeps_its_exact_422(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("selector", ["A//B", "/Auth", "Auth/", "A/ /B"])
+async def test_get_missing_entity_with_malformed_selector_keeps_its_422(
+    client: AsyncClient, v2_project_url, selector
+):
+    """Regression: without a note no heading can bear the text, so 422 comes first as before."""
+    missing = f"{v2_project_url}/knowledge/entities/{uuid.uuid4()}"
+
+    response = await client.get(missing, params={"section": selector})
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == f"Invalid section selector: '{selector}'"
+    # A well-formed selector still meets the missing entity first.
+    assert (await client.get(missing, params={"section": "Auth"})).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_get_contentless_entity_with_malformed_selector_keeps_its_422(
+    client: AsyncClient,
+    test_project: Project,
+    v2_project_url,
+    entity_repository,
+    session_maker,
+):
+    """Regression: a file without markdown has no headings to bear "A//B" either."""
+    entity = EntityModel(
+        title="legacy-malformed.txt",
+        note_type="file",
+        content_type="text/plain",
+        file_path="legacy/legacy-malformed.txt",
+        checksum="seeded",
+        created_at=datetime.now(timezone.utc),
+        updated_at=datetime.now(timezone.utc),
+    )
+    async with db.scoped_session(session_maker) as session:
+        entity = await entity_repository.add(session, entity)
+
+    response = await client.get(
+        f"{v2_project_url}/knowledge/entities/{entity.external_id}",
+        params={"section": "A//B"},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "Invalid section selector: 'A//B'"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("selector", "content", "label"),
     [
-        ("KI/ML", "## KI/ML\nliteral", "Top/KI/ML"),
+        # The returned name reads back to the section it names (review of B3).
+        ("KI/ML", "## KI/ML\nliteral", "KI/ML"),
         ("KI / ML", "### ML\nnested", "Top/KI/ML"),
-        ("/etc", "## /etc\nconfig", "Top//etc"),
+        ("/etc", "## /etc\nconfig", "/etc"),
     ],
 )
 async def test_get_entity_section_names_a_slash_heading_whole(
