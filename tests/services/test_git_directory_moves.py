@@ -364,6 +364,41 @@ def test_a_target_another_moving_note_leaves_is_not_occupied(tmp_path):
     assert disk_conflicts(disk(tmp_path, files), plan) == ([], [])
 
 
+def test_a_file_that_vanishes_during_the_scan_counts_as_absent(tmp_path, monkeypatch):
+    # The files stage runs beside the move: it stages each note as '.<name>.<hex>.tmp' and
+    # renames it over the note, and it deletes retired files, so a listed file may be gone
+    # by the time the scan looks at it.
+    files, ids = tree("src/a.md", "src/b.md")
+    for path, text in files.items():
+        write(tmp_path, path, text)
+    write(tmp_path, "src/.a.md.0123456789abcdef.tmp", files["src/a.md"])
+    write(tmp_path, "src/gone-before-read.md", "retired bytes")
+    write(tmp_path, "dst/b.md", "retired target")
+    plan = plan_git_directory_move(files, ids, "src", "dst")
+    real_walk = os.walk
+
+    def walk_then_rename(top, *args, **kwargs):
+        for current, folders, names in real_walk(top, *args, **kwargs):
+            # Listed, then renamed over the note before the scan reaches it.
+            if ".a.md.0123456789abcdef.tmp" in names:
+                os.replace(Path(current) / ".a.md.0123456789abcdef.tmp", Path(current) / "a.md")
+            yield current, folders, names
+
+    module = "basic_memory.services.git_directory_moves"
+    monkeypatch.setattr(f"{module}.os.walk", walk_then_rename)
+    real_checksum = __import__(module, fromlist=["_file_checksum"])._file_checksum
+
+    def checksum_after_delete(path: str) -> str:
+        # The lstat saw the file; it is deleted before it is read.
+        if path.endswith(("gone-before-read.md", "dst/b.md")):
+            os.unlink(path)
+        return real_checksum(path)
+
+    monkeypatch.setattr(f"{module}._file_checksum", checksum_after_delete)
+
+    assert disk_conflicts(disk(tmp_path, files), plan) == ([], [])
+
+
 def test_conflicts_describe_themselves():
     assert GitDirectoryMoveConflict("d/x.md", "unpublished_file").describe() == (
         "d/x.md is not a published note"

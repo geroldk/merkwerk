@@ -6,7 +6,8 @@ The composition root suppresses legacy writers/materializers/imports before admi
 
 import asyncio
 import hashlib
-from collections.abc import AsyncIterator, Sequence
+import subprocess
+from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import datetime
@@ -320,10 +321,10 @@ class GitProjectRuntime:
             # Outcome: files found there are listed; otherwise the folder is not found.
             if refused.reason == "not_found":
                 directory = normalize_note_directory(source, role="source")
-                if stray := await asyncio.to_thread(unpublished_source_files, disk, directory):
+                if stray := await _scan_disk(unpublished_source_files, disk, directory):
                     raise _unclean_source(stray) from refused
             raise
-        unclean, taken = await asyncio.to_thread(disk_conflicts, disk, plan)
+        unclean, taken = await _scan_disk(disk_conflicts, disk, plan)
         if unclean:
             raise _unclean_source(unclean)
         if taken:
@@ -462,13 +463,39 @@ class GitProjectRuntime:
 
     async def _drop_candidate(self, transaction_id: UUID) -> None:
         """Remove the private candidate ref prepare() leaves, published or not."""
+        # Constraint: this runs in a finally block, also when the caller was cancelled.
+        #   A cancelled await of to_thread revokes the job while it still waits for a
+        #   worker thread, so the ref would stay; shielded, the cleanup always runs.
+        await asyncio.shield(asyncio.to_thread(self._remove_candidates, transaction_id))
+
+    def _remove_candidates(self, transaction_id: UUID) -> None:
         try:
-            await asyncio.to_thread(self.pipeline.repository.remove_candidates, transaction_id)
-        except GitPublicationError as error:  # pragma: no cover - a failing local git binary
-            # A leftover candidate ref is harmless residue; the move's outcome stands.
+            self.pipeline.repository.remove_candidates(transaction_id)
+        except (GitPublicationError, subprocess.SubprocessError, OSError) as error:
+            # Trigger: git fails, times out (30 s) or cannot start (EMFILE, ENOMEM).
+            # Why: raising here would replace the outcome the move already reached (a
+            #   published commit, or its refusal) with a 500.
+            # Outcome: a leftover candidate ref is harmless residue; the outcome stands.
             logger.warning(
                 "Git candidate cleanup failed", transaction_id=str(transaction_id), error=str(error)
             )
+
+
+async def _scan_disk[**P, T](scan: Callable[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
+    """Run a disk check off the event loop; a disk that cannot be read refuses the move.
+
+    The checks run before anything is published, so an OSError there (permission, I/O)
+    means nothing moved. Answered as "not accepting", a caller is not told the outcome is
+    unknown. A file that vanishes during the scan is not an error (see _disk_entry).
+    """
+    try:
+        return await asyncio.to_thread(scan, *args, **kwargs)
+    except OSError as error:
+        raise GitDirectoryMoveRefused(
+            409,
+            "not_accepting",
+            f"The project folder could not be read: {error}. Nothing was moved.",
+        ) from error
 
 
 def _unclean_source(conflicts: Sequence[GitDirectoryMoveConflict]) -> GitDirectoryMoveRefused:

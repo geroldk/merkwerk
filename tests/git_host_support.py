@@ -1,6 +1,8 @@
 """Shared real Git-host fixtures, importable under pytest's importlib mode."""
 
 import asyncio
+import os
+import time
 from dataclasses import dataclass
 from uuid import UUID
 
@@ -64,3 +66,25 @@ async def ready(client, project_id):
             assert host is not None
             host.runtime_for(project_id).worker.notify()
             await asyncio.sleep(0.03)
+
+
+@pytest.fixture
+def local_time_with_offset():
+    """Run in Europe/Berlin, a zone with a non-zero UTC offset.
+
+    In UTC (as on CI runners) a UTC wall time stored as naive local time reads back as the
+    right instant, so a test of stored times passes with or without the bug it guards.
+    """
+    previous = os.environ.get("TZ")
+    os.environ["TZ"] = "Europe/Berlin"
+    time.tzset()
+    try:
+        # Fail loudly if the zone database is missing: UTC would hide the bug again.
+        assert time.localtime(0).tm_gmtoff != 0, "Europe/Berlin is not available here"
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = previous
+        time.tzset()

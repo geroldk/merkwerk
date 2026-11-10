@@ -498,8 +498,11 @@ async def _move_git_directory(
         f"Moved directory {result['path']} to {result['destination']} "
         f"({moved.total_notes} notes, one commit {moved.commit_id[:12]})"
     ]
+    # The server may adopt an existing folder's spelling; say so, as the JSON form does.
+    if "requested_path" in result:
+        lines.append(f"requested source: {result['requested_path']}")
     if "requested_destination" in result:
-        lines.append(f"requested: {result['requested_destination']}")
+        lines.append(f"requested destination: {result['requested_destination']}")
     lines += [
         f"- {note['previous_file_path']} -> {note['file_path']} "
         f"(id {note['external_id']}, permalink {note['permalink']})"
@@ -581,10 +584,23 @@ def _git_move_failure(
                 "another destination"
             )
         case "unpublished_file":
-            try_instead = (
-                f"move the files that are not notes out of '{source_address}' and save or "
-                "undo editor changes, then repeat the same bm_move"
-            )
+            # Trigger: the source holds files that are not notes, or notes edited on disk.
+            # Why: Git mode never imports a disk edit, so saving it keeps it refused; only
+            #   restoring the published bytes or writing the change through BM clears it.
+            # Outcome: each kind of offender gets the step that actually clears it.
+            kinds = {conflict["reason"] for conflict in conflicts}
+            steps = []
+            if kinds != {"edited_on_disk"}:
+                steps.append(
+                    f"move the files that are not notes out of '{source_address}' (close an "
+                    "editor that keeps a swap file there)"
+                )
+            if "edited_on_disk" in kinds:
+                steps.append(
+                    "for each note marked edited_on_disk, undo the edit made outside Basic "
+                    "Memory or bring it in with bm_edit/bm_write (saving it again does not help)"
+                )
+            try_instead = "; ".join(steps) + ", then repeat the same bm_move"
         case "unsupported_config":
             try_instead = "bm_move(identifier=...) for each note, which follows that setting"
         case "ambiguous_source":

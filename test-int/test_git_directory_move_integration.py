@@ -28,7 +28,12 @@ from basic_memory.models import Entity
 from basic_memory.repository.git_project_repository import GitProjectRepository
 from basic_memory.repository.project_repository import ProjectRepository
 
-from tests.git_host_support import HostSetup, host_setup as host_setup, ready
+from tests.git_host_support import (
+    HostSetup,
+    host_setup as host_setup,
+    local_time_with_offset as local_time_with_offset,
+    ready,
+)
 
 CREATED = "2025-01-02T03:04:05+00:00"
 MODIFIED = "2025-02-03T04:05:06+00:00"
@@ -140,7 +145,9 @@ def git_host(host_setup, config_manager) -> HostSetup:
 
 
 @pytest.mark.asyncio
-async def test_a_folder_moves_as_one_commit_and_the_answer_lists_every_note(git_host):
+async def test_a_folder_moves_as_one_commit_and_the_answer_lists_every_note(
+    git_host, local_time_with_offset
+):
     host_setup = git_host
     from basic_memory.api.app import app
 
@@ -419,13 +426,14 @@ async def test_a_host_that_renames_permalinks_on_move_refuses_the_folder_move(ho
 
     assert host_setup.config.update_permalinks_on_move
     seed(host_setup.repository, {"src/a.md": note("src/a.md")})
-    head = host_setup.repository.head()
     async with app.router.lifespan_context(app):
         async with AsyncClient(transport=ASGITransport(app), base_url="http://test") as client:
+            await ready(client, host_setup.project.external_id)
+            before = await state(host_setup)
             response = await move(client, host_setup.project.external_id, "src", "dst")
-    assert response.status_code == 409, response.text
-    assert response.json()["detail"]["reason"] == "unsupported_config"
-    assert host_setup.repository.head() == head
+            assert response.status_code == 409, response.text
+            assert response.json()["detail"]["reason"] == "unsupported_config"
+            assert await state(host_setup) == before
 
 
 @pytest.mark.asyncio
@@ -446,13 +454,13 @@ async def test_a_defect_outside_the_folder_does_not_block_it_but_one_inside_does
         async with AsyncClient(transport=ASGITransport(app), base_url="http://test") as client:
             # A blank title blocks the graph stage for good; the files stage is enough here.
             await files_written(project_id)
-            head = git_host.repository.head()
+            before = await state(git_host)
             response = await move(client, project_id, "bad", "worse")
             assert response.status_code == 422, response.text
             detail = response.json()["detail"]
             assert detail["reason"] == "invalid_draft"
             assert "worse/blank.md" in detail["message"]
-            assert git_host.repository.head() == head
+            assert await state(git_host) == before
             response = await move(client, project_id, "src", "dst")
             assert response.status_code == 200, response.text
 
@@ -508,6 +516,70 @@ async def test_a_failure_before_or_at_publication_leaves_git_sql_and_disk_unchan
 
             response = await move(client, project_id, "src", "dst")
             assert response.status_code == 200, response.text
+
+
+@pytest.mark.asyncio
+async def test_a_disk_that_cannot_be_read_refuses_the_move_as_not_accepting(git_host, monkeypatch):
+    """An OSError before publication is a clean refusal, never an unknown outcome (500)."""
+    from basic_memory.api.app import app
+
+    project_id = git_host.project.external_id
+    seed(git_host.repository, {"src/a.md": note("src/a.md")})
+    async with app.router.lifespan_context(app):
+        transport = ASGITransport(app, raise_app_exceptions=False)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            await ready(client, project_id)
+            before = await state(git_host)
+
+            def unreadable(*args, **kwargs):
+                raise PermissionError(13, "Permission denied", "src/a.md")
+
+            for scan in ("disk_conflicts", "unpublished_source_files"):
+                monkeypatch.setattr(f"basic_memory.services.git_project_runtime.{scan}", unreadable)
+            for source in ("src", "attachments-only"):
+                response = await move(client, project_id, source, "dst")
+                assert response.status_code == 409, response.text
+                detail = response.json()["detail"]
+                assert detail["reason"] == "not_accepting"
+                assert "Permission denied" in detail["message"]
+                assert "Nothing was moved" in detail["message"]
+                assert await state(git_host) == before
+
+
+@pytest.mark.asyncio
+async def test_a_failing_candidate_cleanup_keeps_the_outcome_of_the_move(git_host, monkeypatch):
+    """The cleanup runs in a finally block: a git timeout there must not turn into a 500."""
+    import subprocess
+
+    from basic_memory.api.app import app
+    from basic_memory.repository.git_project_repository import GitPublicationConflict
+
+    project_id = git_host.project.external_id
+    seed(git_host.repository, {"src/a.md": note("src/a.md"), "other/b.md": note("other/b.md")})
+    async with app.router.lifespan_context(app):
+        transport = ASGITransport(app, raise_app_exceptions=False)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            await ready(client, project_id)
+            repository = runtime(project_id).pipeline.repository
+            failures = iter(
+                [subprocess.TimeoutExpired(["git", "for-each-ref"], 30), OSError(24, "EMFILE")]
+            )
+
+            def failing_cleanup(transaction_id):
+                raise next(failures)
+
+            monkeypatch.setattr(repository, "remove_candidates", failing_cleanup)
+            response = await move(client, project_id, "src", "dst")
+            assert response.status_code == 200, response.text
+            assert response.json()["commit_id"] == git_host.repository.head()
+
+            def conflicting_publish(self, prepared):
+                raise GitPublicationConflict(prepared.base_commit, "f" * 40)
+
+            monkeypatch.setattr(GitProjectRepository, "publish", conflicting_publish)
+            response = await move(client, project_id, "other", "elsewhere")
+            assert response.status_code == 409, response.text
+            assert response.json()["detail"]["reason"] == "base_advanced"
 
 
 @pytest.mark.asyncio
@@ -598,11 +670,15 @@ async def test_a_stopped_runtime_refuses_the_move_as_not_accepting(git_host):
 
     seed(git_host.repository, {"src/a.md": note("src/a.md")})
     async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=ASGITransport(app), base_url="http://test") as client:
+            await ready(client, git_host.project.external_id)
         stopped = runtime(git_host.project.external_id)
+        before = await state(git_host)
     with pytest.raises(GitDirectoryMoveRefused) as error:
         await stopped.move_directory("src", "dst")
     assert (error.value.status_code, error.value.reason) == (409, "not_accepting")
     assert "Nothing was moved" in error.value.message
+    assert await state(git_host) == before
 
 
 @pytest.mark.asyncio
@@ -633,11 +709,13 @@ async def test_sql_outside_the_published_basis_refuses_before_publication(git_ho
                             file_path="stray.md",
                         )
                     )
+            before = await state(git_host)
             response = await move(client, project_id, "src", "dst")
-    assert response.status_code == 409, response.text
-    assert response.json()["detail"]["reason"] == "not_accepting"
-    assert "outside the captured Git basis" in response.json()["detail"]["message"]
-    assert git_host.repository.head() == head
+            assert response.status_code == 409, response.text
+            assert response.json()["detail"]["reason"] == "not_accepting"
+            assert "outside the captured Git basis" in response.json()["detail"]["message"]
+            assert await state(git_host) == before
+            assert git_host.repository.head() == head
 
 
 @pytest.mark.asyncio
@@ -808,28 +886,29 @@ async def test_links_after_a_folder_move(git_host):
         )
         return response.json()["external_id"] if response.status_code == 200 else None
 
-    async def links(client, inner: str) -> dict[str, str | None]:
+    async def links(client) -> dict[str, str | None]:
+        # Every link starts from the note that stays, so each one reads the moved note's
+        # state; a relative link from a moved note would only test path arithmetic.
         return {
             "by_permalink": await resolve(client, "test-project/drafts/target", "keep/linker.md"),
             "by_title": await resolve(client, "target", "keep/linker.md"),
             "by_path": await resolve(client, "/drafts/target.md", "keep/linker.md"),
-            "relative": await resolve(client, "../keep/linker.md", inner),
+            "relative": await resolve(client, "../drafts/target.md", "keep/linker.md"),
         }
 
-    target, linker = str(ids["drafts/target.md"]), str(ids["keep/linker.md"])
+    target = str(ids["drafts/target.md"])
     async with app.router.lifespan_context(app):
         async with AsyncClient(transport=ASGITransport(app), base_url="http://test") as client:
             await ready(client, project_id)
-            assert await links(client, "drafts/inner.md") == {
+            assert await links(client) == {
                 "by_permalink": target,
                 "by_title": target,
                 "by_path": target,
-                "relative": linker,
+                "relative": target,
             }
-            # One level deeper, so the relative link climbs to a different folder.
             response = await move(client, project_id, "drafts", "archive/drafts")
             assert response.status_code == 200, response.text
-            assert await links(client, "archive/drafts/inner.md") == {
+            assert await links(client) == {
                 "by_permalink": target,
                 "by_title": target,
                 "by_path": None,
@@ -893,6 +972,167 @@ def _app():
     from basic_memory.api.app import app
 
     return app
+
+
+@pytest.mark.asyncio
+async def test_a_locked_note_in_the_folder_moves_with_it(git_host):
+    """Parity with a single move: `locked` guards edits and deletes, not moves."""
+    from basic_memory.api.app import app
+
+    project_id = git_host.project.external_id
+    locked = note("drafts/locked.md").replace("type: note\n", "type: note\nlocked: true\n")
+    ids = seed(
+        git_host.repository, {"drafts/locked.md": locked, "drafts/a.md": note("drafts/a.md")}
+    )
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=ASGITransport(app), base_url="http://test") as client:
+            await ready(client, project_id)
+            response = await move(client, project_id, "drafts", "archive")
+            assert response.status_code == 200, response.text
+    after = git_host.repository.snapshot()
+    assert after.files["archive/locked.md"] == locked
+    assert after.manifest.note_ids["archive/locked.md"] == ids["drafts/locked.md"]
+
+
+@pytest.mark.asyncio
+async def test_a_move_whose_answer_is_lost_after_publication_is_found_at_the_destination(
+    git_host, monkeypatch
+):
+    """A cancelled caller after publication: the worker finishes SQL, a repeat says where."""
+    from basic_memory.mcp.server import mcp
+    import basic_memory.mcp.tools  # noqa: F401
+
+    project_id = git_host.project.external_id
+    ids = seed(git_host.repository, {"drafts/a.md": note("drafts/a.md")})
+    recover = GitProjectionPipeline.recover_content
+    published = asyncio.Event()
+
+    async def hangs_after_publication(self, commit_id, **kwargs):
+        if kwargs.get("known_ancestor") is not None:
+            published.set()
+            await asyncio.Event().wait()  # until the caller gives up
+        await recover(self, commit_id, **kwargs)
+
+    async with Client(mcp) as client:
+        async with AsyncClient(transport=ASGITransport(_app()), base_url="http://test") as api:
+            await ready(api, project_id)
+            count, refs = commits(git_host.repository), candidate_refs(git_host.repository)
+            monkeypatch.setattr(GitProjectionPipeline, "recover_content", hangs_after_publication)
+            request = asyncio.create_task(move(api, project_id, "drafts", "archive"))
+            await asyncio.wait_for(published.wait(), 30)
+            request.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await request
+            # Published once; durable recovery (woken on the way out) brings SQL along.
+            assert commits(git_host.repository) == count + 1
+            await ready(api, project_id)
+            assert (await entities(git_host.config))[str(ids["drafts/a.md"])][0] == ("archive/a.md")
+            # The cleanup in the finally block ran although the caller was cancelled.
+            assert candidate_refs(git_host.repository) == refs
+        repeated = await client.call_tool(
+            "bm_move",
+            {
+                "path": "drafts",
+                "destination": "archive",
+                "project": "test-project",
+                "output_format": "json",
+            },
+            raise_on_error=False,
+        )
+    assert repeated.is_error
+    block = repeated.content[0]
+    assert isinstance(block, TextContent)
+    payload = json.loads(block.text)
+    assert payload["error"] == "NOT_FOUND"
+    assert "may already have moved" in payload["message"]
+    assert "bm_list(path='archive'" in payload["try_instead"]
+    assert commits(git_host.repository) == count + 1
+
+
+@pytest.fixture
+def merge_peer(git_host, tmp_path, config_manager) -> GitProjectRepository:
+    """A bare peer with automatic note-level merge, as in test_git_merge_integration."""
+    import subprocess
+
+    from basic_memory.config_git import GitSyncRemote
+
+    path = tmp_path / "peer.git"
+    subprocess.run(
+        ["git", "clone", "--bare", "--no-local", str(git_host.repository.path), str(path)],
+        capture_output=True,
+        check=True,
+        timeout=30,
+    )
+    project = UUID(git_host.project.external_id)
+    git_host.config.git_sync_remotes = {project: GitSyncRemote(url=str(path))}
+    git_host.config.git_sync_merge = {project: "auto"}
+    config_manager.save_config(git_host.config)
+    return GitProjectRepository(path)
+
+
+@pytest.mark.asyncio
+async def test_a_sync_merge_computed_before_a_folder_move_fails_and_the_next_one_merges(
+    git_host, merge_peer, monkeypatch
+):
+    """The merge is computed outside the gate; the move lands first, the merge retries."""
+    from threading import Event
+
+    from basic_memory.api.app import app
+
+    project_id = git_host.project.external_id
+    seed(git_host.repository, {"drafts/a.md": note("drafts/a.md")})
+    async with app.router.lifespan_context(app):
+        sync = runtime(project_id).sync
+        assert (await sync.synchronize()).last_attempt.outcome == "pushed"
+    uuid = git_host.repository.snapshot().manifest.note_ids["drafts/a.md"]
+    # Both sides change: the peer edits the note, the host adds another one.
+    peer = merge_peer.snapshot()
+    edited = note("drafts/a.md", "Edited on the peer")
+    merge_peer.publish(
+        merge_peer.prepare(
+            transaction_id=uuid4(),
+            base_commit=peer.commit_id,
+            files={**peer.files, "drafts/a.md": edited},
+            note_ids=peer.manifest.note_ids,
+        )
+    )
+    seed(git_host.repository, {"keep/b.md": note("keep/b.md")})
+    prepare_merge = GitProjectRepository.prepare_merge
+    computed, release = Event(), Event()
+
+    def held(self, **kwargs):
+        prepared = prepare_merge(self, **kwargs)
+        computed.set()
+        assert release.wait(30)
+        return prepared
+
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=ASGITransport(app), base_url="http://test") as client:
+            await ready(client, project_id)
+            sync = runtime(project_id).sync
+            monkeypatch.setattr(GitProjectRepository, "prepare_merge", held)
+            attempt = asyncio.create_task(sync.synchronize())
+            await asyncio.to_thread(computed.wait, 30)
+            response = await move(client, project_id, "drafts", "archive")
+            assert response.status_code == 200, response.text
+            release.set()
+            failed = await attempt
+            assert failed.last_attempt.kind == "failed"
+            assert failed.last_attempt.reason == "local_changed"
+            monkeypatch.setattr(GitProjectRepository, "prepare_merge", prepare_merge)
+
+            merged = await sync.synchronize()
+            assert merged.last_attempt.outcome == "merged"
+            snapshot = git_host.repository.snapshot()
+            # The peer's edit reached the note by its UUID, at the path the move gave it.
+            assert snapshot.manifest.note_ids["archive/a.md"] == uuid
+            assert "drafts/a.md" not in snapshot.files
+            assert "Edited on the peer" in snapshot.files["archive/a.md"]
+            assert merge_peer.head() == git_host.repository.head()
+            await ready(client, project_id)
+            root = Path(git_host.project.path)
+            assert "Edited on the peer" in (root / "archive/a.md").read_text()
+            assert not (root / "drafts/a.md").exists()
 
 
 # --- Scale ---
@@ -976,6 +1216,9 @@ async def _scale_move(setup: HostSetup, folder: str, count: int, monkeypatch) ->
         assert payload["total_files"] == count and len(payload["moved_notes"]) == count
         assert repository._git("rev-list", "--count", f"{head}..main").strip() == b"1"
         json_bytes = len(block.text.encode())
+        # The basis the move read proves every note, also those whose times were stamped
+        # in: no rev-list over the history under the gate (else N notes cost N searches).
+        assert proofs == 0, f"{proofs} notes were proved through Git history"
         measured = dict(timings, proofs=proofs)
         timings["projection"] = timings["identity_proofs"] = 0.0
         proofs = 0
@@ -989,6 +1232,7 @@ async def _scale_move(setup: HostSetup, folder: str, count: int, monkeypatch) ->
         text = back.content[0]
         assert isinstance(text, TextContent)
         assert len(text.text.splitlines()) == count + 1
+        assert proofs == 0, f"{proofs} notes were proved through Git history"
         release.set()
     return {
         "notes_in_project": len(repository.snapshot().files),

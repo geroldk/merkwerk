@@ -141,7 +141,11 @@ async def test_spellings_the_server_resolved_are_reported_next_to_the_request(
         "archive/drafts",
     )
     assert isinstance(text, str)
-    assert text.splitlines()[1] == "requested: archive/drafts"
+    # Both resolutions are named in the text form too, not only in JSON.
+    assert text.splitlines()[1:3] == [
+        "requested source: drafts",
+        "requested destination: archive/drafts",
+    ]
 
 
 @pytest.mark.asyncio
@@ -226,6 +230,43 @@ async def test_each_refusal_reason_has_its_own_code_and_way_forward(
             {"path": "drafts/img.png", "reason": "unpublished_file", "other": None},
         ],
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "kinds,wanted,unwanted",
+    [
+        (["edited_on_disk"], ["undo the edit", "bm_edit/bm_write"], ["not notes out of"]),
+        (["unpublished_file"], ["not notes out of"], ["undo the edit"]),
+        (["symlink", "edited_on_disk"], ["not notes out of", "undo the edit"], []),
+    ],
+)
+async def test_an_unclean_source_names_the_step_that_clears_each_offender(
+    client, test_project, monkeypatch, kinds, wanted, unwanted
+):
+    """Saving an editor does not clear a note edited on disk: Git mode never imports it."""
+    refused_with(
+        monkeypatch,
+        422,
+        {
+            "message": "Not clean",
+            "reason": "unpublished_file",
+            "conflicts": [
+                {"path": f"drafts/{index}.md", "reason": kind, "other": None}
+                for index, kind in enumerate(kinds)
+            ],
+        },
+    )
+    with local_git_routing(True), pytest.raises(ToolError) as error:
+        await bm_move(
+            path="drafts", destination="archive", project=test_project.name, output_format="json"
+        )
+
+    hint = json.loads(str(error.value))["try_instead"]
+    assert hint.endswith(", then repeat the same bm_move")
+    assert "save or undo editor changes" not in hint
+    assert all(part in hint for part in wanted), hint
+    assert not any(part in hint for part in unwanted), hint
 
 
 @pytest.mark.asyncio

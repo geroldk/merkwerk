@@ -25,6 +25,8 @@ from basic_memory.schemas.git_project import GitProjectManifest
 from basic_memory.services.file_service import FileService
 from basic_memory.services.git_project_projection import project_git_content
 
+from tests.git_host_support import local_time_with_offset as local_time_with_offset
+
 
 @pytest.fixture
 def repository(
@@ -501,7 +503,7 @@ async def test_content_appearing_after_an_absence_read_is_not_overwritten(
 
 @pytest.mark.asyncio
 async def test_a_published_move_keeps_times_and_repoints_conflict_keys(
-    repository, test_project, session_maker
+    repository, test_project, session_maker, local_time_with_offset
 ):
     """The layout UPDATE skips Entity's validators; it must do what they would."""
     note_id = uuid4()

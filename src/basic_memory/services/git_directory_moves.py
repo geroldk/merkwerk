@@ -391,6 +391,24 @@ def _file_checksum(path: str) -> str:
         return hashlib.sha256(file.read()).hexdigest()
 
 
+type _DiskEntry = tuple[int, str | None]
+
+
+def _disk_entry(path: str) -> _DiskEntry | None:
+    """The entry's mode and, for a regular file, its checksum; None once it is gone.
+
+    Constraint: the files stage runs beside a move (only its content stage waits for the
+    gate). It stages each note as '.<name>.<hex>.tmp' and renames it over the note, and
+    it deletes retired files, so a file listed a moment ago may be gone when it is read.
+    A vanished file is not there to block the move; the next scan sees what replaced it.
+    """
+    try:
+        mode = os.lstat(path).st_mode
+        return mode, _file_checksum(path) if stat.S_ISREG(mode) else None
+    except FileNotFoundError:
+        return None
+
+
 def _folder_conflict(
     disk: GitDirectoryMoveDisk, path: str, folder: str
 ) -> GitDirectoryMoveConflict | None:
@@ -434,11 +452,12 @@ def unpublished_source_files(
         for name in sorted(names):
             full = os.path.join(current, name)
             path = _relative(disk.root, full)
-            mode = os.lstat(full).st_mode
+            if (entry := _disk_entry(full)) is None:
+                continue
+            mode, checksum = entry
             if stat.S_ISLNK(mode):
                 conflicts.append(GitDirectoryMoveConflict(path, "symlink"))
                 continue
-            checksum = _file_checksum(full) if stat.S_ISREG(mode) else None
             if path in disk.published:
                 if checksum not in disk.published[path]:
                     conflicts.append(GitDirectoryMoveConflict(path, "edited_on_disk"))
@@ -479,19 +498,14 @@ def disk_conflicts(
         # Outcome: only targets that no moving note leaves are checked for occupancy.
         if target in leaving:
             continue
-        full = disk.root / target
-        try:
-            mode = os.lstat(full).st_mode
-        except FileNotFoundError:
+        if (entry := _disk_entry(str(disk.root / target))) is None:
             continue
+        mode, checksum = entry
         if stat.S_ISLNK(mode):
             taken.append(GitDirectoryMoveConflict(target, "symlink"))
         elif stat.S_ISDIR(mode):
             taken.append(GitDirectoryMoveConflict(target, "file_folder_clash"))
-        elif not (
-            stat.S_ISREG(mode)
-            and _file_checksum(str(full)) in disk.retired.get(target, frozenset())
-        ):
+        elif checksum is None or checksum not in disk.retired.get(target, frozenset()):
             # A file BM has not indexed: the single move refuses it the same way.
             taken.append(GitDirectoryMoveConflict(target, "occupied"))
     return unpublished_source_files(disk, plan.source), taken

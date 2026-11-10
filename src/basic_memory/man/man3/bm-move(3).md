@@ -68,9 +68,11 @@ permalink, one line each in the text form, and in the JSON form `moved_notes`
 `moved_files` (the new paths) and `commit_id`. The answer grows with the
 folder: with paths of about 95 characters it takes about 380 bytes per note as
 text and 530 as JSON, so 600 notes answer with about 225 KB of text or 320 KB
-of JSON. While the move runs, every other write to the project waits; moving
-600 notes took about 15 seconds in a project with a short history and about 23
-seconds in one with 770 commits and 900 notes.
+of JSON. While the move runs, every other write to the project waits. As a
+rough guide, a move of 600 notes took about 15 seconds in a project with a short
+history and about 23 seconds in one with 770 commits and 900 notes; these are
+whole-call times on one machine with no other load on the project (graph and
+search indexing held back), not a guarantee for a busy host.
 
 Nothing changes, and the refusal names every offender (in the JSON form in
 `details.conflicts`), when a destination path is taken (by a note outside the
@@ -138,6 +140,13 @@ bm_move(identifier="plans/launch.md", destination="inbox/", project="demo",
   path gets a permalink with a suffix (`drafts/a-1`).
 - If a folder move gets no answer, do not repeat it blindly: a repeat that
   finds the folder empty is refused as not found. bm_list the destination.
+- On a Git host a note edited on disk outside Basic Memory blocks the folder
+  move, and saving the editor again does not help: Basic Memory does not take
+  in disk edits there. Undo the edit, or make it with bm_edit or bm_write.
+- If the server adopts an existing spelling of the folder (`Drafts` for
+  `drafts`), the text form says so in `requested source:` and
+  `requested destination:` lines, the JSON form in `requested_path` and
+  `requested_destination`.
 
 ## SEE ALSO
 
