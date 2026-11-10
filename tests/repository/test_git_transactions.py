@@ -402,3 +402,30 @@ def test_source_freeze_and_concurrent_write_do_not_lose_an_accepted_change(store
         assert record.revision == 1 and snapshot.files == {"A.md": "accepted if first"}
     else:
         assert record.state.kind == "frozen" and snapshot.files == {}
+
+
+def test_maintenance_lists_candidate_refs_once_however_many_records_are_kept(store, monkeypatch):
+    """Committed records stay for good; each call must not cost one Git call per record."""
+    for number in range(5):
+        started = store.start(GitTransactionStart())
+        replace(store, started, {f"n{number}.md": "---\ntitle: N\ntype: note\npermalink: n\n---\n"})
+        commit(store, started)
+    # The last commit's candidate refs go on the next maintenance; after that, none remain.
+    store.maintain()
+    calls = []
+    remove = store.repository.remove_candidates
+    listed = store.repository.candidate_transaction_ids
+
+    monkeypatch.setattr(
+        store.repository, "remove_candidates", lambda i: calls.append(i) or remove(i)
+    )
+    monkeypatch.setattr(
+        store.repository, "candidate_transaction_ids", lambda: calls.append("list") or listed()
+    )
+    store.maintain()
+    assert calls == ["list"]
+    # A rolled-back draft still holding refs is cleaned in the same pass.
+    started = store.start(GitTransactionStart())
+    calls.clear()
+    store.rollback(started.transaction_id, started.transaction_key, expected_revision=0)
+    assert store.repository.candidate_transaction_ids() == frozenset()

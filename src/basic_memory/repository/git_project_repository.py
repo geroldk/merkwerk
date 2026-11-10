@@ -529,10 +529,16 @@ class GitProjectRepository:
             reference, commit_id = line.split()
             self._git("update-ref", "-d", reference, commit_id)
 
+    def candidate_transaction_ids(self) -> frozenset[UUID]:
+        """The transactions that still hold a private candidate ref, in one Git call."""
+        refs = self._git("for-each-ref", "--format=%(refname)", "refs/bm/candidates/")
+        return frozenset(
+            UUID(reference.split("/")[3]) for reference in refs.decode("ascii").splitlines()
+        )
+
     def _read_snapshot(self, commit_id: str) -> GitSnapshot:
         tree = self._git("ls-tree", "-r", "-z", "--full-tree", commit_id)
-        files: dict[str, str] = {}
-        manifest: GitProjectManifest | None = None
+        entries: list[tuple[str, str]] = []
         for entry in tree.split(b"\0"):
             if not entry:
                 continue
@@ -540,8 +546,14 @@ class GitProjectRepository:
             mode, kind, blob_id = metadata.split(b" ")
             if mode != b"100644" or kind != b"blob":
                 raise GitPublicationError("Published project contains a non-regular note")
-            path = raw_path.decode("utf-8")
-            content = self._git("cat-file", "blob", blob_id.decode("ascii")).decode("utf-8")
+            entries.append((raw_path.decode("utf-8"), blob_id.decode("ascii")))
+        # Constraint: one `git cat-file` per note costs seconds for a thousand notes, and
+        #   every write reads a snapshot; one batch call reads all of them.
+        blobs = self._blobs([blob_id for _, blob_id in entries])
+        files: dict[str, str] = {}
+        manifest: GitProjectManifest | None = None
+        for path, blob_id in entries:
+            content = blobs[blob_id].decode("utf-8")
             if path == GIT_PROJECT_MANIFEST_PATH:
                 manifest = GitProjectManifest.model_validate_json(content)
                 continue
@@ -552,6 +564,26 @@ class GitProjectRepository:
                 "Git manifest must identify every published note exactly once"
             )
         return GitSnapshot(commit_id, files, manifest)
+
+    def _blobs(self, blob_ids: Iterable[str]) -> dict[str, bytes]:
+        """The bytes of several blobs, in one `cat-file --batch` call."""
+        wanted = list(dict.fromkeys(blob_ids))
+        if not wanted:
+            return {}
+        output = self._git(
+            "cat-file", "--batch", input_bytes="".join(f"{blob}\n" for blob in wanted).encode()
+        )
+        found: dict[str, bytes] = {}
+        position = 0
+        for blob in wanted:
+            end = output.index(b"\n", position)
+            header = output[position:end].split()
+            if len(header) != 3 or header[0].decode("ascii") != blob or header[1] != b"blob":
+                raise GitPublicationError("Published project lost a note blob")
+            size = int(header[2])
+            found[blob] = output[end + 1 : end + 1 + size]
+            position = end + 1 + size + 1
+        return found
 
     def prepare(
         self,
@@ -803,12 +835,29 @@ class GitProjectRepository:
         with TemporaryDirectory(prefix="bm-git-index-") as directory:
             index_path = Path(directory) / "index"
             self._git("read-tree", "--empty", index_path=index_path)
+            paths = sorted(files)
+            # Constraint: one `git hash-object` per note costs seconds for a thousand
+            #   notes. Each text goes to a private file and one call writes every blob;
+            #   --no-filters stores the exact bytes, as --stdin does.
+            sources = Path(directory) / "blobs"
+            sources.mkdir()
+            listing = bytearray()
+            for number, path in enumerate(paths):
+                source = sources / str(number)
+                source.write_bytes(files[path].encode("utf-8"))
+                listing.extend(str(source).encode() + b"\n")
+            blobs = (
+                self._git(
+                    "hash-object", "-w", "--no-filters", "--stdin-paths", input_bytes=bytes(listing)
+                ).split()
+                if paths
+                else []
+            )
+            if len(blobs) != len(paths):
+                raise GitPublicationError("Git did not store every note blob")
             entries = bytearray()
-            for path, content in sorted(files.items()):
-                blob = self._git(
-                    "hash-object", "-w", "--stdin", input_bytes=content.encode("utf-8")
-                )
-                entries.extend(b"100644 " + blob.strip() + b"\t" + path.encode("utf-8") + b"\0")
+            for path, blob in zip(paths, blobs, strict=True):
+                entries.extend(b"100644 " + blob + b"\t" + path.encode("utf-8") + b"\0")
             self._git(
                 "update-index",
                 "-z",

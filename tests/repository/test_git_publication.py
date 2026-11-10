@@ -644,3 +644,35 @@ def test_introductions_in_a_root_commit_a_created_merge_and_a_missing_manifest(
     bare = repository._git("commit-tree", empty, input_bytes=b"Raw\n").strip().decode()
     with pytest.raises(GitPublicationError, match="no Basic Memory manifest"):
         repository.last_introduction(bare, note)
+
+
+def test_one_batch_read_and_one_batch_write_keep_every_byte(
+    repository: GitProjectRepository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Snapshots read all blobs in one Git call, and prepare writes all blobs in one."""
+    base = repository.head()
+    files = {
+        f"notes/{number}.md": f"---\ntitle: N{number}\n---\n\nZeile\r\n  trailing  \n\n"
+        for number in range(40)
+    }
+    files["notes/leer.md"] = ""
+    files["notes/ohne Zeilenende.md"] = "kein Zeilenende"
+    calls: list[str] = []
+    run = GitProjectRepository._run
+
+    def counted(self, *arguments, **options):
+        calls.append(arguments[0])
+        return run(self, *arguments, **options)
+
+    monkeypatch.setattr(GitProjectRepository, "_run", counted)
+    prepared = prepare(repository, transaction_id=uuid4(), base_commit=base, files=files)
+    assert calls.count("hash-object") == 1
+    repository.publish(prepared)
+    calls.clear()
+    snapshot = repository.snapshot()
+    assert snapshot.files == files
+    assert calls.count("cat-file") == 1
+    # The empty tree needs no blob call at all.
+    calls.clear()
+    repository._write_tree({})
+    assert "hash-object" not in calls

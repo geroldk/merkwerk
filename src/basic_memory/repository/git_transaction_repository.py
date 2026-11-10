@@ -210,11 +210,16 @@ class GitTransactionRepository:
                     raise GitTransactionError(409, "Retained draft source is missing")
                 protected.add(parent)
                 pending.append(parent)
+        # Constraint: terminal records are kept for good, and every transaction call runs
+        #   this; one ref listing replaces a Git call per record, which made each call
+        #   slower with every committed move (a folder of 600 single moves).
+        retained = self.repository.candidate_transaction_ids()
         for identity, record in records.items():
             if isinstance(record.state, GitDraftState) and identity not in protected:
                 self.save(record.model_copy(update={"state": GitCleanedState()}))
-                self.repository.remove_candidates(identity)
-            elif not isinstance(record.state, GitDraftState):
+                if identity in retained:
+                    self.repository.remove_candidates(identity)
+            elif not isinstance(record.state, GitDraftState) and identity in retained:
                 self.repository.remove_candidates(identity)
         return {
             record.source_transaction_id
