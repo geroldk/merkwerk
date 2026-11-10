@@ -124,8 +124,12 @@ a non-breaking hyphen. Any well-formed trailer for the note counts, so a chain A
 converges; but when the owner itself took the note by a move from the same source the
 claim names, and no project on this host shows a move chain from the owner to that
 source, two hosts moved one note to two projects (a double move): that is case (c).
-Only manifests and trailers are read (`git cat-file` of the manifest, `git log -S`
-over it); introductions are cached per tip.
+Only manifests and trailers are read: one first-parent walk of the claiming history
+for all notes at once (manifests in `cat-file --batch` chunks, stopping when every note
+is placed) and one `git log` for their trailers; both are cached per tip and commit.
+`test-int/test_git_note_ownership_scale.py` (slow) classifies 600 notes that arrived by
+600 single moves into a 1000-note project in about 0.8 s (a cached pass: 0.0 s); a walk
+per note took 86 s. The sync guard runs inside the project's admission.
 
 **Projection.** With the host's identities, `project_git_content` projects everything
 except the waiting notes: removals and moves of local notes run as usual, which also

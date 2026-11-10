@@ -583,7 +583,8 @@ def merge(repository: GitProjectRepository, local: str, remote: str, note_ids: d
 
 def test_last_introduction_through_merges(repository: GitProjectRepository) -> None:
     kept, added, source = uuid4(), uuid4(), uuid4()
-    base = publish_ids(repository, {"kept.md": kept})
+    # `kept` once arrived by a move: that old trailer must not cover the merge's "keep".
+    base = publish_ids(repository, {"kept.md": kept}, moved_notes={kept: uuid4()})
     # Remote side: a move brings a new note in.
     remote = publish_ids(
         repository, {"kept.md": kept, "added.md": added}, base=base, moved_notes={added: source}
@@ -599,3 +600,47 @@ def test_last_introduction_through_merges(repository: GitProjectRepository) -> N
     }
     # ... but the merge itself brings back `kept`, which the local side had and dropped.
     assert repository.last_introduction(merged, kept) == merged
+    assert repository.move_sources(merged, kept) == frozenset()
+    assert repository.last_introductions(merged, [kept, added]) == {kept: merged, added: remote}
+
+
+def test_introductions_in_a_root_commit_a_created_merge_and_a_missing_manifest(
+    tmp_path: Path,
+) -> None:
+    """Histories BM itself never writes, but a peer or a person could."""
+    from basic_memory.schemas.git_project import GIT_PROJECT_MANIFEST_PATH, GitProjectManifest
+
+    repository = GitProjectRepository.create(tmp_path / "project.git")
+    project = repository.snapshot().manifest.project_external_id
+    note, created = uuid4(), uuid4()
+
+    def commit(parents: list[str], notes: dict[str, UUID]) -> str:
+        manifest = GitProjectManifest.model_validate(
+            {
+                "project_external_id": project,
+                "notes": [{"path": path, "external_id": n} for path, n in notes.items()],
+            }
+        )
+        tree = repository._write_tree(
+            {**{path: path for path in notes}, GIT_PROJECT_MANIFEST_PATH: manifest.canonical_json()}
+        )
+        arguments = [argument for parent in parents for argument in ("-p", parent)]
+        return (
+            repository._git("commit-tree", tree, *arguments, input_bytes=b"Raw\n").strip().decode()
+        )
+
+    # A root commit that already holds the note introduced it.
+    root = commit([], {"n.md": note})
+    other = uuid4()
+    assert repository.last_introductions(root, [note, other]) == {note: root, other: None}
+    # A merge that holds a note neither parent had created it itself.
+    left, right = commit([root], {"n.md": note}), commit([root], {"n.md": note, "r.md": uuid4()})
+    merged = commit([left, right], {"n.md": note, "c.md": created})
+    assert repository.last_introduction(merged, created) == merged
+    # No trailers asked for, none read.
+    assert repository.moved_notes_of([]) == {}
+    # A commit without a manifest is not a Basic Memory commit.
+    empty = repository._write_tree({})
+    bare = repository._git("commit-tree", empty, input_bytes=b"Raw\n").strip().decode()
+    with pytest.raises(GitPublicationError, match="no Basic Memory manifest"):
+        repository.last_introduction(bare, note)

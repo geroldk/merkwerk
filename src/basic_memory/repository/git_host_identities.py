@@ -35,7 +35,7 @@ from basic_memory.repository.git_projection_repository import (
 )
 from basic_memory.schemas.git_project import GitProjectManifest
 
-# Introductions are fixed for a fixed tip, so they are cached by (repository, tip, note).
+# Introductions are fixed for a fixed tip and trailers for a commit, so both are cached.
 _INTRODUCTION_CACHE_LIMIT = 4096
 
 
@@ -80,6 +80,7 @@ class GitHostIdentities:
         self._wakers: dict[int, Callable[[], None]] = {}
         self._waiting: dict[int, frozenset[int]] = {}
         self._introductions: dict[tuple[str, str, UUID], str | None] = {}
+        self._trailers: dict[tuple[str, str], dict[UUID, frozenset[UUID]]] = {}
 
     def describe(self, project_id: int) -> str:
         project = self.projects.get(project_id)
@@ -128,6 +129,7 @@ class GitHostIdentities:
         heads: dict[int, frozenset[UUID]] = {}
         deferred: dict[UUID, int] = {}
         duplicates: dict[UUID, int] = {}
+        held: dict[UUID, GitHostProject] = {}
         for note, owner_id in sorted(owners.items(), key=lambda item: str(item[0])):
             owner = self.projects.get(owner_id)
             if owner is None:
@@ -136,17 +138,22 @@ class GitHostIdentities:
             if owner_id not in heads:
                 heads[owner_id] = owner.repository.published_note_ids()
             # Rule (a): the owner published the release; its SQL follows on its own.
-            if note not in heads[owner_id] or self._move_in_progress(note, owner, claimant, tip):
+            if note not in heads[owner_id]:
                 deferred[note] = owner_id
             else:
-                duplicates[note] = owner_id
+                held[note] = owner
+        # Rule (b) needs each claim's introduction: one walk of the claiming history for
+        # all of them (a folder that arrived by 600 single moves is 600 such notes).
+        claims = self._claims(claimant, tip, held)
+        for note, owner in held.items():
+            if self._move_in_progress(note, owner, claims[note]):
+                deferred[note] = owner.project_id
+            else:
+                duplicates[note] = owner.project_id
         return ForeignNotes(deferred, duplicates)
 
-    def _move_in_progress(
-        self, note: UUID, owner: GitHostProject, claimant: GitProjectRepository, tip: str
-    ) -> bool:
+    def _move_in_progress(self, note: UUID, owner: GitHostProject, claim: frozenset[UUID]) -> bool:
         """Rule (b): the claim's own introduction proves a move the owner will follow."""
-        claim = self._introduced_from(claimant, tip, note)
         if not claim:
             return False
         if owner.external_id in claim or self._custody_reaches(note, claim, owner):
@@ -157,7 +164,7 @@ class GitHostIdentities:
         #   two hosts each moved the note out of one project: the owner then holds a move
         #   from that same source, and neither side would ever release.
         # Outcome: the double move is a duplicate (named invalid_incoming on sync).
-        owner_claim = self._introduced_from(owner.repository, owner.repository.head(), note)
+        owner_claim = self._claims(owner.repository, owner.repository.head(), [note])[note]
         return not (owner_claim & claim)
 
     def _custody_reaches(self, note: UUID, claim: frozenset[UUID], owner: GitHostProject) -> bool:
@@ -172,23 +179,53 @@ class GitHostIdentities:
             project = self._by_external_id.get(source)
             if project is None:
                 continue
-            sources = self._introduced_from(project.repository, project.repository.head(), note)
+            repository = project.repository
+            sources = self._claims(repository, repository.head(), [note])[note]
             if owner.external_id in sources:
                 return True
             pending.extend(sources)
         return False
 
-    def _introduced_from(
-        self, repository: GitProjectRepository, tip: str, note: UUID
-    ) -> frozenset[UUID]:
-        """The move sources named on the commit that last introduced `note` at `tip`."""
-        key = (str(repository.path), tip, note)
-        if key not in self._introductions:
-            if len(self._introductions) >= _INTRODUCTION_CACHE_LIMIT:
-                self._introductions.clear()
-            self._introductions[key] = repository.last_introduction(tip, note)
-        introduction = self._introductions[key]
-        return repository.move_sources(introduction, note) if introduction else frozenset()
+    def _claims(
+        self, repository: GitProjectRepository, tip: str, notes: Iterable[UUID]
+    ) -> dict[UUID, frozenset[UUID]]:
+        """For each note, the move sources on the commit that last introduced it at `tip`.
+
+        Introductions and trailers never change for a fixed tip or commit, so both are
+        cached; a waiting project re-classifies on every pass.
+        """
+        notes = list(notes)
+        path = str(repository.path)
+        # Read into locals: another thread may clear a full cache meanwhile.
+        introductions = {
+            note: self._introductions[key]
+            for note in notes
+            if (key := (path, tip, note)) in self._introductions
+        }
+        if missing := [note for note in notes if note not in introductions]:
+            introductions |= repository.last_introductions(tip, missing)
+            self._remember(
+                self._introductions, {(path, tip, note): introductions[note] for note in missing}
+            )
+        commits = {commit for commit in introductions.values() if commit is not None}
+        trailers = {
+            commit: self._trailers[key]
+            for commit in commits
+            if (key := (path, commit)) in self._trailers
+        }
+        if unread := [commit for commit in commits if commit not in trailers]:
+            trailers |= repository.moved_notes_of(unread)
+            self._remember(self._trailers, {(path, commit): trailers[commit] for commit in unread})
+        return {
+            note: trailers[commit].get(note, frozenset()) if commit is not None else frozenset()
+            for note, commit in introductions.items()
+        }
+
+    @staticmethod
+    def _remember[K, V](cache: dict[K, V], entries: Mapping[K, V]) -> None:
+        if len(cache) + len(entries) > _INTRODUCTION_CACHE_LIMIT:
+            cache.clear()
+        cache.update(entries)
 
     def deferral(self, foreign: ForeignNotes) -> GitProjectionDeferred:
         return GitProjectionDeferred(

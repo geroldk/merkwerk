@@ -12,7 +12,7 @@ import json
 import os
 import re
 import subprocess
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -36,6 +36,8 @@ _COMMIT_ID = re.compile(r"[0-9a-f]{40}\Z")
 _RESERVED_PREFIX = "basic-memory-"
 _RESERVED_SPELLING = re.compile(r"(basic-memory)-", re.IGNORECASE)
 MOVED_NOTE_TRAILER = "Basic-Memory-Moved-Note"
+# Manifests read per `cat-file --batch` call while looking for a note's introduction.
+_MANIFEST_BATCH = 64
 _MOVED_NOTE_VALUE = re.compile(
     r"(?P<note>[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}) from "
     r"(?P<source>[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})\Z"
@@ -649,82 +651,110 @@ class GitProjectRepository:
         return frozenset(UUID(note["external_id"]) for note in data["notes"])
 
     def move_sources(self, commit_id: str, external_id: UUID) -> frozenset[UUID]:
-        """The source projects a `Basic-Memory-Moved-Note` trailer of this commit names.
+        """The source projects a `Basic-Memory-Moved-Note` trailer of this commit names."""
+        return self.moved_notes_of([commit_id])[commit_id].get(external_id, frozenset())
+
+    def moved_notes_of(self, commit_ids: Iterable[str]) -> dict[str, dict[UUID, frozenset[UUID]]]:
+        """Each commit's move trailers (note -> source projects), in one Git call.
 
         Git parses the trailers, so the text only counts in BM's own final trailer
         block; a caller's message can never hold the prefix (see `prepare`).
         """
-        _require_commit_id(commit_id)
-        values = self._git(
-            "show",
-            "--no-patch",
-            f"--format=%(trailers:key={MOVED_NOTE_TRAILER},valueonly)",
-            commit_id,
-            "--",
+        commits = list(dict.fromkeys(commit_ids))
+        for commit in commits:
+            _require_commit_id(commit)
+        found: dict[str, dict[UUID, set[UUID]]] = {commit: {} for commit in commits}
+        if not commits:
+            return {}
+        output = self._git(
+            "log",
+            "--no-walk=unsorted",
+            "--stdin",
+            f"--format=%H%x00%(trailers:key={MOVED_NOTE_TRAILER},valueonly)%x01",
+            input_bytes="".join(f"{commit}\n" for commit in commits).encode(),
         ).decode("utf-8")
-        sources: set[UUID] = set()
-        for line in values.splitlines():
-            found = _MOVED_NOTE_VALUE.fullmatch(line.strip())
-            if found is not None and UUID(found["note"]) == external_id:
-                sources.add(UUID(found["source"]))
-        return frozenset(sources)
+        for record in output.split("\x01"):
+            commit, _, values = record.strip().partition("\0")
+            if commit not in found:
+                continue
+            for line in values.splitlines():
+                if (value := _MOVED_NOTE_VALUE.fullmatch(line.strip())) is not None:
+                    found[commit].setdefault(UUID(value["note"]), set()).add(UUID(value["source"]))
+        return {
+            commit: {note: frozenset(sources) for note, sources in notes.items()}
+            for commit, notes in found.items()
+        }
 
     def last_introduction(self, tip: str, external_id: UUID) -> str | None:
-        """The commit that last brought `external_id` into the line ending at `tip`.
+        """The commit that last brought `external_id` into the line ending at `tip`."""
+        return self.last_introductions(tip, [external_id])[external_id]
 
-        The walk follows first parents: a note a merge takes from its other parent was
+    def last_introductions(self, tip: str, external_ids: Iterable[UUID]) -> dict[UUID, str | None]:
+        """For each note, the commit that last brought it into the line ending at `tip`.
+
+        The walk follows first parents, newest first, reading manifests in batches and
+        stopping as soon as every note is placed: a recently moved note costs a few
+        commits, not the whole history. A note a merge takes from its other parent was
         introduced over there, unless the first parent already had it once and dropped
-        it (a merge that keeps a deleted note brings it back itself). None when the
-        note was never in this line.
+        it (a merge that keeps a deleted note brings it back itself). None when the note
+        was never in this line.
         """
         _require_commit_id(tip)
-        commit = tip
-        while True:
-            added = self._last_added(commit, external_id)
-            if added is None:
-                return None
-            parents = self._parents(added)
-            if len(parents) < 2:
-                return added
-            holder = next(
-                (parent for parent in parents[1:] if external_id in self.note_ids_at(parent)),
-                None,
-            )
-            bases = self.merge_bases(parents[0], holder) if holder is not None else []
-            if (
-                holder is None
-                or not bases
-                or any(external_id in self.note_ids_at(base) for base in bases)
-            ):
-                return added
-            commit = holder
+        pending = {str(note): note for note in external_ids}
+        found: dict[UUID, str | None] = {note: None for note in pending.values()}
+        lineage = self._git("rev-list", "--first-parent", "--parents", tip).decode("ascii")
+        line = [entry.split() for entry in lineage.splitlines()]
+        index, newer = 0, None
+        while pending and index < len(line):
+            batch = line[index : index + _MANIFEST_BATCH]
+            manifests = self._note_id_strings([entry[0] for entry in batch])
+            for entry in batch:
+                commit, parents = entry[0], entry[1:]
+                ids = manifests[commit]
+                if newer is not None:
+                    later_commit, later_ids, later_parents = newer
+                    for key in [key for key in pending if key in later_ids and key not in ids]:
+                        found[pending.pop(key)] = self._through_merge(
+                            later_commit, later_parents, UUID(key)
+                        )
+                newer = (commit, ids, parents)
+            index += len(batch)
+        if newer is not None and not line[-1][1:]:
+            # The root commit holds what no older commit can have introduced.
+            for key in [key for key in pending if key in newer[1]]:
+                found[pending.pop(key)] = newer[0]
+        return found
 
-    def _last_added(self, tip: str, external_id: UUID) -> str | None:
-        """The newest first-parent commit whose manifest gained `external_id`."""
-        # Pickaxe finds the commits where the UUID's count in the manifest changed; each
-        # is checked against its parent, so a path that spells the UUID cannot mislead.
-        changed = self._git(
-            "log",
-            "--first-parent",
-            "--diff-merges=first-parent",
-            "--no-patch",
-            "--format=%H",
-            f"-S{external_id}",
-            tip,
-            "--",
-            GIT_PROJECT_MANIFEST_PATH,
-        ).decode("ascii")
-        for commit in changed.split():
-            if external_id not in self.note_ids_at(commit):
-                continue
-            parents = self._parents(commit)
-            if not parents or external_id not in self.note_ids_at(parents[0]):
-                return commit
-        return None
+    def _through_merge(self, added: str, parents: list[str], external_id: UUID) -> str:
+        """`added` gained the note over its first parent; a merge may only have carried it."""
+        if len(parents) < 2:
+            return added
+        holder = next(
+            (parent for parent in parents[1:] if external_id in self.note_ids_at(parent)), None
+        )
+        if holder is None:
+            return added
+        bases = self.merge_bases(parents[0], holder)
+        if not bases or any(external_id in self.note_ids_at(base) for base in bases):
+            return added
+        return self.last_introduction(holder, external_id) or added
 
-    def _parents(self, commit_id: str) -> list[str]:
-        line = self._git("rev-list", "--parents", "--max-count=1", commit_id).decode("ascii")
-        return line.split()[1:]
+    def _note_id_strings(self, commits: list[str]) -> dict[str, frozenset[str]]:
+        """The manifest note UUIDs (as text) of several commits, in one `cat-file --batch`."""
+        requests = "".join(f"{commit}:{GIT_PROJECT_MANIFEST_PATH}\n" for commit in commits)
+        output = self._git("cat-file", "--batch", input_bytes=requests.encode())
+        result: dict[str, frozenset[str]] = {}
+        position = 0
+        for commit in commits:
+            end = output.index(b"\n", position)
+            header = output[position:end].split()
+            if len(header) != 3 or header[1] != b"blob":
+                raise GitPublicationError("Commit has no Basic Memory manifest")
+            size = int(header[2])
+            data = json.loads(output[end + 1 : end + 1 + size])
+            result[commit] = frozenset(note["external_id"] for note in data["notes"])
+            position = end + 1 + size + 1
+        return result
 
     def committed_at(self, commit_id: str) -> datetime:
         _require_commit_id(commit_id)

@@ -237,3 +237,46 @@ async def test_an_owner_wakes_only_the_projects_waiting_for_it(host):
     host.identities.nudge_waiting()
     assert woken == ["b", "c", "c"]
     assert host.identities.describe(-1) == "another project"
+
+
+@pytest.mark.asyncio
+async def test_custody_skips_unknown_and_repeated_sources(host, session_maker):
+    """A chain that names a project this host does not know, or loops, ends cleanly."""
+    looping, unknown, stranger = uuid4(), uuid4(), uuid4()
+    a_id = host.projects["a"].project_id
+    publish(host.repo("a"), add={"l.md": looping, "u.md": unknown})
+    await own_in_sql(session_maker, a_id, looping)
+    await own_in_sql(session_maker, a_id, unknown)
+    # b names c for `looping` and an unknown project for `unknown`; c names b for both.
+    publish(
+        host.repo("b"),
+        add={"l.md": looping, "u.md": unknown},
+        moved={looping: host.uuid("c"), unknown: stranger},
+    )
+    publish(host.repo("b"), remove=(looping, unknown))
+    publish(
+        host.repo("c"),
+        add={"l.md": looping, "u.md": unknown},
+        moved={looping: host.uuid("b"), unknown: host.uuid("b")},
+    )
+    # No chain reaches a, and a took neither by a move: both chains are still travelling.
+    assert (await classify(host, session_maker, "c")).deferred == {
+        looping: a_id,
+        unknown: a_id,
+    }
+
+
+@pytest.mark.asyncio
+async def test_an_empty_manifest_has_no_foreign_notes(host, session_maker):
+    foreign = await classify(host, session_maker, "b")
+    assert foreign.deferred == {} and foreign.duplicates == {}
+    async with session_maker() as session:
+        assert await host.identities.sql_owners(session, 1, []) == {}
+
+
+def test_full_caches_start_over():
+    from basic_memory.repository import git_host_identities as module
+
+    cache = {str(index): index for index in range(module._INTRODUCTION_CACHE_LIMIT)}
+    GitHostIdentities._remember(cache, {"new": -1})
+    assert cache == {"new": -1}
