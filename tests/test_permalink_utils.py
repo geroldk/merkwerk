@@ -1,6 +1,9 @@
 """Tests for canonical permalink utility helpers."""
 
+import pytest
+
 from basic_memory.utils import (
+    build_permalink_candidates_after_file_paths,
     build_permalink_resolution_candidates,
     own_project_remainder,
     build_qualified_permalink_reference,
@@ -132,6 +135,74 @@ def test_non_markdown_identifiers_keep_their_extension():
     assert "main/notes/foo" in build_permalink_resolution_candidates("main/notes/foo.md", "main")
     # A version-like title is not a file extension.
     assert "main/release-2.0" in build_permalink_resolution_candidates("Release 2.0", "main")
+
+
+@pytest.mark.parametrize(
+    "identifier,include_project,workspace,expected",
+    [
+        # A note's permalink can end in a file suffix; routing stripped its project prefix.
+        ("threads/fix.py", True, None, ["main/threads/fix.py"]),
+        ("notes/foo.txt", True, None, ["main/notes/foo.txt"]),
+        # The caller's spelling first, then its slug, which keeps the suffix.
+        (
+            "threads/Fix in tax_costs.py",
+            True,
+            None,
+            ["main/threads/Fix in tax_costs.py", "main/threads/fix-in-tax-costs.py"],
+        ),
+        # Already qualified: the first candidates hold it verbatim.
+        ("main/threads/fix.py", True, None, []),
+        ("main::threads/fix.py", True, None, []),
+        # Short permalinks without a workspace: as for any other identifier, no route.
+        ("threads/fix.py", False, None, []),
+        # A workspace route, then the older project form, whatever the project setting.
+        (
+            "threads/fix.py",
+            True,
+            "personal",
+            ["personal/main/threads/fix.py", "main/threads/fix.py"],
+        ),
+        (
+            "threads/fix.py",
+            False,
+            "personal",
+            ["personal/main/threads/fix.py", "main/threads/fix.py"],
+        ),
+        ("personal/main/threads/fix.py", True, "personal", ["main/threads/fix.py"]),
+    ],
+)
+def test_file_suffixed_identifiers_get_routed_candidates_after_file_paths(
+    identifier, include_project, workspace, expected
+):
+    """The routes the first candidates leave out for a suffix (#1629), in their order."""
+    assert (
+        build_permalink_candidates_after_file_paths(
+            identifier, "main", include_project, workspace_permalink=workspace
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    "identifier",
+    [
+        "threads/fixnodot",
+        "notes/plan.md",
+        "Release 2.0",
+        "aufgaben/ap-0.9-host-test",
+        "threads/gd.py-in-den-katalog",
+    ],
+)
+def test_identifiers_without_a_file_suffix_get_no_candidates_after_file_paths(identifier):
+    """Their routed forms are already among the first candidates, so their meaning stays."""
+    for workspace in (None, "personal"):
+        assert (
+            build_permalink_candidates_after_file_paths(
+                identifier, "main", workspace_permalink=workspace
+            )
+            == []
+        )
+    assert build_permalink_candidates_after_file_paths("threads/fix.py", None) == []
 
 
 def test_own_project_remainder_strips_every_routing_spelling():

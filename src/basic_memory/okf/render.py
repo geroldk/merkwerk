@@ -26,6 +26,7 @@ from basic_memory.services.bulk_link_resolver import RelationTargetReference
 from basic_memory.services.link_resolver import normalize_link_text
 from basic_memory.utils import (
     build_file_path_permalink,
+    build_permalink_candidates_after_file_paths,
     build_permalink_resolution_candidates,
     generate_permalink,
 )
@@ -200,6 +201,19 @@ def convert_wikilinks(
             resolved = title_targets.get(target)
         if not rooted and resolved is None:
             resolved = targets.get(target)
+        if not rooted and resolved is None and target not in ambiguous_aliases:
+            # Trigger: the target ends in a non-Markdown file suffix (`threads/fix.py`).
+            # Why: the graph tries such a target's routed permalink only after its exact
+            #   file paths, `<target>.md` included, so a resource keeps its name (#1629)
+            #   while a note whose permalink ends that way still links.
+            # Outcome: the exact `.md` file first, then the project-qualified permalink.
+            routed = build_permalink_candidates_after_file_paths(target, project, include_project)
+            if routed:
+                known_permalinks = permalinks or {}
+                resolved = targets.get(f"{target}.md") or next(
+                    (known_permalinks[name] for name in routed if name in known_permalinks),
+                    None,
+                )
         if (
             not rooted
             and resolved is None

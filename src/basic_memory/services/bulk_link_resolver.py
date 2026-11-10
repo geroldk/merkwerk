@@ -15,6 +15,7 @@ from basic_memory.repository.entity_repository import EntityRepository, file_pat
 from basic_memory.repository.project_repository import ProjectRepository
 from basic_memory.services.link_resolver import normalize_link_text
 from basic_memory.utils import (
+    build_permalink_candidates_after_file_paths,
     build_permalink_resolution_candidates,
     generate_permalink,
     own_project_remainder,
@@ -203,6 +204,20 @@ class ProjectEntityIdentityIndex:
             path_match = self.by_file_path.get(path_with_md)
             if path_match is not None:
                 return StrictProjectLinkMatch(path_match)
+
+        # The routed permalinks of a file-suffixed identifier (`threads/fix.py`), at the
+        # point LinkResolver tries them: after the exact file paths, never past a title
+        # several notes share.
+        if not ambiguous_title:
+            for candidate_permalink in build_permalink_candidates_after_file_paths(
+                identifier,
+                self.project.permalink,
+                include_project=include_project_permalinks,
+                workspace_permalink=workspace_permalink,
+            ):
+                entity = self.by_permalink.get(candidate_permalink)
+                if entity is not None:
+                    return StrictProjectLinkMatch(entity)
 
         if has_markdown_extension or can_use_stem_path:
             alias_match = self.by_file_path_alias.get(file_path_alias(path_with_md))

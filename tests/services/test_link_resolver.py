@@ -1350,6 +1350,189 @@ async def test_non_markdown_path_beats_same_stem_markdown_permalink(
     assert markdown.permalink == f"{project_prefix}/components/core-service"
 
 
+# --- Permalinks that end in a file suffix ---
+# `Fix in tax_costs.py.md` stores `<project>/threads/fix-in-tax-costs.py`. MCP routing
+# hands the resolver that permalink without its project prefix.
+
+
+async def add_entities(
+    entity_repository: EntityRepository,
+    session_maker,
+    rows: list[tuple[str, str, str | None]],
+) -> list[EntityModel]:
+    """Add (title, file path, permalink) rows; a row without permalink is a resource."""
+    now = datetime.now(timezone.utc)
+    added = []
+    async with db.scoped_session(session_maker) as session:
+        for title, file_path, permalink in rows:
+            added.append(
+                await entity_repository.add(
+                    session,
+                    EntityModel(
+                        title=title,
+                        note_type="note" if permalink else "file",
+                        content_type="text/markdown" if permalink else "text/plain",
+                        file_path=file_path,
+                        permalink=permalink,
+                        created_at=now,
+                        updated_at=now,
+                        project_id=entity_repository.project_id,
+                    ),
+                )
+            )
+    return added
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("suffix", ["py", "txt"])
+async def test_note_permalink_ending_in_a_file_suffix_resolves_by_that_permalink(
+    entity_repository, session_maker, link_resolver, project_prefix, suffix
+):
+    """The file lives in another folder, so only the permalink can name the note."""
+    permalink = f"{project_prefix}/threads/fix-in-tax-costs.{suffix}"
+    (note,) = await add_entities(
+        entity_repository,
+        session_maker,
+        [("Fix in tax_costs", f"archive/threads/Fix in tax_costs.{suffix}.md", permalink)],
+    )
+
+    for identifier in (
+        f"threads/fix-in-tax-costs.{suffix}",
+        permalink,
+        # Not slug-shaped: the slug keeps the suffix.
+        f"threads/Fix-In-Tax_Costs.{suffix}",
+    ):
+        entity = await link_resolver.resolve_entity(identifier, strict=True)
+        assert entity is not None and entity.id == note.id, identifier
+        link = await link_resolver.resolve_link(identifier, strict=True)
+        assert link is not None and link.id == note.id, identifier
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("note_path", ["notes/foo.txt.md", "archive/Foo note.txt.md"])
+async def test_a_resource_path_beats_a_note_whose_permalink_spells_it(
+    entity_repository, session_maker, link_resolver, project_prefix, note_path
+):
+    """`notes/foo.txt` is the resource, not the note with permalink `<p>/notes/foo.txt` (#1629)."""
+    resource, note = await add_entities(
+        entity_repository,
+        session_maker,
+        [
+            ("foo.txt", "notes/foo.txt", None),
+            ("Foo note", note_path, f"{project_prefix}/notes/foo.txt"),
+        ],
+    )
+
+    for kwargs in ({"strict": True}, {}):
+        entity = await link_resolver.resolve_link("notes/foo.txt", **kwargs)
+        assert entity is not None and entity.id == resource.id, kwargs
+    entity = await link_resolver.resolve_entity("notes/foo.txt", strict=True)
+    assert entity is not None and entity.id == resource.id
+    by_path = await link_resolver.resolve_entity(note_path, strict=True)
+    assert by_path is not None and by_path.id == note.id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "title,owned_permalink",
+    [
+        # The routed candidate `<p>/threads/fix.py` is never the verbatim input.
+        ("threads/fix.py", "threads/fix.py"),
+        # Neither is the routed slug of a title that is not slug-shaped.
+        ("threads/Fix.py", "threads/fix.py"),
+        # Undotted: the routed form is among the first candidates; the guard is the same.
+        ("threads/fixnodot", "threads/fixnodot"),
+    ],
+)
+async def test_duplicate_titles_stay_ambiguous_past_the_routed_permalink(
+    entity_repository, session_maker, link_resolver, project_prefix, title, owned_permalink
+):
+    """Two notes share the identifier as title; one owns its routed permalink (#1148)."""
+    from basic_memory.services.exceptions import AmbiguousIdentifierError
+
+    await add_entities(
+        entity_repository,
+        session_maker,
+        [
+            (title, "archive/one.md", f"{project_prefix}/{owned_permalink}"),
+            (title, "archive/two.md", f"{project_prefix}/archive/two"),
+        ],
+    )
+
+    with pytest.raises(AmbiguousIdentifierError):
+        await link_resolver.resolve_entity(title, strict=True)
+    with pytest.raises(AmbiguousIdentifierError):
+        await link_resolver.resolve_link(title, strict=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("include_project", [True, False])
+async def test_workspace_route_finds_a_file_suffixed_permalink(
+    entity_repository,
+    search_service,
+    session_maker,
+    app_config,
+    link_resolver,
+    project_prefix,
+    include_project,
+):
+    """Workspace permalinks are complete whatever the project setting; older rows too."""
+    from basic_memory.workspace_context import workspace_permalink_context
+
+    current, legacy = await add_entities(
+        entity_repository,
+        session_maker,
+        [
+            ("Fix", "archive/Fix.py.md", f"team-paul/{project_prefix}/threads/fix.py"),
+            ("Legacy", "archive/Legacy.py.md", f"{project_prefix}/threads/legacy.py"),
+        ],
+    )
+    resolver = LinkResolver(
+        entity_repository,
+        search_service,
+        session_maker,
+        app_config.model_copy(update={"permalinks_include_project": include_project}),
+    )
+
+    with workspace_permalink_context("team-paul", "organization"):
+        for identifier, expected in (
+            ("threads/fix.py", current),
+            (f"team-paul/{project_prefix}/threads/fix.py", current),
+            ("threads/legacy.py", legacy),
+            (f"team-paul/{project_prefix}/threads/legacy.py", legacy),
+        ):
+            entity = await resolver.resolve_entity(identifier, strict=True)
+            assert entity is not None and entity.id == expected.id, identifier
+
+
+@pytest.mark.asyncio
+async def test_short_file_suffixed_permalinks_without_project_prefixes(
+    entity_repository, search_service, session_maker, app_config, link_resolver, project_prefix
+):
+    """Without project prefixes or a workspace, suffixed and plain identifiers get no route."""
+    short, _, _ = await add_entities(
+        entity_repository,
+        session_maker,
+        [
+            ("Short", "archive/Short.py.md", "threads/short.py"),
+            ("Qualified", "archive/Qualified.py.md", f"{project_prefix}/threads/qualified.py"),
+            ("Plain", "archive/Plain.md", f"{project_prefix}/threads/plain"),
+        ],
+    )
+    resolver = LinkResolver(
+        entity_repository,
+        search_service,
+        session_maker,
+        app_config.model_copy(update={"permalinks_include_project": False}),
+    )
+
+    entity = await resolver.resolve_entity("threads/short.py", strict=True)
+    assert entity is not None and entity.id == short.id
+    # Older project-prefixed rows are reached by their full permalink, as before.
+    assert await resolver.resolve_entity("threads/qualified.py", strict=True) is None
+    assert await resolver.resolve_entity("threads/plain", strict=True) is None
+
+
 @pytest.mark.asyncio
 async def test_workspace_qualified_title_resolves_exactly(link_resolver, project_prefix):
     """Workspace routes qualify as `<workspace>/<project>/<Title>` (#1626 review)."""

@@ -567,6 +567,31 @@ def test_ambiguous_bare_title_does_not_fall_through_to_filename():
     assert b"[Same](/Same) and [Same.md](/other.md) and [./Same.md](/Same.md)" in source
 
 
+def test_file_suffixed_permalinks_link_after_exact_file_paths():
+    """Export links a moved note by its `.py` permalink as the graph does, never past a file."""
+    snapshot = ExportSnapshot(
+        "p",
+        (
+            ExportFile("archive/Fix.py.md", b"---\ntitle: Fix\npermalink: p/threads/fix.py\n---\n"),
+            ExportFile("notes/foo.txt", b"resource"),
+            ExportFile("archive/Foo.md", b"---\ntitle: Foo\npermalink: p/notes/foo.txt\n---\n"),
+            ExportFile("mirror/x.py.md", b"---\ntitle: Mirror\npermalink: p/elsewhere\n---\n"),
+            ExportFile("archive/Claim.md", b"---\ntitle: Claim\npermalink: p/mirror/x.py\n---\n"),
+            ExportFile("one.md", b"---\ntitle: threads/dup.py\npermalink: p/threads/dup.py\n---\n"),
+            ExportFile("two.md", b"---\ntitle: threads/dup.py\n---\n"),
+            ExportFile(
+                "source.md",
+                b"[[threads/fix.py]] [[notes/foo.txt]] [[mirror/x.py]] [[threads/dup.py]]",
+            ),
+        ),
+    )
+    source = next(file.content for file in render_bundle(snapshot) if file.path == "source.md")
+    assert (
+        b"[threads/fix.py](/archive/Fix.py.md) [notes/foo.txt](/notes/foo.txt) "
+        b"[mirror/x.py](/mirror/x.py.md) [threads/dup.py](/threads/dup.py)"
+    ) in source
+
+
 @pytest.mark.parametrize(
     "yaml_title,target",
     [
