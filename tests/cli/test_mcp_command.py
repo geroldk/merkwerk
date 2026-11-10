@@ -74,6 +74,17 @@ def test_http_transports_delegate_guard_to_fastmcp(
     assert WARNING_TEXT not in result.output
 
 
+@pytest.mark.parametrize("transport", ["streamable-http", "sse"])
+def test_http_transports_give_running_calls_time_to_finish_on_a_stop(
+    transport: HttpTransport, captured_run: dict[str, Any]
+) -> None:
+    """FastMCP's own 2 s cut writes that wait for their project's write gate (B4)."""
+    result = runner.invoke(cli_app, ["mcp", "--transport", transport])
+
+    assert result.exit_code == 0, result.output
+    assert captured_run["uvicorn_config"] == {"timeout_graceful_shutdown": 30}
+
+
 def test_non_loopback_host_warns(captured_run: dict[str, Any]) -> None:
     result = runner.invoke(cli_app, ["mcp", "--transport", "sse", "--host", "0.0.0.0"])
 

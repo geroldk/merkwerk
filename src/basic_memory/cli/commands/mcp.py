@@ -23,6 +23,16 @@ class _DeferredMcpServer:
 # Keep module-level attribute for tests/monkeypatching while deferring heavy import.
 mcp_server = _DeferredMcpServer()
 
+# Constraint: FastMCP gives uvicorn 2 s to finish running requests on a stop, but a write
+#   can wait several seconds for the project's write gate (5-23 s were measured with
+#   parallel moves), and a cancelled call still finishes its atomic Git step first.
+# Why 30 s: a call that reached its turn finishes well within it, and the rest of the stop
+#   (worker and index shutdown) still fits a service manager's limit (systemd's
+#   TimeoutStopSec=120 on the reference host) before it would kill the process mid-write.
+# Outcome: uvicorn waits up to 30 s, then cancels what still runs; each such call logs
+#   one line (CancelledCallMiddleware) saying whether it published.
+HTTP_GRACEFUL_SHUTDOWN_SECONDS = 30
+
 
 def is_loopback_host(host: str) -> bool:
     """Return True when an HTTP bind host only accepts connections from this machine."""
@@ -165,4 +175,5 @@ def mcp(
             # leaves 0.0.0.0 container binds (Docker bridge) usable. FastMCP applies
             # it to both HTTP transports with FASTMCP_HTTP_ALLOWED_HOSTS/_ORIGINS.
             host_origin_protection="auto",
+            uvicorn_config={"timeout_graceful_shutdown": HTTP_GRACEFUL_SHUTDOWN_SECONDS},
         )
