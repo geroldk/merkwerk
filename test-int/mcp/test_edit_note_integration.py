@@ -292,6 +292,47 @@ All services communicate via message queues.""",
 
 
 @pytest.mark.asyncio
+async def test_slash_heading_is_read_and_edited_by_its_whole_text(mcp_server, app, test_project):
+    """Decision B3 A: "KI/ML" names the heading "KI/ML", not heading "ML" under "KI"."""
+    note = "# Slash Test\n\n## KI/ML\nliteral\n\n## KI\n### ML\nnested\n"
+
+    async with Client(mcp_server) as client:
+        await client.call_tool(
+            "bm_write",
+            {"project": test_project.name, "identifier": "test/slash.md", "content": note},
+        )
+
+        async def read(section: str) -> str:
+            result = await client.call_tool(
+                "bm_read",
+                {
+                    "project": test_project.name,
+                    "identifier": "test/slash.md",
+                    "section": section,
+                    "output_format": "json",
+                },
+            )
+            return json.loads(result.content[0].text)["content"]
+
+        assert await read("KI/ML") == "## KI/ML\nliteral\n"
+        assert await read("KI / ML") == "### ML\nnested"
+
+        await client.call_tool(
+            "bm_edit",
+            {
+                "project": test_project.name,
+                "identifier": "test/slash.md",
+                "command": "replace_section",
+                "section": "KI/ML",
+                "content": "changed",
+            },
+        )
+
+        assert await read("KI/ML") == "## KI/ML\nchanged\n"
+        assert await read("KI / ML") == "### ML\nnested"
+
+
+@pytest.mark.asyncio
 async def test_edit_note_with_observations_and_relations(mcp_server, app, test_project):
     """Test editing a note that has observations and relations, and verify they're updated."""
 

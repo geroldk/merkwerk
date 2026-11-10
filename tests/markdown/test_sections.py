@@ -13,9 +13,12 @@ from basic_memory.markdown.sections import (
     LineRange,
     NoteSlice,
     NoteSliceError,
+    SectionSelector,
+    SectionSpan,
     TRUNCATION_MARKER_TEMPLATE,
     _frontmatter_line_count,
     _token_budget_line_count,
+    locate_section,
     parse_line_range,
     parse_section_selector,
     scan_sections,
@@ -238,9 +241,32 @@ def test_parse_section_selector_accepted_forms(selector, segments, duplicate_ind
     assert parsed.duplicate_index == duplicate_index
 
 
-@pytest.mark.parametrize("selector", ["", "   ", "A//B", "/Auth", "Auth/", "[2]", "A/ /B"])
-def test_parse_section_selector_rejects_malformed_forms(selector):
+@pytest.mark.parametrize("selector", ["", "   ", "[2]"])
+def test_parse_section_selector_rejects_empty_forms(selector):
     assert parse_section_selector(selector) is None
+
+
+@pytest.mark.parametrize(
+    ("selector", "heading", "segments"),
+    [
+        ("Decisions", "Decisions", ("Decisions",)),
+        ("Ein/Aus", "Ein/Aus", ("Ein", "Aus")),
+        ("  ## Ein/Aus [1] ", "Ein/Aus", ("Ein", "Aus")),
+        ("KI / ML", "KI / ML", ("KI", "ML")),
+        ("Fragen/Antworten[1][0]", "Fragen/Antworten[1]", ("Fragen", "Antworten[1]")),
+        # Malformed as a path, but possibly a heading's whole text.
+        ("A//B", "A//B", None),
+        ("/Auth", "/Auth", None),
+        ("Auth/", "Auth/", None),
+        ("A/ /B", "A/ /B", None),
+    ],
+)
+def test_parse_section_selector_keeps_both_readings(selector, heading, segments):
+    parsed = parse_section_selector(selector)
+
+    assert parsed is not None
+    assert parsed.heading == heading
+    assert parsed.segments == segments
 
 
 # --- parse_line_range ---
@@ -594,3 +620,222 @@ def test_token_budget_single_over_budget_line_is_served_whole():
 def test_token_budget_keeps_first_line_even_when_it_exceeds_budget():
     lines = ["x" * 500, "tail"]
     assert _token_budget_line_count("\n".join(lines), lines, budget_chars=10) == 1
+
+
+# --- Headings whose own text contains "/" (decision B3 A) ---
+#
+# A heading named exactly as the selector is written, "/" included, wins over the
+# path reading. Without such a heading the path reading runs exactly as before.
+
+_SLASH_DOC = dedent("""\
+    ---
+    title: Slash
+    ---
+
+    # Top
+    ## Ein/Aus
+    literal
+    ## Ein
+    ### Aus
+    nested
+    ## Log
+    one
+    ## Log
+    two
+    ## Log[1]
+    bracketed""")
+
+
+def _selector(text: str) -> SectionSelector:
+    selector = parse_section_selector(text)
+    assert selector is not None, f"{text!r} did not parse"
+    return selector
+
+
+def _read_section(full_text: str, selector_text: str) -> NoteSlice | NoteSliceError:
+    return slice_note_content(full_text, section=_selector(selector_text))
+
+
+def _read_section_ok(full_text: str, selector_text: str) -> NoteSlice:
+    sliced = _read_section(full_text, selector_text)
+    assert isinstance(sliced, NoteSlice), sliced
+    return sliced
+
+
+def _read_section_error(full_text: str, selector_text: str) -> NoteSliceError:
+    sliced = _read_section(full_text, selector_text)
+    assert isinstance(sliced, NoteSliceError), sliced
+    return sliced
+
+
+def test_selector_naming_a_slash_heading_whole_wins_over_the_path():
+    sliced = _read_section_ok(_SLASH_DOC, "Ein/Aus")
+
+    assert sliced.content == "## Ein/Aus\nliteral"
+    assert (sliced.start_line, sliced.end_line) == (6, 7)
+    assert sliced.section == "Top/Ein/Aus"
+
+
+@pytest.mark.parametrize("selector", ["Ein / Aus", "Top/Ein/Aus", "Aus", "# Ein/### Aus"])
+def test_path_reading_stays_reachable_when_both_readings_exist(selector):
+    """Regression: spaces around the "/" or an added ancestor still mean the path."""
+    sliced = _read_section_ok(_SLASH_DOC, selector)
+
+    assert sliced.content == "### Aus\nnested"
+    assert (sliced.start_line, sliced.end_line) == (9, 10)
+
+
+@pytest.mark.parametrize(
+    ("selector", "content"),
+    [
+        ("Ein", "## Ein\n### Aus\nnested"),
+        # [n] stays the duplicate index even beside a heading literally named "Log[1]".
+        ("Log[1]", "## Log\ntwo"),
+        ("Log[1][0]", "## Log[1]\nbracketed"),
+        ("## Log[0]", "## Log\none"),
+    ],
+)
+def test_selectors_without_a_slash_keep_their_meaning(selector, content):
+    """Regression: the one-heading and the path reading coincide without a "/"."""
+    assert _read_section_ok(_SLASH_DOC, selector).content == content
+
+
+def test_slash_selector_without_such_heading_reads_as_a_path():
+    """Regression: a "## Ein/Aus" line inside a code fence is no heading."""
+    doc = "# Top\n## Ein\n### Aus\nnested\n\n```\n## Ein/Aus\n```\n# Tail\nz"
+
+    sliced = _read_section_ok(doc, "Ein/Aus")
+
+    assert sliced.content == "### Aus\nnested\n\n```\n## Ein/Aus\n```"
+    assert sliced.section == "Top/Ein/Aus"
+
+
+@pytest.mark.parametrize(
+    ("doc", "selector", "content", "label"),
+    [
+        ("# Ein/Aus\nbody", "Ein/Aus", "# Ein/Aus\nbody", "Ein/Aus"),
+        ("# A\n## B\n### Ein/Aus\nbody", "Ein/Aus", "### Ein/Aus\nbody", "A/B/Ein/Aus"),
+        ("## Ein/Aus ##\nbody", "Ein/Aus", "## Ein/Aus ##\nbody", "Ein/Aus"),
+        ("Ein/Aus\n=======\nbody", "Ein/Aus", "Ein/Aus\n=======\nbody", "Ein/Aus"),
+        ("## Ein/Aus\nbody", "  ## Ein/Aus  ", "## Ein/Aus\nbody", "Ein/Aus"),
+        ("## KI / ML\nbody", "KI / ML", "## KI / ML\nbody", "KI / ML"),
+        (
+            "## Fragen/Antworten\nbody",
+            "Fragen/Antworten[0]",
+            "## Fragen/Antworten\nbody",
+            "Fragen/Antworten",
+        ),
+        ("## Q/A[1]\nbody", "Q/A[1][0]", "## Q/A[1]\nbody", "Q/A[1]"),
+    ],
+)
+def test_slash_heading_is_found_at_any_level_and_in_any_spelling(doc, selector, content, label):
+    sliced = _read_section_ok(doc, selector)
+
+    assert sliced.content == content
+    assert sliced.section == label
+
+
+@pytest.mark.parametrize("heading", ["/etc", "Ende/", "http://x//y", "A/ /B", "/"])
+def test_heading_with_an_empty_path_segment_is_found_by_its_whole_text(heading):
+    doc = f"# Top\n## {heading}\nbody\n## Next\nz"
+
+    sliced = _read_section_ok(doc, heading)
+
+    assert sliced.content == f"## {heading}\nbody"
+
+
+@pytest.mark.parametrize("selector", ["KI/ML", "ki / ml", "KI /ML"])
+def test_slash_heading_text_compares_exactly(selector):
+    """Regression: case and the spacing around "/" must match the heading."""
+    error = _read_section_error("# Top\n## KI / ML\nbody", selector)
+
+    assert error.message.startswith(f"Section '{selector}' not found.")
+
+
+@pytest.mark.parametrize("selector", ["A//B", "/Auth", "Auth/", "A/ /B"])
+def test_malformed_path_without_such_heading_is_an_invalid_selector(selector):
+    error = _read_section_error(_SLASH_DOC, selector)
+
+    assert error.invalid_selector
+    assert error.message == f"Invalid section selector: '{selector}'"
+
+
+def test_slash_heading_duplicates_count_under_one_parent():
+    doc = "# Top\n## Ein/Aus\none\n## Ein/Aus\ntwo\n# Tail\nz"
+
+    first = _read_section_ok(doc, "Ein/Aus")
+    second = _read_section_ok(doc, "Ein/Aus[1]")
+
+    assert (first.content, first.section) == ("## Ein/Aus\none", "Top/Ein/Aus[0]")
+    assert (second.content, second.section) == ("## Ein/Aus\ntwo", "Top/Ein/Aus[1]")
+
+
+def test_slash_heading_index_out_of_range_does_not_fall_back_to_the_path():
+    doc = "# Top\n## Ein/Aus\nliteral\n## Ein\n### Aus\nfirst\n### Aus\nsecond"
+
+    error = _read_section_error(doc, "Ein/Aus[1]")
+
+    assert error.message == (
+        "Section 'Ein/Aus[1]' not found: 1 heading(s) named 'Ein/Aus' (duplicate indexes 0-0)."
+    )
+    # The path reading is still reachable by spelling it with spaces.
+    assert _read_section_ok(doc, "Ein / Aus[1]").content == "### Aus\nsecond"
+
+
+def test_slash_heading_under_two_parents_is_ambiguous_and_says_why():
+    doc = "# A\n## Ein/Aus\na\n# B\n## Ein/Aus\nb"
+
+    error = _read_section_error(doc, "Ein/Aus")
+
+    assert error.message == (
+        "Section 'Ein/Aus' is ambiguous: 2 paths end in a heading named 'Ein/Aus' "
+        "(A/Ein/Aus, B/Ein/Aus). A heading whose text contains '/' cannot be qualified "
+        "by its parent headings."
+    )
+
+
+def test_slash_paths_that_join_to_one_string_stay_apart():
+    """("A/B", "X/Y") and ("A", "B", "X/Y") both join to "A/B/X/Y"."""
+    doc = "# A/B\n## X/Y\none\n# A\n## B\n### X/Y\ntwo"
+
+    error = _read_section_error(doc, "X/Y")
+
+    assert "is ambiguous: 2 paths end in a heading named 'X/Y'" in error.message
+
+
+# --- locate_section: the edit side of the same selector ---
+
+
+def test_locate_section_names_a_slash_heading_whole():
+    span = locate_section(_SLASH_DOC, _selector("Ein/Aus"))
+
+    assert isinstance(span, SectionSpan)
+    assert (span.heading, span.label) == ("Ein/Aus", "Top/Ein/Aus")
+    # 0-indexed whole-document lines: "## Ein/Aus" is line 6, its body ends before line 8.
+    assert (span.heading_start, span.body_start, span.end) == (5, 6, 7)
+
+
+def test_locate_section_offers_slash_heading_duplicates_by_their_own_text():
+    """The joined path "Top/Ein/Aus[1]" would read back as heading "Aus" under "Ein"."""
+    doc = "# Top\n## Ein/Aus\none\n## Ein/Aus\ntwo\n## Ein\n### Aus\nx\n### Aus\ny"
+
+    refused = locate_section(doc, _selector("Ein/Aus"))
+    assert isinstance(refused, NoteSliceError)
+    assert refused.message.endswith("Name one: Ein/Aus[0], Ein/Aus[1].")
+
+    # Following the hint reaches the second "Ein/Aus", not the second "Aus".
+    span = locate_section(doc, _selector("Ein/Aus[1]"))
+    assert isinstance(span, SectionSpan)
+    assert (span.heading, span.heading_start) == ("Ein/Aus", 3)
+
+
+def test_locate_section_path_hints_keep_their_old_spelling():
+    """Regression: duplicates found by the path reading are offered by full path."""
+    doc = "# Top\n## Log\none\n## Log\ntwo"
+
+    refused = locate_section(doc, _selector("Log"))
+
+    assert isinstance(refused, NoteSliceError)
+    assert refused.message == (
+        "Multiple sections found with header 'Log'. Name one: Top/Log[0], Top/Log[1]."
+    )

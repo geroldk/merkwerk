@@ -3027,6 +3027,66 @@ async def test_get_entity_slice_param_validation_422(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("selector", ["", "[2]", "A//B", "/Auth", "Auth/", "A/ /B"])
+async def test_get_entity_malformed_selector_keeps_its_exact_422(
+    client: AsyncClient, test_project: Project, v2_project_url, session_maker, selector
+):
+    """Regression: no heading bears these texts, so they stay malformed selectors."""
+    external_id = await _seed_sliceable_note(
+        client,
+        v2_project_url,
+        test_project,
+        session_maker,
+        title="SliceMalformed",
+        content=_SLICEABLE_DOC,
+    )
+
+    response = await client.get(
+        f"{v2_project_url}/knowledge/entities/{external_id}", params={"section": selector}
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == f"Invalid section selector: '{selector}'"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("selector", "content", "label"),
+    [
+        ("KI/ML", "## KI/ML\nliteral", "Top/KI/ML"),
+        ("KI / ML", "### ML\nnested", "Top/KI/ML"),
+        ("/etc", "## /etc\nconfig", "Top//etc"),
+    ],
+)
+async def test_get_entity_section_names_a_slash_heading_whole(
+    client: AsyncClient,
+    test_project: Project,
+    v2_project_url,
+    session_maker,
+    selector,
+    content,
+    label,
+):
+    """Decision B3 A: a heading named exactly as written wins over the path reading."""
+    external_id = await _seed_sliceable_note(
+        client,
+        v2_project_url,
+        test_project,
+        session_maker,
+        title="SliceSlash",
+        content="# Top\n## KI/ML\nliteral\n## KI\n### ML\nnested\n## /etc\nconfig",
+    )
+
+    response = await client.get(
+        f"{v2_project_url}/knowledge/entities/{external_id}", params={"section": selector}
+    )
+
+    assert response.status_code == 200
+    entity = EntityResponseV2.model_validate(response.json())
+    assert (entity.content, entity.section) == (content, label)
+
+
+@pytest.mark.asyncio
 async def test_get_entity_max_tokens_truncates_with_marker(
     client: AsyncClient, test_project: Project, v2_project_url, session_maker
 ):

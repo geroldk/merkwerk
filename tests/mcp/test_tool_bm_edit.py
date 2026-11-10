@@ -421,6 +421,117 @@ async def test_a_missing_section_changes_nothing(client, test_project, command):
     assert await spec_text(test_project.name) == before
 
 
+# --- Headings whose own text contains "/" (decision B3 A) ---
+
+SLASH_SPEC = "# Spec\n\n## KI/ML\nliteral\n\n## KI\n### ML\nnested\n"
+
+SLASH_EDITS = {
+    "replace_section": "# Spec\n\n## KI/ML\nNEW\n\n## KI\n### ML\nnested\n",
+    "insert_before_section": "# Spec\n\nNEW\n\n## KI/ML\nliteral\n\n## KI\n### ML\nnested\n",
+    "insert_after_section": "# Spec\n\n## KI/ML\nNEW\n\nliteral\n\n## KI\n### ML\nnested\n",
+}
+
+PATH_EDITS = {
+    "replace_section": "# Spec\n\n## KI/ML\nliteral\n\n## KI\n### ML\nNEW\n",
+    "insert_before_section": "# Spec\n\n## KI/ML\nliteral\n\n## KI\n\nNEW\n\n### ML\nnested\n",
+    "insert_after_section": "# Spec\n\n## KI/ML\nliteral\n\n## KI\n### ML\nNEW\n\nnested\n",
+}
+
+
+async def _seed_slash_spec(project_name: str) -> None:
+    await bm_write(identifier="specs/slash.md", content=SLASH_SPEC, project=project_name)
+
+
+async def slash_body(project_name: str) -> str:
+    text = await bm_read("specs/slash.md", include_frontmatter=False, project=project_name)
+    assert isinstance(text, str)
+    return text.lstrip("\n")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", sorted(SECTION_COMMANDS))
+async def test_section_command_names_a_slash_heading_whole(client, test_project, command):
+    await _seed_slash_spec(test_project.name)
+
+    await bm_edit(
+        identifier="specs/slash.md",
+        command=command,
+        section="KI/ML",
+        content="NEW",
+        project=test_project.name,
+    )
+
+    assert await slash_body(test_project.name) == SLASH_EDITS[command]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", sorted(SECTION_COMMANDS))
+async def test_section_command_reaches_the_path_with_spaces(client, test_project, command):
+    """Regression: "KI / ML" still means heading ML under KI."""
+    await _seed_slash_spec(test_project.name)
+
+    await bm_edit(
+        identifier="specs/slash.md",
+        command=command,
+        section="KI / ML",
+        content="NEW",
+        project=test_project.name,
+    )
+
+    assert await slash_body(test_project.name) == PATH_EDITS[command]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", sorted(SECTION_COMMANDS))
+async def test_section_malformed_as_a_path_keeps_its_old_refusal(client, test_project, command):
+    """Regression: without a heading of that text, "A//B" is refused as before."""
+    await _seed_slash_spec(test_project.name)
+
+    with pytest.raises(
+        ToolError, match=r"^INVALID_ARGUMENTS: Section 'A//B' is not a heading name\."
+    ):
+        await bm_edit(
+            identifier="specs/slash.md",
+            command=command,
+            section="A//B",
+            content="x",
+            project=test_project.name,
+        )
+
+    assert await slash_body(test_project.name) == SLASH_SPEC
+
+
+@pytest.mark.asyncio
+async def test_repeated_slash_heading_is_offered_by_its_own_text(client, test_project):
+    await bm_write(
+        identifier="specs/twice.md",
+        content="# Spec\n## KI/ML\none\n## KI/ML\ntwo\n## KI\n### ML\nx\n### ML\ny\n",
+        project=test_project.name,
+    )
+
+    with pytest.raises(ToolError, match=r"Name one: KI/ML\[0\], KI/ML\[1\]\."):
+        await bm_edit(
+            identifier="specs/twice.md",
+            command="replace_section",
+            section="KI/ML",
+            content="TWO",
+            project=test_project.name,
+        )
+    await bm_edit(
+        identifier="specs/twice.md",
+        command="replace_section",
+        section="KI/ML[1]",
+        content="TWO",
+        project=test_project.name,
+    )
+
+    text = await bm_read("specs/twice.md", include_frontmatter=False, project=test_project.name)
+    assert isinstance(text, str)
+    assert (
+        text.lstrip("\n") == "# Spec\n## KI/ML\none\n## KI/ML\nTWO\n## KI\n### ML\nx\n### ML\ny\n"
+    )
+
+
 # --- find_replace counts ---
 
 

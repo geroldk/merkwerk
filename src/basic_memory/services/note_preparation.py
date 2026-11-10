@@ -652,13 +652,19 @@ def _locate_edit_section(current_content: str, section: str) -> SectionSpan:
     """Resolve an edit's section with the selector reads use.
 
     "Decisions" matches that heading at any level, "Auth/Decisions" one under
-    "Auth", and "Decisions[1]" the second of two; "## Decisions" still works.
-    A miss, an ambiguous name, or an unindexed duplicate refuses the edit.
+    "Auth", and "Decisions[1]" the second of two; "## Decisions" still works. A
+    heading whose own text is the whole selector, "/" included ("KI/ML"), wins
+    over the path reading. A miss, an ambiguous name, or an unindexed duplicate
+    refuses the edit.
     """
     selector = parse_section_selector(section)
     if selector is None:
         raise ValueError(f"Section '{section}' is not a heading name.")
     located = locate_section(current_content, selector)
+    # A selector malformed as a path ("A//B") that no heading bears whole keeps
+    # the refusal it had before headings could contain "/".
+    if isinstance(located, NoteSliceError) and located.invalid_selector:
+        raise ValueError(f"Section '{section}' is not a heading name.")
     if isinstance(located, NoteSliceError):
         raise ValueError(
             f"{located.message} Read the note and use the exact heading, including any "

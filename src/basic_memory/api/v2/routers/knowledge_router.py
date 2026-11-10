@@ -806,6 +806,8 @@ def _parse_note_slice_params(
         )
     selector: SectionSelector | None = None
     if section is not None:
+        # Only an empty selector fails here; one malformed as a path ("A//B") may
+        # still be a heading's whole text and is judged against the note's headings.
         selector = parse_section_selector(section)
         if selector is None:
             raise HTTPException(
@@ -852,7 +854,13 @@ def _apply_note_slice(
         note_title=result.title,
     )
     if isinstance(sliced, NoteSliceError):
-        raise HTTPException(status_code=404, detail=sliced.message)
+        # Trigger: the selector is malformed as a path ("A//B") and no heading bears
+        #   its whole text.
+        # Why: whether such a selector names a heading is known only once the note is
+        #   loaded; before headings could contain "/" it was refused as malformed.
+        # Outcome: the same 422 as before; every other slice miss stays a 404.
+        status_code = 422 if sliced.invalid_selector else 404
+        raise HTTPException(status_code=status_code, detail=sliced.message)
     return result.model_copy(
         update={
             "content": sliced.content,
@@ -891,7 +899,8 @@ async def get_entity_by_id(
         None,
         description="Return one section by heading text: 'Decisions', path form "
         "'Auth/Decisions' to disambiguate, bracket form 'Heading[1]' for duplicate "
-        "headings. Mutually exclusive with lines.",
+        "headings. A heading whose own text equals the whole selector, '/' included "
+        "('KI/ML'), wins over the path form. Mutually exclusive with lines.",
     ),
     lines: str | None = Query(
         None,

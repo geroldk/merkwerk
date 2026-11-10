@@ -19,9 +19,9 @@ import re
 
 from markdown_it import MarkdownIt
 
-# Path segments join on "/" for storage and selector matching. A heading whose text
-# itself contains "/" cannot be addressed by full-path selector; suffix matching and
-# duplicate indexes remain available for it.
+# Path segments join on "/" for storage and selector matching. A heading whose own
+# text contains "/" ("Ein/Aus") is addressed by that whole text: a selector equal to
+# a heading's text wins over its reading as a path (see _selector_reading).
 HEADING_PATH_SEPARATOR = "/"
 
 # Plain parser: heading boundaries need no observation/relation plugins, and the
@@ -237,25 +237,42 @@ _ATX_HEADING_PREFIX = re.compile(r"^#{1,6} ")
 
 @dataclass(frozen=True, slots=True)
 class SectionSelector:
-    """A parsed ``section=`` selector: path segments plus a duplicate index.
+    """A parsed ``section=`` selector: its two readings plus a duplicate index.
 
-    ``raw`` keeps the caller's original spelling for error messages. Bare
-    selectors address duplicate index 0 (the first section with that path).
+    ``heading`` reads the whole selector as one heading's text, "/" included;
+    ``segments`` reads it as a path split on "/", and is None when that split
+    leaves an empty segment ("/etc", "Ende/", "A//B"). Which reading applies
+    depends on the note's headings (``_selector_reading``). ``raw`` keeps the
+    caller's original spelling for error messages. Bare selectors address
+    duplicate index 0 (the first section with that path).
     """
 
     raw: str
-    segments: tuple[str, ...]
+    heading: str
+    segments: tuple[str, ...] | None
     duplicate_index: int
     # True when the caller wrote the [n] suffix; edits need it to pick among duplicates.
     indexed: bool = False
 
 
+def _selector_segment(text: str) -> str:
+    """Clean one heading name: outer whitespace and a "## "-style prefix go."""
+    return _ATX_HEADING_PREFIX.sub("", text.strip()).strip()
+
+
 def parse_section_selector(selector: str) -> SectionSelector | None:
-    """Parse a section selector, or return None when it is malformed.
+    """Parse a section selector, or return None when it names no heading at all.
 
     Accepted forms: ``"Decisions"``, ``"Auth/Decisions"`` (path form),
-    ``"Heading[1]"`` (duplicate index on the last segment), and heading-styled
-    segments like ``"## Auth"`` (leading hashes plus one space are stripped).
+    ``"Heading[1]"`` (duplicate index on the last segment), heading-styled
+    segments like ``"## Auth"`` (leading hashes plus one space are stripped), and
+    a heading whose own text contains "/" (``"Ein/Aus"``), named whole. A trailing
+    ``[n]`` is always the duplicate index, so a heading whose text itself ends in
+    ``[1]`` is named ``"Heading[1][0]"``.
+
+    Only an empty selector (``""``, ``"[2]"``) is refused here. One whose path
+    reading has an empty segment (``"/etc"``) may still be a heading's whole text,
+    which only the note's headings can tell.
     """
     text = selector.strip()
     duplicate_index = 0
@@ -265,15 +282,14 @@ def parse_section_selector(selector: str) -> SectionSelector | None:
         duplicate_index = int(suffix.group(1))
         text = text[: suffix.start()].rstrip()
 
-    segments: list[str] = []
-    for segment in text.split(HEADING_PATH_SEPARATOR):
-        cleaned = _ATX_HEADING_PREFIX.sub("", segment.strip()).strip()
-        if not cleaned:
-            return None
-        segments.append(cleaned)
+    heading = _selector_segment(text)
+    if not heading:
+        return None
+    segments = tuple(_selector_segment(part) for part in text.split(HEADING_PATH_SEPARATOR))
     return SectionSelector(
         raw=selector,
-        segments=tuple(segments),
+        heading=heading,
+        segments=segments if all(segments) else None,
         duplicate_index=duplicate_index,
         indexed=indexed,
     )
@@ -342,6 +358,10 @@ class NoteSliceError:
     """A slice failure: an unknown, ambiguous, or out-of-range section, or a past-end range."""
 
     message: str
+    # True when the selector is malformed as a path ("A//B") and no heading bears
+    # its whole text either: callers report it as the malformed selector it was
+    # before such a selector could name a heading.
+    invalid_selector: bool = False
 
 
 def _frontmatter_line_count(full_text: str) -> int:
@@ -372,28 +392,82 @@ def _section_labels(sections: tuple[MarkdownSection, ...]) -> list[str]:
     ]
 
 
+def _selector_reading(
+    sections: tuple[MarkdownSection, ...], selector: SectionSelector
+) -> tuple[tuple[str, ...], bool] | NoteSliceError:
+    """Choose how a selector reads against these headings: as one heading, or as a path.
+
+    Returns the segments to match and whether they are the one-heading reading.
+    """
+    # Trigger: the selector contains "/" and some heading's own text is exactly it
+    #   ("Ein/Aus", "/etc"); a "## Ein/Aus" line inside a code fence is no heading.
+    # Why: "/" otherwise always splits the path, so such a heading had no selector at
+    #   all; a heading named exactly as written takes precedence (decision B3 A).
+    # Outcome: the selector names that heading, and that reading's errors (ambiguous,
+    #   index out of range, unindexed duplicates) are final, with no retry as a path.
+    #   Without such a heading the path reading runs exactly as before, so a selector
+    #   without "/" is unaffected; "Ein / Aus" (spaces around the "/") or an added
+    #   ancestor still reaches heading "Aus" under "Ein".
+    if HEADING_PATH_SEPARATOR in selector.heading and any(
+        section.heading == selector.heading for section in sections
+    ):
+        return (selector.heading,), True
+    if selector.segments is None:
+        return NoteSliceError(f"Invalid section selector: '{selector.raw}'", invalid_selector=True)
+    return selector.segments, False
+
+
+@dataclass(frozen=True, slots=True)
+class _SectionMatch:
+    """The section a selector found, its label, and which reading found it."""
+
+    section: MarkdownSection
+    label: str
+    by_heading: bool
+
+
 def _find_section(
     sections: tuple[MarkdownSection, ...],
     selector: SectionSelector,
     note_title: str | None,
-) -> tuple[MarkdownSection, str] | NoteSliceError:
+) -> _SectionMatch | NoteSliceError:
     """Match a selector against scanned sections, returning the section and its label.
 
     A selector matches when a section's full path ends with the selector segments
     (suffix match), so ``"Decisions"`` finds ``("Auth", "Decisions")`` and
-    ``"Auth/Decisions"`` disambiguates. Comparison is exact and case-sensitive.
+    ``"Auth/Decisions"`` disambiguates. A selector equal to a heading's own text,
+    "/" included, matches that heading instead (``_selector_reading``). Comparison
+    is exact and case-sensitive.
     """
     note_label = f" in note '{note_title}'" if note_title else ""
-    matches = [
-        section
-        for section in sections
-        if section.path[-len(selector.segments) :] == selector.segments
-    ]
+    reading = _selector_reading(sections, selector)
+    if isinstance(reading, NoteSliceError):
+        return reading
+    segments, by_heading = reading
+    matches = [section for section in sections if section.path[-len(segments) :] == segments]
+    # The one-heading reading applies only when a heading bears its text, so only
+    # the path reading can miss.
     if not matches:
         available = ", ".join(_section_labels(sections)) or "(note has no headings)"
         return NoteSliceError(
             f"Section '{selector.raw}' not found{note_label}. Available sections: {available}."
         )
+
+    # Trigger: the selector named a heading whose text contains "/".
+    # Why: joining its path with "/" would spell a different, nested path, so the
+    #   path-form hints below would send the caller to the wrong section; and two
+    #   distinct paths can join to one string ("A/B" > "X/Y" and "A" > "B" > "X/Y").
+    # Outcome: distinct paths are told apart as tuples, and the hints name selectors
+    #   that read back to this heading.
+    if by_heading:
+        paths = list(dict.fromkeys(section.path for section in matches))
+        if len(paths) > 1:
+            listed = ", ".join(HEADING_PATH_SEPARATOR.join(path) for path in paths)
+            return NoteSliceError(
+                f"Section '{selector.raw}' is ambiguous{note_label}: {len(paths)} paths end "
+                f"in a heading named '{selector.heading}' ({listed}). A heading whose text "
+                "contains '/' cannot be qualified by its parent headings."
+            )
 
     distinct_paths = list(dict.fromkeys(section.heading_path for section in matches))
     if len(distinct_paths) > 1:
@@ -410,7 +484,12 @@ def _find_section(
                 if len(matches) > 1
                 else section.heading_path
             )
-            return section, label
+            return _SectionMatch(section=section, label=label, by_heading=by_heading)
+    if by_heading:
+        return NoteSliceError(
+            f"Section '{selector.raw}' not found{note_label}: {len(matches)} heading(s) "
+            f"named '{selector.heading}' (duplicate indexes 0-{len(matches) - 1})."
+        )
     return NoteSliceError(
         f"Section '{selector.raw}' not found{note_label}: {len(matches)} section(s) share "
         f"the path '{distinct_paths[0]}' (duplicate indexes 0-{len(matches) - 1})."
@@ -455,11 +534,14 @@ def locate_section(
     found = _find_section(sections, selector, note_title)
     if isinstance(found, NoteSliceError):
         return found
-    matched, label = found
+    matched, label = found.section, found.label
     twins = [section for section in sections if section.path == matched.path]
     if len(twins) > 1 and not selector.indexed:
         note_label = f" in note '{note_title}'" if note_title else ""
-        choices = ", ".join(f"{matched.heading_path}[{twin.duplicate_index}]" for twin in twins)
+        # A heading named whole is offered back by its own text: its joined path
+        # ("Top/Ein/Aus") would read as heading "Aus" under "Ein".
+        stem = selector.heading if found.by_heading else matched.heading_path
+        choices = ", ".join(f"{stem}[{twin.duplicate_index}]" for twin in twins)
         return NoteSliceError(
             f"Multiple sections found with header '{selector.raw}'{note_label}. "
             f"Name one: {choices}."
@@ -569,7 +651,7 @@ def slice_note_content(
         found = _find_section(scan_sections(body), section, note_title)
         if isinstance(found, NoteSliceError):
             return found
-        matched, section_label = found
+        matched, section_label = found.section, found.label
         start_line = frontmatter_lines + matched.start_line
         end_line = frontmatter_lines + matched.end_line
     elif lines is not None:

@@ -144,3 +144,59 @@ def test_restated_heading_in_any_spelling_is_dropped():
     assert replace_section_content(setext, "Decisions", "Decisions\n---\nnew") == (
         "Decisions\n---------\nnew\n## Next\n"
     )
+
+
+# --- Headings whose own text contains "/" (decision B3 A) ---
+
+BOTH_READINGS = "# Top\n## KI/ML\nliteral\n## KI\n### ML\nnested\n"
+
+
+def test_replace_section_names_a_slash_heading_whole():
+    assert replace_section_content(BOTH_READINGS, "KI/ML", "new") == (
+        "# Top\n## KI/ML\nnew\n## KI\n### ML\nnested\n"
+    )
+
+
+def test_replace_section_still_reaches_the_path_with_spaces():
+    """Regression: spaces around "/" keep the path reading (heading ML under KI)."""
+    assert replace_section_content(BOTH_READINGS, "KI / ML", "new") == (
+        "# Top\n## KI/ML\nliteral\n## KI\n### ML\nnew\n"
+    )
+
+
+@pytest.mark.parametrize(
+    ("position", "expected"),
+    [
+        ("before", "# Top\n\nadded\n\n## KI/ML\nliteral\n## KI\n### ML\nnested\n"),
+        ("after", "# Top\n## KI/ML\nadded\n\nliteral\n## KI\n### ML\nnested\n"),
+    ],
+)
+def test_insert_around_a_slash_heading(position, expected):
+    assert insert_relative_to_section(BOTH_READINGS, "KI/ML", "added", position) == expected
+
+
+def test_heading_with_an_empty_path_segment_can_be_edited():
+    note = "## /etc\nold\n## Next\n"
+
+    assert replace_section_content(note, "/etc", "new") == "## /etc\nnew\n## Next\n"
+
+
+@pytest.mark.parametrize("command", ["replace_section", "insert_before_section"])
+@pytest.mark.parametrize("section", ["A//B", "/Auth", "Auth/", "A/ /B"])
+def test_malformed_path_without_such_heading_keeps_its_old_refusal(command, section):
+    """Regression: the refusal is the one these selectors had before (B3 A)."""
+    with pytest.raises(ValueError) as refused:
+        apply_edit_operation(BOTH_READINGS, command, "x", section=section)
+
+    assert str(refused.value) == f"Section '{section}' is not a heading name."
+
+
+def test_repeated_slash_heading_is_offered_by_its_own_text():
+    note = "## KI/ML\none\n## KI/ML\ntwo\n## KI\n### ML\nx\n### ML\ny\n"
+
+    with pytest.raises(ValueError, match=r"Name one: KI/ML\[0\], KI/ML\[1\]\."):
+        replace_section_content(note, "KI/ML", "new")
+    # The offered name edits the second "KI/ML", not the second "ML" under "KI".
+    assert replace_section_content(note, "KI/ML[1]", "TWO") == (
+        "## KI/ML\none\n## KI/ML\nTWO\n## KI\n### ML\nx\n### ML\ny\n"
+    )

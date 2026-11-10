@@ -165,6 +165,44 @@ async def test_token_budget_says_where_to_continue(client, test_project):
     assert "Decision paragraph 59" not in text
 
 
+# A heading whose own text contains "/" beside the path it would otherwise spell.
+SLASH_NOTE = "# Plan\n\n## KI/ML\nliteral\n\n## KI\n### ML\nnested\n\n## /etc\nconfig\n"
+
+
+@pytest.mark.asyncio
+async def test_section_names_a_slash_heading_whole(client, test_project):
+    """Decision B3 A: a heading named exactly as written wins over the path reading."""
+    await _write(test_project.name, "Slash", SLASH_NOTE)
+
+    payload = await read_json("notes/Slash.md", project=test_project.name, section="KI/ML")
+    etc = await read_json("notes/Slash.md", project=test_project.name, section="/etc")
+
+    assert payload["content"] == "## KI/ML\nliteral\n"
+    assert payload["section"] == "Plan/KI/ML"
+    assert etc["content"] == "## /etc\nconfig"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("section", ["KI / ML", "Plan/KI/ML", "ML"])
+async def test_section_path_reading_stays_reachable(client, test_project, section):
+    """Regression: spaces around the "/" or an ancestor still mean ML under KI."""
+    await _write(test_project.name, "Slash", SLASH_NOTE)
+
+    payload = await read_json("notes/Slash.md", project=test_project.name, section=section)
+
+    assert payload["content"] == "### ML\nnested\n"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("section", ["A//B", "Goals/"])
+async def test_section_malformed_as_a_path_keeps_its_old_error(client, test_project, section):
+    """Regression: without a heading of that text, the selector is still invalid."""
+    await _write(test_project.name, "Plan", LONG_NOTE)
+
+    with pytest.raises(ToolError, match=f"Invalid section selector: '{section}'"):
+        await bm_read("notes/Plan.md", project=test_project.name, section=section)
+
+
 @pytest.mark.asyncio
 async def test_first_lines_via_end_line(client, test_project):
     # There is no `head` parameter; end_line alone reads from the top.
