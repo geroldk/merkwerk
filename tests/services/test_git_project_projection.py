@@ -1,6 +1,7 @@
 """Real SQL/Git tests for identity restoration and conservative adoption."""
 
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
@@ -496,3 +497,35 @@ async def test_content_appearing_after_an_absence_read_is_not_overwritten(
         assert content is not None
         assert content.markdown_content == markdown
         assert content.db_version == 1
+
+
+@pytest.mark.asyncio
+async def test_a_published_move_keeps_times_and_repoints_conflict_keys(
+    repository, test_project, session_maker
+):
+    """The layout UPDATE skips Entity's validators; it must do what they would."""
+    note_id = uuid4()
+    timed = (
+        f"---\ntitle: A\ntype: note\npermalink: {test_project.name}/notes/a\n"
+        "created: '2025-01-02T03:04:05+00:00'\nmodified: '2025-02-03T04:05:06+00:00'\n"
+        "---\n\nOriginal\n"
+    )
+    publish(repository, timed, note_id)
+    await project_git_content(repository, project_id=test_project.id, session_maker=session_maker)
+    publish(repository, timed, note_id, path="archive/Moved Note.md")
+
+    moved = await project_git_content(
+        repository, project_id=test_project.id, session_maker=session_maker
+    )
+
+    assert moved.notes_moved == 1
+    async with session_maker() as session:
+        entity = await session.scalar(select(Entity).where(Entity.external_id == str(note_id)))
+        assert entity is not None
+        assert (entity.file_path_key, entity.file_path_permalink) == (
+            "archive/moved note.md",
+            "archive/moved-note",
+        )
+        # The same instants, not the UTC wall time read back as local time.
+        assert entity.created_at == datetime(2025, 1, 2, 3, 4, 5, tzinfo=UTC)
+        assert entity.updated_at == datetime(2025, 2, 3, 4, 5, 6, tzinfo=UTC)

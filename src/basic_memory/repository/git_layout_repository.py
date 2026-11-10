@@ -8,12 +8,14 @@ from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from basic_memory.models import Entity, GitFileRetirement, NoteContent
+from basic_memory.models.knowledge import file_path_conflict_columns
 from basic_memory.repository.entity_repository import AcceptedPendingEntityWrite
 from basic_memory.repository.git_projection_repository import (
     GitProjectionConflict,
     GitProjectionContentBasis,
 )
 from basic_memory.repository.note_content_repository import NoteContentVersionConflict
+from basic_memory.utils import ensure_timezone_aware
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,18 +152,23 @@ class GitLayoutRepository:
             )
         for note in moved:
             fields = target[note.external_id].fields
+            # A Core UPDATE skips Entity's validators. Set what they would: the conflict
+            # keys of the new path (else a later write at the vacated path is refused as
+            # "equivalent") and times as local instants (else SQLite keeps an aware UTC
+            # value as naive wall time, and the note reads back shifted by the offset).
             await session.execute(
                 update(Entity)
                 .where(Entity.id == note.entity_id)
                 .values(
                     file_path=fields.file_path,
+                    **file_path_conflict_columns(fields.file_path),
                     permalink=fields.permalink,
                     title=fields.title,
                     note_type=fields.note_type,
                     entity_metadata=fields.entity_metadata,
                     content_type=fields.content_type,
-                    created_at=fields.created_at,
-                    updated_at=fields.updated_at,
+                    created_at=ensure_timezone_aware(fields.created_at).astimezone(),
+                    updated_at=ensure_timezone_aware(fields.updated_at).astimezone(),
                     checksum=None,
                     mtime=None,
                     size=None,
