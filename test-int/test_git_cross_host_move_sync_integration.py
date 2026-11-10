@@ -361,6 +361,28 @@ async def test_one_note_moved_to_two_projects_on_two_hosts_is_refused_by_name(
             assert again.last_attempt.reason == "invalid_incoming"
 
 
+@pytest.mark.asyncio
+async def test_a_git_error_during_validation_shows_no_raw_detail(
+    host_setup, config_manager, tmp_path, monkeypatch
+):
+    """failure_detail carries BM's own words only; Git stderr can hold host paths."""
+    from basic_memory.api.app import app
+    from basic_memory.repository.git_project_repository import GitPublicationError
+
+    hosted = Hosted(host_setup)
+    hosted.clone_peers(config_manager, tmp_path)
+    peer_publish(hosted.peers["a"], add={"n.md": (canonical("N", "n.md"), uuid4())})
+
+    def failing(self, attempt_id, commit_id):
+        raise GitPublicationError("fatal: /private/host/path/project.git is broken")
+
+    monkeypatch.setattr(GitProjectRepository, "incoming_snapshots", failing)
+    async with app.router.lifespan_context(app):
+        result = await hosted.sync("a")
+        assert result.last_attempt.reason == "invalid_incoming"
+        assert result.failure_detail is None
+
+
 # --- Merges ---
 
 

@@ -340,8 +340,11 @@ class GitSyncService:
                     refused = error  # the caller must see why its decisions were not applied
                 if failure_reason == "invalid_incoming":
                     # The record keeps only the reason; the words (which UUID, which
-                    # projects) go to the log and to the status of this attempt.
-                    self._failure = (attempt.attempt_id, str(error))
+                    # projects) go to the log and, when BM wrote them itself, to the status
+                    # of this attempt. Git and OS errors can carry stderr and host paths,
+                    # which responses never show.
+                    if isinstance(error, (ValueError, GitTransactionError)):
+                        self._failure = (attempt.attempt_id, str(error))
                     logger.warning(
                         "Git sync refused incoming history",
                         project_id=self.runtime.pipeline.project_id,
