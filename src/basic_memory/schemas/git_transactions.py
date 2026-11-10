@@ -108,7 +108,9 @@ class GitTransactionCommit(GitTransactionControl):
     @field_validator("message")
     @classmethod
     def require_safe_message(cls, value: str) -> str:
-        if not value.strip() or "Basic-Memory-Transaction:" in value or "\0" in value:
+        # Basic-Memory-* trailers are BM's own evidence (transaction, moved note): the
+        # prefix is refused anywhere and in any case, as GitProjectRepository.prepare does.
+        if not value.strip() or "basic-memory-" in value.casefold() or "\0" in value:
             raise ValueError("Commit message must omit reserved transaction evidence")
         return value
 

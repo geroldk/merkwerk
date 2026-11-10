@@ -8,7 +8,7 @@ lives in private candidate refs, never in an indexed root or published branch.
 import hashlib
 import os
 import secrets
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -325,7 +325,13 @@ class GitTransactionRepository:
             return self.status_value(self.renew(record))
 
     def commit(
-        self, transaction_id: UUID, key: str, *, expected_revision: int, message: str
+        self,
+        transaction_id: UUID,
+        key: str,
+        *,
+        expected_revision: int,
+        message: str,
+        moved_notes: Mapping[UUID, UUID] | None = None,
     ) -> GitTransactionStatus:
         with self.locked():
             self.maintain_locked()
@@ -340,6 +346,7 @@ class GitTransactionRepository:
                 files=snapshot.files,
                 note_ids=snapshot.manifest.note_ids,
                 message=message,
+                moved_notes=moved_notes,
             )
             try:
                 publication = self.repository.publish(candidate)

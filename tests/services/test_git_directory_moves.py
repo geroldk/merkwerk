@@ -61,6 +61,26 @@ def test_every_note_under_the_folder_moves_with_its_id_and_permalink():
     assert plan.message == "Move drafts/ to archive/drafts/ (2 notes)"
 
 
+def test_a_folder_spelled_like_a_bm_trailer_still_has_a_publishable_message(tmp_path):
+    """Git trailer keys ignore case, so prepare() refuses `Basic-Memory-` in any message;
+    a folder of that name is caller text and must not make the move fail (I1)."""
+    from basic_memory.repository.git_project_repository import GitProjectRepository
+
+    files, ids = tree("Basic-Memory-x/a.md")
+    plan = plan_git_directory_move(files, ids, "Basic-Memory-x", "basic-memory-y")
+    assert plan.message == "Move Basic-Memory\u2011x/ to basic-memory\u2011y/ (1 notes)"
+    repository = GitProjectRepository.create(tmp_path / "project.git")
+    moved = {move.file_path: files[move.previous_file_path] for move in plan.moves}
+    prepared = repository.prepare(
+        transaction_id=uuid4(),
+        base_commit=repository.head(),
+        files=moved,
+        note_ids={move.file_path: move.external_id for move in plan.moves},
+        message=plan.message,
+    )
+    assert prepared.changed
+
+
 def test_a_folder_known_only_through_notes_deeper_down_moves():
     files, ids = tree("a/b/c/x.md")
 

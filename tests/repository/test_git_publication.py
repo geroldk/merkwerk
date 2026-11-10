@@ -439,3 +439,163 @@ def test_only_published_history_can_authorize_older_sql_content(
     assert repository.contains_published_note_content(second.commit_id, "a.md", "current")
     assert not repository.contains_published_note_content(second.commit_id, "a.md", "private")
     assert not repository.contains_published_note_content(second.commit_id, "other.md", "old")
+
+
+# --- Ownership evidence (I1): move trailers and the commit that introduced a note ---
+
+
+def publish_ids(
+    repository: GitProjectRepository,
+    note_ids: dict[str, UUID],
+    *,
+    base: str | None = None,
+    moved_notes: dict[UUID, UUID] | None = None,
+    message: str = "Publish Basic Memory notes",
+) -> str:
+    """Publish exactly `note_ids` (each note's text is its path) on `base` or the head."""
+    prepared = repository.prepare(
+        transaction_id=uuid4(),
+        base_commit=base or repository.head(),
+        files={path: path for path in note_ids},
+        note_ids=note_ids,
+        message=message,
+        moved_notes=moved_notes,
+    )
+    return repository.publish(prepared).commit_id
+
+
+def test_moved_note_trailer_is_written_and_read_as_a_real_trailer(
+    repository: GitProjectRepository,
+) -> None:
+    note, source = uuid4(), uuid4()
+    prepared = repository.prepare(
+        transaction_id=uuid4(),
+        base_commit=repository.head(),
+        files={"moved.md": "moved"},
+        note_ids={"moved.md": note},
+        message="Move other/moved.md -> moved.md",
+        moved_notes={note: source},
+    )
+    # The evidence is readable on a private candidate already, before publication.
+    assert repository.move_sources(prepared.commit_id, note) == {source}
+    assert repository.move_sources(prepared.commit_id, uuid4()) == frozenset()
+    repository.publish(prepared)
+    message = repository._git("log", "-1", "--format=%B").decode()
+    assert message.endswith(
+        f"Basic-Memory-Transaction: {prepared.transaction_id}\n"
+        f"Basic-Memory-Moved-Note: {note} from {source}\n\n"
+    )
+    assert repository.move_sources(repository.head(), note) == {source}
+
+
+def test_move_text_outside_bms_trailer_block_is_no_evidence(
+    repository: GitProjectRepository,
+) -> None:
+    note, source = uuid4(), uuid4()
+    publish_ids(repository, {"n.md": note})
+    # A commit BM did not write (raw Git), with the text in the body and mid-line.
+    tree = repository._git("rev-parse", "HEAD^{tree}").strip().decode()
+    body = (
+        f"Import\n\nBasic-Memory-Moved-Note: {note} from {source}\n\n"
+        f"see Basic-Memory-Moved-Note: {note} from {source}\n"
+    )
+    commit = (
+        repository._git("commit-tree", tree, "-p", repository.head(), input_bytes=body.encode())
+        .strip()
+        .decode()
+    )
+    assert repository.move_sources(commit, note) == frozenset()
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Move Basic-Memory-Moved-Note: x",
+        "Move\n\n Basic-Memory-Moved-Note: x",
+        "Move\n\nbasic-memory-moved-note: x",
+        "Move\n\nBASIC-MEMORY-TRANSACTION: x",
+    ],
+)
+def test_prepare_refuses_the_reserved_prefix_anywhere_and_in_any_case(
+    repository: GitProjectRepository, message: str
+) -> None:
+    with pytest.raises(ValueError, match="reserved"):
+        publish_ids(repository, {"n.md": uuid4()}, message=message)
+
+
+def test_a_moved_note_must_be_new_here_and_come_from_another_project(
+    repository: GitProjectRepository,
+) -> None:
+    present, absent = uuid4(), uuid4()
+    publish_ids(repository, {"n.md": present})
+    own = repository.snapshot().manifest.project_external_id
+    for moved in ({present: uuid4()}, {absent: uuid4()}):
+        with pytest.raises(ValueError, match="moved note"):
+            publish_ids(repository, {"n.md": present}, moved_notes=moved)
+    with pytest.raises(ValueError, match="moved note"):
+        publish_ids(repository, {"n.md": present, "m.md": absent}, moved_notes={absent: own})
+
+
+def test_manifest_readers_return_identities_only(repository: GitProjectRepository) -> None:
+    note = uuid4()
+    first = repository.head()
+    publish_ids(repository, {"n.md": note})
+    assert repository.published_note_ids() == {note}
+    assert repository.note_ids_at(first) == frozenset()
+    assert repository.note_ids_at(repository.head()) == {note}
+
+
+def test_last_introduction_is_bound_to_the_current_life_of_the_note(
+    repository: GitProjectRepository,
+) -> None:
+    note, other, source = uuid4(), uuid4(), uuid4()
+    assert repository.last_introduction(repository.head(), note) is None
+    moved_in = publish_ids(repository, {"n.md": note}, moved_notes={note: source})
+    publish_ids(repository, {"n.md": note, "o.md": other})
+    assert repository.last_introduction(repository.head(), note) == moved_in
+    # Round trip: the note leaves, comes back without a move, and the old trailer must
+    # no longer count for it.
+    publish_ids(repository, {"o.md": other})
+    gone = repository.head()
+    assert repository.last_introduction(gone, note) == moved_in
+    back = publish_ids(repository, {"o.md": other, "again.md": note})
+    assert repository.last_introduction(repository.head(), note) == back
+    assert repository.move_sources(back, note) == frozenset()
+    # A path that spells the UUID changes its count in the manifest too; it is ignored.
+    publish_ids(repository, {"o.md": other, "again.md": note, f"{note}.md": uuid4()})
+    assert repository.last_introduction(repository.head(), note) == back
+
+
+def merge(repository: GitProjectRepository, local: str, remote: str, note_ids: dict[str, UUID]):
+    """A raw two-parent merge commit published on `local`."""
+    tree = repository.prepare(
+        transaction_id=uuid4(), base_commit=local, files={p: p for p in note_ids}, note_ids=note_ids
+    )
+    tree_id = repository._git("rev-parse", f"{tree.commit_id}^{{tree}}").strip().decode()
+    commit = (
+        repository._git("commit-tree", tree_id, "-p", local, "-p", remote, input_bytes=b"Merge\n")
+        .strip()
+        .decode()
+    )
+    repository._git("update-ref", "refs/heads/main", commit, local)
+    return commit
+
+
+def test_last_introduction_through_merges(repository: GitProjectRepository) -> None:
+    kept, added, source = uuid4(), uuid4(), uuid4()
+    base = publish_ids(repository, {"kept.md": kept})
+    # Remote side: a move brings a new note in.
+    remote = publish_ids(
+        repository, {"kept.md": kept, "added.md": added}, base=base, moved_notes={added: source}
+    )
+    repository._git("update-ref", "refs/heads/main", base, remote)
+    # Local side: the kept note is deleted.
+    local = publish_ids(repository, {}, base=base)
+    merged = merge(repository, local, remote, {"kept.md": kept, "added.md": added})
+    # The merge took `added` from the remote side, where the move introduced it ...
+    assert repository.last_introduction(merged, added) == remote
+    assert repository.move_sources(repository.last_introduction(merged, added) or "", added) == {
+        source
+    }
+    # ... but the merge itself brings back `kept`, which the local side had and dropped.
+    assert repository.last_introduction(merged, kept) == merged

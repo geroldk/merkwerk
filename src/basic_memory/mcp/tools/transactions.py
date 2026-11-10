@@ -80,7 +80,12 @@ async def bm_transaction(
     ] = "draft",
     message: Annotated[
         str,
-        Field(description="For commit: Git message; reserved transaction trailers are forbidden."),
+        Field(
+            description=(
+                "For commit: Git message. It must not contain 'Basic-Memory-' in any case: "
+                "BM reserves that prefix for its own commit trailers."
+            )
+        ),
     ] = "Publish Basic Memory transaction",
     source_transaction_id: Annotated[
         UUID | None,

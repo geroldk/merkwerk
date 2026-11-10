@@ -8,6 +8,7 @@ single branch update publishes bytes and evidence together. SQLite stays outside
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import subprocess
@@ -30,7 +31,28 @@ from basic_memory.schemas.git_project import (
 PUBLISHED_REF = "refs/heads/main"
 _COMMIT_ID = re.compile(r"[0-9a-f]{40}\Z")
 # Basic-Memory-* trailers are evidence written only by BM itself, never by a caller's message.
-_RESERVED_TRAILER = re.compile(r"^Basic-Memory-[A-Za-z-]+:", re.MULTILINE)
+# Git reads trailer keys without regard to case, and a line that starts with blanks
+# continues the trailer above it, so the whole prefix is refused anywhere in a message.
+_RESERVED_PREFIX = "basic-memory-"
+_RESERVED_SPELLING = re.compile(r"(basic-memory)-", re.IGNORECASE)
+MOVED_NOTE_TRAILER = "Basic-Memory-Moved-Note"
+_MOVED_NOTE_VALUE = re.compile(
+    r"(?P<note>[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}) from "
+    r"(?P<source>[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})\Z"
+)
+
+
+def holds_reserved_evidence(message: str) -> bool:
+    """Whether a commit message spells BM's own trailer prefix, in any case."""
+    return _RESERVED_PREFIX in message.casefold()
+
+
+def quote_in_message(text: str) -> str:
+    """Caller text (a folder name) for a message BM builds: never a trailer prefix.
+
+    A non-breaking hyphen reads the same to a person and is not the reserved spelling.
+    """
+    return _RESERVED_SPELLING.sub("\\1\u2011", text)
 
 
 class GitPublicationError(RuntimeError):
@@ -537,16 +559,34 @@ class GitProjectRepository:
         files: Mapping[str, str],
         note_ids: Mapping[str, UUID],
         message: str = "Publish Basic Memory notes",
+        moved_notes: Mapping[UUID, UUID] | None = None,
     ) -> PreparedGitPublication:
-        """Prepare a complete candidate without publishing bytes or holding a lock."""
+        """Prepare a complete candidate without publishing bytes or holding a lock.
+
+        `moved_notes` (note UUID -> source project UUID) names notes this commit takes
+        over from another project; each becomes a `Basic-Memory-Moved-Note` trailer, the
+        proof the ownership rules read (see `move_sources`).
+        """
         _require_commit_id(base_commit)
-        if not message.strip() or _RESERVED_TRAILER.search(message) or "\0" in message:
+        if not message.strip() or holds_reserved_evidence(message) or "\0" in message:
             raise ValueError(
                 "Commit message must be nonempty and omit reserved transaction evidence"
             )
         base = self.snapshot(base_commit)
         if set(note_ids) != set(files):
             raise ValueError("Every Markdown file requires exactly one explicit note identity")
+        moved = dict(moved_notes or {})
+        # Trigger: a move trailer names a note this commit does not newly hold.
+        # Why: the trailer is the only proof that lets another project wait instead of
+        #   failing; it must never cover a note that was here already or is not here.
+        # Outcome: refused before any object is written.
+        if any(
+            note not in note_ids.values()
+            or note in base.manifest.note_ids_by_uuid
+            or source == base.manifest.project_external_id
+            for note, source in moved.items()
+        ):
+            raise ValueError("A moved note must be new in this project and come from another")
         manifest = GitProjectManifest(
             project_external_id=base.manifest.project_external_id,
             notes=tuple(GitNoteIdentity(path=path, external_id=note_ids[path]) for path in files),
@@ -574,6 +614,10 @@ class GitProjectRepository:
                 base_commit,
                 input_bytes=(
                     f"{message.strip()}\n\nBasic-Memory-Transaction: {transaction_id}\n"
+                    + "".join(
+                        f"{MOVED_NOTE_TRAILER}: {note} from {moved[note]}\n"
+                        for note in sorted(moved, key=str)
+                    )
                 ).encode(),
             )
             .strip()
@@ -586,6 +630,101 @@ class GitProjectRepository:
         return PreparedGitPublication(
             transaction_id, base_commit, commit_id, candidate_ref, changed
         )
+
+    # --- Ownership evidence (I1): manifests and move trailers, never full snapshots ---
+
+    def published_note_ids(self) -> frozenset[UUID]:
+        """The note UUIDs of the published head's manifest: one Git call, no note bytes."""
+        return self._note_ids(PUBLISHED_REF)
+
+    def note_ids_at(self, commit_id: str) -> frozenset[UUID]:
+        """The note UUIDs of any retained commit (published, incoming or a candidate)."""
+        _require_commit_id(commit_id)
+        return self._note_ids(commit_id)
+
+    def _note_ids(self, revision: str) -> frozenset[UUID]:
+        # Only the identities are read: an old commit's manifest may predate a newer
+        # path rule, and its validity was checked when it was published or received.
+        data = json.loads(self._git("cat-file", "blob", f"{revision}:{GIT_PROJECT_MANIFEST_PATH}"))
+        return frozenset(UUID(note["external_id"]) for note in data["notes"])
+
+    def move_sources(self, commit_id: str, external_id: UUID) -> frozenset[UUID]:
+        """The source projects a `Basic-Memory-Moved-Note` trailer of this commit names.
+
+        Git parses the trailers, so the text only counts in BM's own final trailer
+        block; a caller's message can never hold the prefix (see `prepare`).
+        """
+        _require_commit_id(commit_id)
+        values = self._git(
+            "show",
+            "--no-patch",
+            f"--format=%(trailers:key={MOVED_NOTE_TRAILER},valueonly)",
+            commit_id,
+            "--",
+        ).decode("utf-8")
+        sources: set[UUID] = set()
+        for line in values.splitlines():
+            found = _MOVED_NOTE_VALUE.fullmatch(line.strip())
+            if found is not None and UUID(found["note"]) == external_id:
+                sources.add(UUID(found["source"]))
+        return frozenset(sources)
+
+    def last_introduction(self, tip: str, external_id: UUID) -> str | None:
+        """The commit that last brought `external_id` into the line ending at `tip`.
+
+        The walk follows first parents: a note a merge takes from its other parent was
+        introduced over there, unless the first parent already had it once and dropped
+        it (a merge that keeps a deleted note brings it back itself). None when the
+        note was never in this line.
+        """
+        _require_commit_id(tip)
+        commit = tip
+        while True:
+            added = self._last_added(commit, external_id)
+            if added is None:
+                return None
+            parents = self._parents(added)
+            if len(parents) < 2:
+                return added
+            holder = next(
+                (parent for parent in parents[1:] if external_id in self.note_ids_at(parent)),
+                None,
+            )
+            bases = self.merge_bases(parents[0], holder) if holder is not None else []
+            if (
+                holder is None
+                or not bases
+                or any(external_id in self.note_ids_at(base) for base in bases)
+            ):
+                return added
+            commit = holder
+
+    def _last_added(self, tip: str, external_id: UUID) -> str | None:
+        """The newest first-parent commit whose manifest gained `external_id`."""
+        # Pickaxe finds the commits where the UUID's count in the manifest changed; each
+        # is checked against its parent, so a path that spells the UUID cannot mislead.
+        changed = self._git(
+            "log",
+            "--first-parent",
+            "--diff-merges=first-parent",
+            "--no-patch",
+            "--format=%H",
+            f"-S{external_id}",
+            tip,
+            "--",
+            GIT_PROJECT_MANIFEST_PATH,
+        ).decode("ascii")
+        for commit in changed.split():
+            if external_id not in self.note_ids_at(commit):
+                continue
+            parents = self._parents(commit)
+            if not parents or external_id not in self.note_ids_at(parents[0]):
+                return commit
+        return None
+
+    def _parents(self, commit_id: str) -> list[str]:
+        line = self._git("rev-list", "--parents", "--max-count=1", commit_id).decode("ascii")
+        return line.split()[1:]
 
     def committed_at(self, commit_id: str) -> datetime:
         _require_commit_id(commit_id)

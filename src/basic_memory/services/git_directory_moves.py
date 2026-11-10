@@ -19,6 +19,7 @@ from typing import Literal
 from uuid import UUID
 
 from basic_memory.file_utils import ParseError, parse_frontmatter
+from basic_memory.repository.git_project_repository import quote_in_message
 from basic_memory.schemas.git_project import validate_note_path
 from basic_memory.utils import (
     file_path_conflict_keys,
@@ -123,7 +124,9 @@ class GitDirectoryMovePlan:
     @property
     def message(self) -> str:
         """The commit message: one line a person reading `git log` understands."""
-        return f"Move {self.source}/ to {self.destination}/ ({len(self.moves)} notes)"
+        # Folder names are caller text; one spelled like a BM trailer must not be refused.
+        source, destination = quote_in_message(self.source), quote_in_message(self.destination)
+        return f"Move {source}/ to {destination}/ ({len(self.moves)} notes)"
 
 
 @dataclass(frozen=True, slots=True)

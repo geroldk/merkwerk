@@ -81,7 +81,7 @@ their source against cleanup. Never silently rebase or replay append operations.
 - **destination** (string | null, optional, default: None) — For move: new exact Markdown path; UUID/permalink are preserved.
 - **operation** (string, optional, default: "replace") — Write behavior.
 - **view** (string, optional, default: "draft") — For list/read: fixed basis or own draft.
-- **message** (string, optional, default: "Publish Basic Memory transaction") — For commit: Git message; reserved transaction trailers are forbidden.
+- **message** (string, optional, default: "Publish Basic Memory transaction") — For commit: Git message. It must not contain 'Basic-Memory-' in any case: BM reserves that prefix for its own commit trailers.
 - **source_transaction_id** (string | null, optional, default: None) — For start: freeze/protect this old source; do not copy it automatically.
 - **source_key** (string | null, optional, default: None) — For start with a source: its private key.
 - **source_revision** (integer | null, optional, default: None) — For start with a source: its reviewed revision.

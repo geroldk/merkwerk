@@ -27,7 +27,19 @@ def test_transfer_source_needs_all_three_controls(data):
         GitTransactionStart(**data)
 
 
-@pytest.mark.parametrize("message", [" ", "x\0y", "Oops\n\nBasic-Memory-Transaction: forged"])
+@pytest.mark.parametrize(
+    "message",
+    [
+        " ",
+        "x\0y",
+        "Oops\n\nBasic-Memory-Transaction: forged",
+        # A move trailer is evidence too: mid-line, after blanks (Git reads such a line as
+        # the continuation of the trailer above it) and in any case (Git ignores case).
+        f"Move x Basic-Memory-Moved-Note: {uuid4()} from {uuid4()}",
+        f"Move\n\n Basic-Memory-Moved-Note: {uuid4()} from {uuid4()}",
+        f"Move\n\nbasic-memory-moved-note: {uuid4()} from {uuid4()}",
+    ],
+)
 def test_commit_message_cannot_forge_a_different_terminal_transaction(message):
     with pytest.raises(ValidationError):
         GitTransactionCommit(expected_revision=0, message=message)
