@@ -6,6 +6,7 @@ Tests the complete edit note workflow: MCP client -> MCP server -> FastAPI -> da
 
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 from fastmcp import Client
@@ -330,6 +331,49 @@ async def test_slash_heading_is_read_and_edited_by_its_whole_text(mcp_server, ap
 
         assert await read("KI/ML") == "## KI/ML\nchanged\n"
         assert await read("KI / ML") == "### ML\nnested"
+
+
+@pytest.mark.asyncio
+async def test_location_reads_and_edits_a_heading_under_its_second_parent(
+    mcp_server, app, test_project
+):
+    """Decision B3 C: "B > KI/ML" names the "KI/ML" under "B", which "KI/ML" cannot."""
+    note = "# A\n## KI/ML\na\n# B\n## KI/ML\nb\n"
+
+    async with Client(mcp_server) as client:
+        await client.call_tool(
+            "bm_write",
+            {"project": test_project.name, "identifier": "test/where.md", "content": note},
+        )
+
+        async def read(section: str) -> dict[str, Any]:
+            result = await client.call_tool(
+                "bm_read",
+                {
+                    "project": test_project.name,
+                    "identifier": "test/where.md",
+                    "section": section,
+                    "output_format": "json",
+                },
+            )
+            return json.loads(result.content[0].text)
+
+        second = await read("B > KI/ML")
+        assert (second["content"], second["section"]) == ("## KI/ML\nb", "B > KI/ML")
+
+        await client.call_tool(
+            "bm_edit",
+            {
+                "project": test_project.name,
+                "identifier": "test/where.md",
+                "command": "replace_section",
+                "section": second["section"],
+                "content": "changed",
+            },
+        )
+
+        assert (await read("B > KI/ML"))["content"] == "## KI/ML\nchanged"
+        assert (await read("A > KI/ML"))["content"] == "## KI/ML\na"
 
 
 @pytest.mark.asyncio

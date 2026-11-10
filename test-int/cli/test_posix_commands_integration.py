@@ -197,6 +197,12 @@ def check_cat_sections_and_token_budget() -> None:
     assert "Available sections" in missing
     assert "Guide/First" in missing
 
+    # A location reads from the top heading down: "Top" ends two paths here.
+    write_note("Locations", "test", "# Top\n## Dec\nx\n# Other\n## Top\n### Dec\ny")
+    top = bm_json("cat", "Locations", "--section", "> Top")
+    assert (top["section"], top["content"].splitlines()) == ("> Top", ["# Top", "## Dec", "x"])
+    assert bm_json("cat", "Locations", "--section", "Top > Dec")["content"] == "## Dec\nx"
+
     # A cut read says where to continue; reading from there rebuilds the rest.
     budget_lines = bm_json("cat", "Token Budget")["content"].splitlines()
     truncated = bm_json("cat", "Token Budget", "--max-tokens", "20")

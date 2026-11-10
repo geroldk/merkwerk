@@ -563,6 +563,114 @@ async def test_section_name_a_read_returns_edits_that_section(client, test_proje
     )
 
 
+# --- Locations: a heading's full path from the top (decision B3 C) ---
+
+LOCATION_SPEC = "# A\n## KI/ML\na\n# B\n## KI/ML\nb\n"
+
+LOCATION_EDITS = {
+    "replace_section": "# A\n## KI/ML\na\n# B\n## KI/ML\nNEW\n",
+    "insert_before_section": "# A\n## KI/ML\na\n# B\n\nNEW\n\n## KI/ML\nb\n",
+    "insert_after_section": "# A\n## KI/ML\na\n# B\n## KI/ML\nNEW\n\nb\n",
+}
+
+
+async def location_body(project_name: str) -> str:
+    text = await bm_read("specs/where.md", include_frontmatter=False, project=project_name)
+    assert isinstance(text, str)
+    return text.lstrip("\n")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", sorted(SECTION_COMMANDS))
+async def test_section_command_takes_a_location(client, test_project, command):
+    """ "KI/ML" ends two paths; the location "B > KI/ML" names the second one."""
+    await bm_write(identifier="specs/where.md", content=LOCATION_SPEC, project=test_project.name)
+
+    await bm_edit(
+        identifier="specs/where.md",
+        command=command,
+        section="B > KI/ML",
+        content="NEW",
+        project=test_project.name,
+    )
+
+    assert await location_body(test_project.name) == LOCATION_EDITS[command]
+
+
+TOP_EDITS = {
+    "replace_section": "# Top\nNEW\n# Other\n## Top\n### Dec\ny\n",
+    "insert_before_section": "NEW\n\n# Top\n## Dec\nx\n# Other\n## Top\n### Dec\ny\n",
+    "insert_after_section": "# Top\nNEW\n\n## Dec\nx\n# Other\n## Top\n### Dec\ny\n",
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", sorted(SECTION_COMMANDS))
+async def test_section_command_takes_the_location_of_a_top_heading(client, test_project, command):
+    """ "Top" ends two paths, the top one and the one under "Other"; "> Top" is the top one."""
+    note = "# Top\n## Dec\nx\n# Other\n## Top\n### Dec\ny\n"
+    await bm_write(identifier="specs/where.md", content=note, project=test_project.name)
+
+    await bm_edit(
+        identifier="specs/where.md",
+        command=command,
+        section="> Top",
+        content="NEW",
+        project=test_project.name,
+    )
+
+    assert await location_body(test_project.name) == TOP_EDITS[command]
+
+
+@pytest.mark.asyncio
+async def test_section_name_a_location_read_returns_edits_that_section(client, test_project):
+    """The name bm_read returns for a heading only a location reaches edits it."""
+    await bm_write(identifier="specs/where.md", content=LOCATION_SPEC, project=test_project.name)
+
+    read = await bm_read(
+        "specs/where.md", section="A > KI/ML", output_format="json", project=test_project.name
+    )
+    assert isinstance(read, dict)
+    assert read["section"] == "A > KI/ML"
+
+    await bm_edit(
+        identifier="specs/where.md",
+        command="replace_section",
+        section=read["section"],
+        content="NEW",
+        project=test_project.name,
+    )
+
+    assert await location_body(test_project.name) == "# A\n## KI/ML\nNEW\n# B\n## KI/ML\nb\n"
+
+
+LITERAL_EDITS = {
+    "replace_section": "# R\n## A > B\nNEW\n## A\n### B\npath\n",
+    "insert_before_section": "# R\n\nNEW\n\n## A > B\nlit\n## A\n### B\npath\n",
+    "insert_after_section": "# R\n## A > B\nNEW\n\nlit\n## A\n### B\npath\n",
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", sorted(SECTION_COMMANDS))
+async def test_section_command_names_a_heading_written_like_a_location(
+    client, test_project, command
+):
+    """Regression: a heading whose own text is "A > B" is edited by that text, as before."""
+    note = "# R\n## A > B\nlit\n## A\n### B\npath\n"
+    await bm_write(identifier="specs/where.md", content=note, project=test_project.name)
+
+    await bm_edit(
+        identifier="specs/where.md",
+        command=command,
+        section="A > B",
+        content="NEW",
+        project=test_project.name,
+    )
+
+    assert await location_body(test_project.name) == LITERAL_EDITS[command]
+
+
 # --- find_replace counts ---
 
 

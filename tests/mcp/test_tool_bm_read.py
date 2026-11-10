@@ -202,6 +202,59 @@ async def test_section_path_reading_stays_reachable(client, test_project, sectio
     assert payload["content"] == "### ML\nnested\n"
 
 
+# Headings that recur: "KI/ML" under two parents, and a top "Top" that recurs deeper.
+LOCATION_NOTE = (
+    "# A\n## KI/ML\na\n# B\n## KI/ML\nb\n# Top\n## Dec\nx\n# Other\n## Top\n### Dec\ny\n"
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("section", "content"),
+    [
+        ("A > KI/ML", "## KI/ML\na"),
+        ("B > KI/ML", "## KI/ML\nb"),
+        ("> Top", "# Top\n## Dec\nx"),
+        ("Top > Dec", "## Dec\nx"),
+    ],
+)
+async def test_section_location_reaches_a_heading_no_other_selector_names(
+    client, test_project, section, content
+):
+    """Decision B3 C: a location, the full path from the top, is a selector."""
+    await _write(test_project.name, "Locations", LOCATION_NOTE)
+
+    payload = await read_json("notes/Locations.md", project=test_project.name, section=section)
+
+    assert payload["content"] == content
+    # The returned name is the location itself, so it reads back to this heading.
+    assert payload["section"] == section
+
+
+@pytest.mark.asyncio
+async def test_section_refusal_offers_locations_that_read_back(client, test_project):
+    await _write(test_project.name, "Locations", LOCATION_NOTE)
+
+    with pytest.raises(ToolError, match=r"Qualify it: A > KI/ML, B > KI/ML\.") as refused:
+        await bm_read("notes/Locations.md", project=test_project.name, section="KI/ML")
+    assert "cannot be qualified" not in str(refused.value)
+    with pytest.raises(ToolError, match=r"Qualify it: > Top, Other/Top\."):
+        await bm_read("notes/Locations.md", project=test_project.name, section="Top")
+
+    payload = await read_json("notes/Locations.md", project=test_project.name, section="> Top")
+    assert payload["content"] == "# Top\n## Dec\nx"
+
+
+@pytest.mark.asyncio
+async def test_section_heading_named_like_a_location_is_read_by_its_text(client, test_project):
+    """Regression: a heading whose own text is "A > B" wins over the location reading."""
+    await _write(test_project.name, "Literal", "# R\n## A > B\nlit\n## A\n### B\npath\n")
+
+    payload = await read_json("notes/Literal.md", project=test_project.name, section="A > B")
+
+    assert payload["content"] == "## A > B\nlit"
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("section", ["A//B", "Goals/"])
 async def test_section_malformed_as_a_path_keeps_its_old_error(client, test_project, section):
