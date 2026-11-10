@@ -72,7 +72,12 @@ chooses with `POST /v2/git/moves/{move_id}/resolve`, `{"choice": "target",
 "destination_path": ...}` or `{"choice": "source"}` (back where it came from).
 `GET /v2/git/moves` lists open moves. A directory moves note by note through the
 same route, with every id kept, and the target's index catches up once at the
-end; the text form lists every note, one line each, without an upper limit.
+end; the text form lists every note, one line each, without an upper limit. As a
+rough guide, a folder of 300 notes moved into a project of 1000 notes in about
+13 minutes (2.6 s per note) and one of 600 in about 31 minutes, on one machine
+with both projects idle; graph and search indexing follow for some minutes
+more. A caller whose answer is lost finds the moved notes in the target, each
+with its id, and the others still in the source.
 On any other host the note is written in the target as a new note (a new id and
 its own version history) and then deleted here; if that delete is refused, the
 copy is removed again and nothing has moved.

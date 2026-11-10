@@ -36,7 +36,11 @@ bm_project(command, name=None, path=None, set_default=False, workspace=None,
 - `status` — local Git publication and index progress for the required `project`.
   Reports source revision and separate SQL content, file, graph/full-text and
   vector completion. This observes progress; it does not wait or pin a snapshot.
-  Available on an explicitly configured local Git host.
+  Available on an explicitly configured local Git host. While notes of the project
+  wait for another project to let go of their ids (a move between projects still in
+  transit), the content stage lists them in `deferred` (note, owner project, and the
+  owner's own error when it fails); `caught_up` stays false and writes to the project
+  are refused as `UNAVAILABLE` until the owner has caught up or synced.
 - `sync` — explicitly fetch/push the configured private Git peer for `project`.
   Local writes work offline. Incoming fast-forwards are validated before publication;
   divergence stops for review. JSON returns the last attempt and observed relationship.

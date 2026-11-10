@@ -259,8 +259,18 @@ host still starts.
 Further limits of part B:
 - Moves are one at a time per host; while one runs, every write into its target waits.
 - A move does a full target transaction per note (start, write, commit, each reading and
-  writing the whole tree) plus the source delete. Measured cost for a folder into a
-  1000-note target: see the scale test `test-int/test_git_cross_project_move_scale.py`.
+  writing the whole tree) plus the source delete. Measured with
+  `test-int/test_git_cross_project_move_scale.py` (slow and benchmark; one machine, both
+  projects settled first, a target of 1000 notes): a folder of 300 notes took 769 s for the
+  `bm_move` call (2.6 s per note), and every stage (files, graph, vectors) had caught up
+  323 s later; 600 notes took 1840 s (3.1 s per note), then 433 s. The cost per note
+  grows with the target and with the background graph work that every source delete
+  restarts host-wide. Two changes made this feasible: snapshots and tree writes in one Git
+  call each (before: 3.5 s per snapshot and 3.8 s per tree write of 1000 notes, several of
+  each per move), and content passes and draft checks that skip unchanged notes (before:
+  a median of 9.7 s per move, measured over 15 moves). A call of this
+  length outlives an ordinary MCP or gateway timeout; a caller that loses the answer
+  finds the moved notes in the target (each has its id) and the rest still in the source.
 - The P2 title rule is not applied again when resume rebuilds a draft.
 - A merge "keep" for a note this host moved away re-creates the UUID in the source: the
   ownership guard refuses it by name (no silent duplicate); there is no re-key tool.

@@ -858,11 +858,8 @@ def reserve_open_moves(host: GitHost) -> None:
 async def resume_cross_project_moves(host: GitHost) -> list[GitMoveResumeOutcome]:
     """Finish or undo every open move; never raises (it runs at host start)."""
     async with host.move_lock:
-        try:
-            found, _ = await asyncio.to_thread(_open_intents, host)
-        except Exception as error:  # pragma: no cover - _open_intents collects its errors
-            logger.exception("Cross-project move resume could not list intents", error=str(error))
-            return []
+        # Unreadable intent files are collected there, not raised (they stay reserved).
+        found, _ = await asyncio.to_thread(_open_intents, host)
         outcomes = []
         for intent, target in found:
             try:
