@@ -58,15 +58,12 @@ async def link_targets(pipeline):
     return target_id, targets
 
 
-@pytest.mark.asyncio
-async def test_a_stored_unresolved_link_resolves_on_the_next_full_graph_pass(pipeline, monkeypatch):
-    files = {
-        "Source.md": note("Source", "test-project/source", f"- relates_to [[{LINK}]]"),
-        TARGET: note("Fix", f"test-project/{LINK}", "The fix"),
-        "Other.md": note("Other", "test-project/other", "Firstprobe"),
-    }
-    worker = GitProjectionWorker(pipeline)
-    # The graph as the old resolver left it: no routed permalink after the file paths.
+async def project_with_the_old_resolver(pipeline, monkeypatch, files) -> int:
+    """Project `files` as the old resolver did: no routed permalink after the file paths.
+
+    This simulates the stored state by switching the new candidate list off for one pass;
+    it is not a graph written by the old release.
+    """
     with monkeypatch.context() as old_resolver:
         old_resolver.setattr(
             bulk_link_resolver,
@@ -75,9 +72,20 @@ async def test_a_stored_unresolved_link_resolves_on_the_next_full_graph_pass(pip
             raising=False,
         )
         publish(pipeline, files)
-        assert await worker._pass(vectors=False) is GitPassOutcome.done
+        assert await GitProjectionWorker(pipeline)._pass(vectors=False) is GitPassOutcome.done
     target_id, targets = await link_targets(pipeline)
     assert target_id is not None and targets == [None]
+    return target_id
+
+
+@pytest.mark.asyncio
+async def test_a_stored_unresolved_link_resolves_on_the_next_full_graph_pass(pipeline, monkeypatch):
+    files = {
+        "Source.md": note("Source", "test-project/source", f"- relates_to [[{LINK}]]"),
+        TARGET: note("Fix", f"test-project/{LINK}", "The fix"),
+        "Other.md": note("Other", "test-project/other", "Firstprobe"),
+    }
+    target_id = await project_with_the_old_resolver(pipeline, monkeypatch, files)
 
     # A restart re-indexes nothing, and a body-only change re-indexes only its own note.
     restarted = GitProjectionWorker(pipeline)
@@ -91,4 +99,20 @@ async def test_a_stored_unresolved_link_resolves_on_the_next_full_graph_pass(pip
     files["New.md"] = note("New", "test-project/new", "New note")
     publish(pipeline, files)
     assert await restarted._pass(vectors=False) is GitPassOutcome.done
+    assert (await link_targets(pipeline))[1] == [target_id]
+
+
+@pytest.mark.asyncio
+async def test_editing_the_linking_note_resolves_its_stored_link(pipeline, monkeypatch):
+    files = {
+        "Source.md": note("Source", "test-project/source", f"- relates_to [[{LINK}]]"),
+        TARGET: note("Fix", f"test-project/{LINK}", "The fix"),
+    }
+    target_id = await project_with_the_old_resolver(pipeline, monkeypatch, files)
+
+    # A body-only change re-indexes just this note, which resolves its own links again.
+    files["Source.md"] += "\nEdited after the install\n"
+    publish(pipeline, files)
+    worker = GitProjectionWorker(pipeline)
+    assert await worker._pass(vectors=False) is GitPassOutcome.done
     assert (await link_targets(pipeline))[1] == [target_id]
