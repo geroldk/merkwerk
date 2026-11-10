@@ -38,25 +38,44 @@ Pass `expected_checksum` (from bm_read) to move a note only if it is still the
 revision you read.
 
 `destination_project` moves into another project; `destination` is then a path
-in that project. The note is written there and then deleted here, so it is a
-new note: it gets a new id and its own version history, and links in either
-project are not rewritten. Its permalink is formed again from its new path, as
-for a note created there (a permalink that carried the source project's prefix
-would point into the wrong project). Every other frontmatter key, including
-`created` and `modified`, keeps its value; the copy is written like any new
-note, so the frontmatter is re-serialised and the body's outer blank lines are
-trimmed. In the JSON form the result names the old and the new permalink and
-the identity of the new note (`previous_permalink`, `permalink`,
+in that project. Links in either project are not rewritten. Its permalink is
+formed again from its new path, as for a note created there (a permalink that
+carried the source project's prefix would point into the wrong project; a
+permalink already taken there gets a `-1` suffix). Every other frontmatter key,
+including `created` and `modified`, keeps its value; a note without those keys
+gets its indexed times written in, never the time of the move. The note is
+written like any new note, so the frontmatter is re-serialised and the body's
+outer blank lines are trimmed. In the JSON form the result names the old and
+the new permalink and the identity (`previous_permalink`, `permalink`,
 `previous_external_id`, `external_id`; for a directory, one entry each in
-`moved_notes`); the text form names the permalinks only. If some notes of a
-directory fail, the `PARTIAL_FAILURE` refusal lists what did move (in the JSON
-form as `details.moved_notes`), because those notes are already gone from the
-source. The original is deleted only after the copy is
-written, and only if it is still the revision that was copied; if that delete
-is refused, the copy is removed again and nothing has moved. A note already at
-the destination is never replaced, and a locked note is refused. A directory
-moves note by note; files that are not notes stay, and the result lists
-whatever did not move.
+`moved_notes`). A note already at the destination is never replaced, a note
+whose title the target already has (ignoring case) is refused, and a locked
+note is refused. A directory moves note by note; files that are not notes
+stay, and the result lists whatever did not move. If some notes of a directory
+fail, the `PARTIAL_FAILURE` refusal lists what did move (in the JSON form as
+`details.moved_notes`), because those notes are already gone from the source.
+
+On a host that publishes its projects through Git, the note keeps its id:
+`external_id` equals `previous_external_id` (kept in the result for callers of
+the older form), and the text form says `id kept`. The server writes a private
+draft in the target under the old id, deletes the note in the source (only if
+it is still the revision read), then publishes the draft with a proof of the
+move that peers read. Every other write to the target waits meanwhile. If the
+source refuses the delete, the draft is dropped and nothing has moved. A move
+that stops after the source let go (a crash, or the target could not publish
+yet) is kept with its content and finishes at the next start of the host or
+with `POST /v2/git/moves/resume`; until then the call answers
+`PARTIAL_FAILURE` with `details.move_id`, `details.state` (`pending` or
+`stuck`) and `details.external_id`, and the id stays reserved (no other note
+may take it). `stuck` means the planned path was taken meanwhile: a person
+chooses with `POST /v2/git/moves/{move_id}/resolve`, `{"choice": "target",
+"destination_path": ...}` or `{"choice": "source"}` (back where it came from).
+`GET /v2/git/moves` lists open moves. A directory moves note by note through the
+same route, with every id kept, and the target's index catches up once at the
+end; the text form lists every note, one line each, without an upper limit.
+On any other host the note is written in the target as a new note (a new id and
+its own version history) and then deleted here; if that delete is refused, the
+copy is removed again and nothing has moved.
 
 On a host that publishes its projects through Git, a directory moves within
 its project as one commit, all or nothing. Every note keeps its id, its
@@ -122,12 +141,20 @@ bm_move(path="drafts", destination="archive/", project="demo")
 bm_move(identifier="plans/launch.md", destination="inbox/", project="demo",
         destination_project="research")
 # → Moved plans/launch.md (project demo) to inbox/launch.md (project research)
+# On a Git host: ..., id kept (0b6e5d1c-…); permalink demo/plans/launch -> research/inbox/launch
 ```
 
 ## GOTCHAS
 
 - A destination with no file extension is refused for a note; end it with `/`
   to move into a folder.
+- On a Git host, a move into another project that answers `PARTIAL_FAILURE`
+  with a `move_id` has left the source already. Do not write the note again:
+  it finishes on its own (next start, or `POST /v2/git/moves/resume`), or, when
+  `stuck`, by a person's choice; its id stays reserved meanwhile.
+- A target project that waits for notes another project still holds takes the
+  move anyway; the answer then says its index is pending. A source that waits
+  refuses (`UNAVAILABLE`) until the owner it waits for has synced.
 - Off a Git host a directory move is file by file. If some files fail, the
   error lists which moved and which did not; bm_list the destination before
   retrying.

@@ -70,11 +70,12 @@ its own peer. A failed creation of a local peer removes the directories this cal
 
 ## `bm_move` across projects: the permalink is formed again
 
-A note moved with `destination_project` is written in the target project as a new note, then
-deleted in the source. Until now the copy carried the source's frontmatter verbatim, permalink
-included, so a note moved from `main` into `cobol-ana` kept `personal/main/tasks/...`. A
-gateway refuses addresses that start with another project's name (or `personal`), so such a
-note could not be reached remotely.
+A note moved with `destination_project` is written in the target project, then deleted in the
+source. On a Git host it keeps its UUID (I1, see BM006_GIT_PUBLICATION "Moving a note into another
+project"); elsewhere it is a new note with a new UUID. Until now the copy carried the source's
+frontmatter verbatim, permalink included, so a note moved from `main` into `cobol-ana` kept
+`personal/main/tasks/...`. A gateway refuses addresses that start with another project's name
+(or `personal`), so such a note could not be reached remotely.
 
 * The copy is written **without** its `permalink` key (the one line is removed from the text before
   the write). The target forms the permalink from the new path, exactly as for a note created
@@ -84,10 +85,13 @@ note could not be reached remotely.
   later `set_metadata` would renew `modified` on every moved note. Every other frontmatter key keeps
   its value and the body its text; the copy is written like any new note, so the frontmatter is
   re-serialised (key order and quoting may change) and leading/trailing blank lines of the body
-  are trimmed. Precondition on the Git host: the note already carries the two keys (the BM-010
-  backfill), else the copy is dated with the move.
-* The result names both: `previous_permalink` and `permalink`, and the identity of the new note
-  (`previous_external_id`, `external_id`); a directory move lists one entry per note in
+  are trimmed. A note that lacks the two keys gets the source entity's `created`/`modified`
+  written in (I1), never the time of the move; that holds on a Git host, where the server moves
+  the note. (Before I1 the precondition was the BM-010 backfill, else the copy was dated with the
+  move.)
+* The result names both: `previous_permalink` and `permalink`, and the identity
+  (`previous_external_id`, `external_id`). A Git host keeps the id, so the two are equal there;
+  other hosts give the copy a new one. A directory move lists one entry per note in
   `moved_notes` (`previous_file_path`, `file_path`, `previous_permalink`, `permalink`,
   `previous_external_id`, `external_id`). If some notes of a directory fail, the `PARTIAL_FAILURE`
   refusal lists exactly what did move (JSON form: `details.moved_notes`, `details.failed`; text form: the

@@ -43,12 +43,13 @@ from basic_memory.utils import generate_permalink, validate_caller_note_path
         "moves into that folder under the current name ('archive/'). A note keeps "
         "its file extension ('.markdown' may become '.md'). Pass `expected_checksum` (from "
         "bm_read) to move a note only if it is still the revision you read. "
-        "`destination_project` moves into another project: the note is written there as a "
-        "new note (new id, its own history, a permalink formed from its new path, links not "
-        "rewritten) and deleted here; the result names the old and the new permalink. On a "
-        "host that publishes through Git, a directory moves within its project as one "
-        "commit, all or nothing, and the result lists every note; elsewhere it moves note by "
-        "note."
+        "`destination_project` moves into another project, with a permalink formed from "
+        "the new path and links not rewritten; the result names the old and the new "
+        "permalink. On a host that publishes through Git the note keeps its id (an "
+        "interrupted move finishes at the next start); elsewhere it is written there as a "
+        "new note (new id, its own history) and deleted here. On a Git host, a directory "
+        "moves within its project as one commit, all or nothing, and the result lists every "
+        "note; elsewhere, and into another project, it moves note by note."
     ),
     tags={"notes"},
     annotations={

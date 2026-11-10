@@ -6,6 +6,7 @@ deliberately not one atomic commit, because projects are the transaction boundar
 """
 
 import asyncio
+import json
 from datetime import datetime
 from typing import Any
 from uuid import UUID
@@ -318,3 +319,153 @@ async def test_a_move_inside_a_project_follows_the_setting_and_keeps_the_times(
     metadata = parse_frontmatter(first_repo.snapshot().files["b/Jek.md"])
     assert metadata["permalink"] == permalink_after
     assert (metadata["created"], metadata["modified"]) == (CREATED, MODIFIED)
+
+
+# --- I1: on a Git host the note keeps its id ---
+
+
+@pytest.mark.asyncio
+async def test_a_moved_note_keeps_its_id_in_json_and_text(host_setup, second_repository):
+    from basic_memory.mcp.server import mcp
+    import basic_memory.mcp.tools  # noqa: F401
+
+    second, second_repo = second_repository
+    first_repo = host_setup.repository
+    async with Client(mcp) as client:
+        for title in ("Eins", "Zwei"):
+            await written_note(client, title)
+        await caught_up(host_setup.project.external_id)
+        source = first_repo.snapshot().manifest.note_ids
+        as_json = await client.call_tool(
+            "bm_move",
+            {
+                "identifier": "notes/Eins.md",
+                "destination": "archive/",
+                "project": "test-project",
+                "destination_project": "second",
+                "output_format": "json",
+            },
+        )
+        as_text = await client.call_tool(
+            "bm_move",
+            {
+                "identifier": "notes/Zwei.md",
+                "destination": "archive/Zwei.md",
+                "project": "test-project",
+                "destination_project": "second",
+            },
+        )
+        # Readable by the kept id in the target right after the answer.
+        read = await client.call_tool(
+            "bm_read",
+            {"identifier": str(source["notes/Eins.md"]), "project": "second"},
+            raise_on_error=False,
+        )
+    assert as_json.data["external_id"] == as_json.data["previous_external_id"]
+    assert as_json.data["external_id"] == str(source["notes/Eins.md"])
+    text = as_text.content[0].text  # type: ignore[union-attr]
+    assert f"id kept ({source['notes/Zwei.md']})" in text
+    assert not read.is_error, read.content
+    assert second_repo.snapshot().manifest.note_ids == {
+        "archive/Eins.md": source["notes/Eins.md"],
+        "archive/Zwei.md": source["notes/Zwei.md"],
+    }
+
+
+async def written_note(client: Client[Any], title: str, directory: str = "notes") -> None:
+    result = await client.call_tool(
+        "bm_write",
+        {
+            "project": "test-project",
+            "title": title,
+            "directory": directory,
+            "content": f"- [fact] {title}\n",
+            "output_format": "json",
+        },
+    )
+    assert not result.is_error, result.content
+
+
+@pytest.mark.asyncio
+async def test_a_folder_moves_note_by_note_and_every_id_is_kept(host_setup, second_repository):
+    from basic_memory.mcp.server import mcp
+    import basic_memory.mcp.tools  # noqa: F401
+
+    second, second_repo = second_repository
+    first_repo = host_setup.repository
+    async with Client(mcp) as client:
+        for title in ("Alpha", "Beta", "Gamma"):
+            await written_note(
+                client, title, directory="ordner/sub" if title == "Gamma" else "ordner"
+            )
+        await caught_up(host_setup.project.external_id)
+        source = first_repo.snapshot().manifest.note_ids
+        as_text = await client.call_tool(
+            "bm_move",
+            {
+                "path": "ordner",
+                "destination": "ziel",
+                "project": "test-project",
+                "destination_project": "second",
+            },
+        )
+        await caught_up(host_setup.project.external_id, second.external_id)
+    text = as_text.content[0].text  # type: ignore[union-attr]
+    assert "ids kept" in text
+    # Every note is listed, one line each.
+    for path, note in source.items():
+        assert f"(id {note}," in text
+        assert path.replace("ordner/", "ziel/", 1) in text
+    assert second_repo.snapshot().manifest.note_ids == {
+        path.replace("ordner/", "ziel/", 1): note for path, note in source.items()
+    }
+    assert first_repo.snapshot().files == {}
+
+
+@pytest.mark.asyncio
+async def test_a_move_that_cannot_commit_yet_is_reported_and_resumes(
+    host_setup, second_repository, monkeypatch
+):
+    from httpx import ASGITransport, AsyncClient
+
+    from basic_memory.api.app import app
+    from basic_memory.mcp.server import mcp
+    from basic_memory.services.git_transactions import GitNoteStillOwned, GitTransactionService
+    import basic_memory.mcp.tools  # noqa: F401
+
+    second, second_repo = second_repository
+    first_repo = host_setup.repository
+    commit = GitTransactionService.commit_admitted
+
+    async def still_owned(self, *arguments, **options):
+        raise GitNoteStillOwned(409, "Note UUID is still owned by project 'test-project'")
+
+    async with Client(mcp) as client:
+        await written_note(client, "Haengt")
+        await caught_up(host_setup.project.external_id)
+        note = first_repo.snapshot().manifest.note_ids["notes/Haengt.md"]
+        monkeypatch.setattr(GitTransactionService, "commit_admitted", still_owned)
+        moved = await client.call_tool(
+            "bm_move",
+            {
+                "identifier": "notes/Haengt.md",
+                "destination": "archive/Haengt.md",
+                "project": "test-project",
+                "destination_project": "second",
+                "output_format": "json",
+            },
+            raise_on_error=False,
+        )
+        monkeypatch.setattr(GitTransactionService, "commit_admitted", commit)
+        async with AsyncClient(transport=ASGITransport(app), base_url="http://test") as http:
+            listed = (await http.get("/v2/git/moves")).json()["moves"]
+            resumed = (await http.post("/v2/git/moves/resume")).json()["outcomes"]
+        await caught_up(second.external_id)
+    assert moved.is_error
+    error = json.loads(moved.content[0].text)  # type: ignore[union-attr]
+    assert error["error"] == "PARTIAL_FAILURE"
+    assert error["details"]["state"] == "pending"
+    assert error["details"]["external_id"] == str(note)
+    assert [move["move_id"] for move in listed] == [error["details"]["move_id"]]
+    assert [outcome["outcome"] for outcome in resumed] == ["completed"]
+    assert second_repo.snapshot().manifest.note_ids == {"archive/Haengt.md": note}

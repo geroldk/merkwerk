@@ -174,6 +174,97 @@ Known limits:
   peer refuses the target's incoming history as `invalid_incoming` until it is
   upgraded, and recovers then; it does not stop that host.
 
+### Moving a note into another project (I1 part B)
+
+`services/git_cross_project_move.py` moves one note and keeps its UUID. The route is
+`POST /v2/projects/{source}/git/moves` with `{external_id, target_project_id,
+destination_path, expected_checksum?, catch_up?}`; `bm_move(destination_project=...)`
+calls it on a Git host (a folder: once per note, then one
+`POST /v2/projects/{target}/git/moves/catch-up`). On a host without Git publication the
+routes answer 404 `kind=not_git_host`, and the MCP tool keeps the copy-with-a-new-id move
+there (W0).
+
+The steps, under the host's `move_lock` (one move, resume or resolve at a time) and with
+the **target's admission gate held from the draft to the commit** (lock order target, then
+source):
+
+1. **Checks, nothing written.** The target's SQL follows its head (a target that waits for
+   other notes still takes this one). The source note must be in SQL and in the source
+   head with the same bytes; `expected_checksum`, a Markdown path, no `locked: true`, no
+   open move holding the UUID, no note with the same title in the target (P2, ignoring
+   case), a free path (also equivalent spellings, and on disk), and the UUID not in the
+   target. The canonical bytes come from the target's own create preparer in a rolled-back
+   session: the permalink is formed from the new path (a taken one gets `-1`), and a note
+   without `created`/`modified` first gets the source entity's times, never the move time.
+2. **Draft (0).** A target transaction holds the note under its UUID
+   (`write_identified_admitted`, never routed), the UUID is reserved host-wide, and the
+   intent is saved: `<target bare repo>/bm-moves/<move_id>.json` (directory 0700, file 0600,
+   temporary file, fsync, rename, fsync of the directory; symlinks refused). It holds the
+   target bytes and the draft's key; `GET /v2/git/moves` never shows either.
+3. **Source delete (b)** through the ordinary guarded delete (`NoteContentMutationService`
+   of the request, with the checksum read in 1; the journal records it like any delete, and a
+   deployment's actor resolver sees the label `api-cross-project-move`). Whether it happened is
+   decided from the source's published history only (`removals_since`: a commit after the
+   base that dropped the UUID), never from the answer: a refusal with no such commit
+   drops the draft and the intent and answers the source's refusal ("Nothing was moved";
+   a waiting source answers 409 `kind=deferred`). After "Git published; SQL pending" the
+   source is caught up under its own gate before the commit. The intent then says
+   `source_deleted` with the removing commit.
+4. **Target commit (c)** with the trailer `Basic-Memory-Moved-Note: <uuid> from <source>`.
+   A draft that can no longer commit (the target advanced, the draft expired after 1800 s
+   or was cleaned) is rebuilt from the intent: new canonical bytes through the preparer,
+   the new transaction saved into the intent before the old draft is dropped. If the
+   source still holds the UUID, it is caught up once more; otherwise the move is `pending`.
+5. **After the commit** the intent and the reservation go, and the target's SQL catches up
+   before the answer, so `bm_read` by UUID works at once. A failure there is no failed
+   move: the answer is `completed` with `index_pending` and both commit ids.
+
+The answer is `completed`, `pending` (the source let go, the target could not commit yet;
+resume retries) or `stuck` (after a crash the planned path was taken meanwhile, or the UUID
+came back into the source). With the gate held, `stuck` cannot arise from local writes; it
+needs a crash. Nothing is lost then: the bytes are in the intent and in the source's
+history, the UUID stays reserved (a PUT that would create it anywhere is refused 409
+`owned_elsewhere`), and the MCP tool answers `PARTIAL_FAILURE` with `details.move_id`,
+`state`, `external_id` and `target_path`.
+
+**Resume.** At every host start, after all runtimes entered and before the first request,
+the open intents reserve their UUIDs and each one is decided (oldest first, each in its own
+error boundary, so one broken intent never stops the host):
+
+| The target... / the source's history after the base | Outcome |
+| --- | --- |
+| target published the draft (record or trailer), or its head holds the UUID | completed: the intent goes |
+| no commit dropped the UUID, and the source head holds it | abandoned: the draft goes, the note stays in the source |
+| a commit dropped it, and the source head holds it again | stuck (a peer or a write brought it back); never dropped as "never moved" |
+| a commit dropped it | commit as in step 4, rebuilding the draft if needed |
+
+`POST /v2/git/moves/resume` does the same online. `POST /v2/git/moves/{move_id}/resolve`
+takes a person's choice for a stuck move: `{"choice": "target", "destination_path": ...}`
+publishes it in the target at another path, `{"choice": "source"}` puts it back into the
+source with its UUID and the bytes it had there (or closes the move when the source holds
+the UUID again; the moved bytes stay in the source's history). There is no CLI command;
+the offline `bm git remove-project` refuses a project an open move names, and
+`bm git backup` / `restore` carry `bm-moves/` (with its lock taken during the backup), so
+the restored host's rebuild resumes the move.
+
+The crash matrix (`test-int/test_git_cross_project_move_w2_integration.py`, process exits
+through `test-int/fixtures/git_cross_move_crash.py`): after the draft before the intent and
+after the intent before the delete the note stays in the source (an orphan draft expires);
+after the source's Git publication before its SQL, after the delete before the commit,
+after the target's publication before its record, and after the record before the intent
+goes, the next start finishes the move. An expired or cleaned draft is rebuilt; a taken
+permalink gets `-1`; a taken path makes the move stuck, visible and resolvable, and the
+host still starts.
+
+Further limits of part B:
+- Moves are one at a time per host; while one runs, every write into its target waits.
+- A move does a full target transaction per note (start, write, commit, each reading and
+  writing the whole tree) plus the source delete. Measured cost for a folder into a
+  1000-note target: see the scale test `test-int/test_git_cross_project_move_scale.py`.
+- The P2 title rule is not applied again when resume rebuilds a draft.
+- A merge "keep" for a note this host moved away re-creates the UUID in the source: the
+  ownership guard refuses it by name (no silent duplicate); there is no re-key tool.
+
 ## Guarded moves, deletions and old-file cleanup
 
 `repository/git_layout_repository.py` records all local note identities/content in

@@ -292,3 +292,47 @@ async def test_transaction_write_and_move_stamp_and_keep_the_times(host_setup):
     sql_created, sql_updated = await entity_times("u/Tx.md", host_setup.config.database_path)
     assert sql_created == datetime.fromisoformat(created)
     assert sql_updated == datetime.fromisoformat(modified)
+
+
+@pytest.mark.asyncio
+async def test_a_note_without_time_keys_keeps_its_indexed_times_across_projects(
+    host_setup, second_repository
+):
+    """I1: the source entity's times go into a note that lacks the keys; not the move time."""
+    from uuid import uuid4
+
+    from basic_memory.mcp.server import mcp
+    import basic_memory.mcp.tools  # noqa: F401
+
+    second, second_repo = second_repository
+    first_repo = host_setup.repository
+    note = uuid4()
+    # Published without `created`/`modified`, as notes from before BM-010 are.
+    base = first_repo.snapshot()
+    prepared = first_repo.prepare(
+        transaction_id=uuid4(),
+        base_commit=base.commit_id,
+        files={"alt/Alt.md": "---\ntitle: Alt\ntype: note\npermalink: alt/alt\n---\n\nAlt\n"},
+        note_ids={"alt/Alt.md": note},
+    )
+    first_repo.publish(prepared)
+    async with Client(mcp) as client:
+        await caught_up(host_setup.project.external_id)
+        indexed = await entity_times("alt/Alt.md", host_setup.config.database_path)
+        await asyncio.sleep(1.1)  # a move-time stamp would differ by at least a second
+        moved = await call(
+            client,
+            "bm_move",
+            {
+                "project": "test-project",
+                "identifier": "alt/Alt.md",
+                "destination": "neu/Alt.md",
+                "destination_project": "second",
+            },
+        )
+        await caught_up(host_setup.project.external_id, second.external_id)
+    assert moved.data["external_id"] == str(note) == moved.data["previous_external_id"]
+    created, modified = times(second_repo, "neu/Alt.md")
+    # Note times are stored to the second (format_note_time).
+    assert datetime.fromisoformat(created).timestamp() == int(indexed[0].timestamp())
+    assert datetime.fromisoformat(modified).timestamp() == int(indexed[1].timestamp())

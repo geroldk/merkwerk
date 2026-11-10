@@ -1,8 +1,13 @@
 """Moving notes into another project (#1842).
 
-A move across projects is a write in the target project followed by a delete in
-the source project. The moved note is a new note there: it gets a new id and its
-own version history, and links in either project are not rewritten.
+On a Git host the note keeps its id (I1): the server drafts it in the target under its
+old UUID, deletes it in the source, then publishes the draft (POST
+/v2/projects/{source}/git/moves). An interrupted move keeps an intent and finishes at the
+next host start; until then the call answers PARTIAL_FAILURE with the move's id and state.
+
+On any other host a move across projects is a write in the target project followed by a
+delete in the source project. The moved note is a new note there: it gets a new id and its
+own version history. On both, links in either project are not rewritten.
 
 Its permalink is formed again from its new path, as for a note created there: a permalink
 that still carried the source project's prefix would point into the wrong project, and a
@@ -19,23 +24,30 @@ refused move leaves both projects as they were.
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Any, assert_never
+from uuid import UUID
 
 from fastmcp.exceptions import ToolError
+from httpx import HTTPStatusError
 
 from basic_memory.file_utils import drop_frontmatter_key
 from basic_memory.markdown.note_lock import LOCKED_NOTE_MESSAGE, note_is_locked
 from basic_memory.mcp.clients import DirectoryClient, KnowledgeClient
+from basic_memory.mcp.clients.git_moves import GitMoveClient
 from basic_memory.mcp.note_targets import ProjectTarget, resolve_note
 from basic_memory.mcp.refusals import (
+    Refusal,
+    RefusalCode,
     api_refusal,
     note_change_failure,
     refusal,
     revision_conflict,
 )
 from basic_memory.mcp.tool_params import OutputFormat
+from basic_memory.runtime.git_routing import git_local_routing_active
 from basic_memory.runtime.storage import runtime_file_path_is_markdown_note
 from basic_memory.schemas.base import Entity
 from basic_memory.schemas.directory import DirectoryNode
+from basic_memory.schemas.git_moves import GitCrossProjectMoveRequest
 from basic_memory.schemas.memory import memory_url_path
 from basic_memory.schemas.v2.entity import EntityResponseV2
 from basic_memory.schemas.v2.note_write import (
@@ -117,6 +129,8 @@ async def move_note_across(
         f"Moved {result['previous_file_path']} (project {result['previous_project']}) to "
         f"{result['file_path']} (project {result['project']})"
     )
+    if moved.external_id == moved.previous_external_id:
+        text += f", id kept ({moved.external_id})"
     if moved.previous_permalink and moved.permalink:
         text += f"; permalink {moved.previous_permalink} -> {moved.permalink}"
     return text
@@ -130,8 +144,14 @@ async def _move_one(
     destination_path: str,
     expected_checksum: str | None,
     output_format: OutputFormat,
+    *,
+    catch_up: bool = True,
 ) -> MovedNote:
-    """Copy one note into the target project, then delete it from the source."""
+    """Copy one note into the target project, then delete it from the source.
+
+    On a Git host the server moves it instead and the note keeps its id; `catch_up`
+    False leaves the target's index to one catch-up after a whole folder.
+    """
     address = source.paths.path(file_path)
     if not runtime_file_path_is_markdown_note(file_path):
         raise refusal(
@@ -145,6 +165,21 @@ async def _move_one(
             f"'{target.paths.path(destination_path)}' is not a Markdown note path.",
             try_instead="a destination ending in '.md', or a folder ending in '/'",
             output_format=output_format,
+        )
+    # Trigger: this host publishes its projects through Git.
+    # Why: the server can move the note under its own id (draft, delete, commit) and
+    #   finish an interrupted move; a copy here would give it a new id.
+    # Outcome: one call to the source project's move route; W0 below stays for other hosts.
+    if git_local_routing_active():
+        return await _move_keeping_id(
+            source,
+            target,
+            external_id,
+            file_path,
+            destination_path,
+            expected_checksum,
+            output_format,
+            catch_up=catch_up,
         )
 
     # --- Read the revision being moved ---
@@ -302,6 +337,160 @@ async def _remove_copy(
         ) from error
 
 
+# --- On a Git host: the note keeps its id (I1) ---
+
+# A refusal's `detail.kind` decides the code; nothing was moved for any of them.
+_KEPT_ID_CODES: dict[str, RefusalCode] = {
+    "not_found": "NOT_FOUND",
+    "locked": "LOCKED",
+    "unsupported": "UNSUPPORTED",
+    "invalid_path": "INVALID_ARGUMENTS",
+    "invalid_draft": "INVALID_ARGUMENTS",
+    "same_project": "INVALID_ARGUMENTS",
+    "occupied": "ALREADY_EXISTS",
+    "already_in_target": "ALREADY_EXISTS",
+    "deferred": "UNAVAILABLE",
+    "not_accepting": "UNAVAILABLE",
+    "reserved": "UNAVAILABLE",
+    "source_failed": "UNAVAILABLE",
+}
+
+
+async def _move_keeping_id(
+    source: ProjectTarget,
+    target: ProjectTarget,
+    external_id: str,
+    file_path: str,
+    destination_path: str,
+    expected_checksum: str | None,
+    output_format: OutputFormat,
+    *,
+    catch_up: bool,
+) -> MovedNote:
+    """Ask the Git host to move the note; refuse, or report a move that is still open."""
+    address = source.paths.path(file_path)
+    try:
+        request = GitCrossProjectMoveRequest(
+            external_id=UUID(external_id),
+            target_project_id=UUID(target.project.external_id),
+            destination_path=destination_path,
+            expected_checksum=expected_checksum,
+            catch_up=catch_up,
+        )
+    except ValueError as error:
+        raise refusal(
+            "INVALID_ARGUMENTS",
+            f"'{target.paths.path(destination_path)}' is not a note path there: {error}",
+            output_format=output_format,
+        ) from error
+    try:
+        moved = await GitMoveClient(source.client, source.project.external_id).move(request)
+    except ToolError as error:
+        raise _kept_id_failure(
+            error, source, target, address, destination_path, output_format
+        ) from error
+    shown = target.paths.path(moved.file_path)
+    if moved.state != "completed":
+        # Trigger: the source let go, but the target has not published the note (yet).
+        # Why: the note is in neither project's current state; its bytes are kept in the
+        #   move's intent and in the source's history, never lost.
+        # Outcome: PARTIAL_FAILURE naming the move, so the caller can follow it up.
+        follow_up = (
+            "it finishes at the next host start or with POST /v2/git/moves/resume"
+            if moved.state == "pending"
+            else (
+                "a person must choose where it goes: POST "
+                f"/v2/git/moves/{moved.move_id}/resolve with choice 'target' (optionally a "
+                "free destination_path) or 'source'"
+            )
+        )
+        raise refusal(
+            "PARTIAL_FAILURE",
+            f"'{address}' left project '{source.project.name}' but is not in project "
+            f"'{target.project.name}' yet (move {moved.move_id}, {moved.state}: "
+            f"{moved.message}); {follow_up}. Its content is kept and its id "
+            f"{moved.external_id} stays reserved.",
+            try_instead="GET /v2/git/moves to see the open move",
+            output_format=output_format,
+            details={
+                "move_id": str(moved.move_id),
+                "state": moved.state,
+                "external_id": str(moved.external_id),
+                "target_path": shown,
+                "reason": moved.message,
+            },
+        )
+    return MovedNote(
+        previous_file_path=moved.previous_file_path,
+        file_path=moved.file_path,
+        previous_permalink=moved.previous_permalink,
+        permalink=moved.permalink,
+        previous_external_id=external_id,
+        external_id=str(moved.external_id),
+    )
+
+
+def _kept_id_failure(
+    error: ToolError,
+    source: ProjectTarget,
+    target: ProjectTarget,
+    address: str,
+    destination_path: str,
+    output_format: OutputFormat,
+) -> ToolError:
+    """Word a refused move by its `detail.kind`; every one of them moved nothing."""
+    cause = error.__cause__
+    answer = cause.response if isinstance(cause, HTTPStatusError) else None
+    detail = (
+        answer.json().get("detail")
+        if answer is not None and "application/json" in answer.headers.get("content-type", "")
+        else None
+    )
+    shown = target.paths.path(destination_path)
+    kind = detail.get("kind") if isinstance(detail, dict) else None
+    if kind == "revision_conflict" and isinstance(detail, dict):
+        return revision_conflict(
+            address,
+            detail.get("db_checksum"),
+            unchanged=UNCHANGED,
+            output_format=output_format,
+            project=source.project_ref,
+        )
+    if kind == "duplicate_title" and isinstance(detail, dict):
+        return refusal(
+            "ALREADY_EXISTS",
+            f"A note titled '{detail.get('title')}' already exists at "
+            f"'{target.paths.path(str(detail.get('file_path')))}' in project "
+            f"'{target.project.name}'. {UNCHANGED}",
+            try_instead="renaming one of the notes first",
+            output_format=output_format,
+        )
+    if isinstance(detail, dict) and kind in _KEPT_ID_CODES:
+        code = _KEPT_ID_CODES[kind]
+        try_instead = {
+            "ALREADY_EXISTS": "a different destination",
+            "UNAVAILABLE": (
+                f"bm_project(command='status', project={source.project_ref!r}) and "
+                f"bm_project(command='status', project={target.project_ref!r}), then repeat"
+            ),
+        }.get(code, f"bm_read(identifier={address!r}, project={source.project_ref!r})")
+        return refusal(
+            code,
+            str(detail.get("message") or error),
+            try_instead=try_instead,
+            output_format=output_format,
+        )
+    return note_change_failure(
+        error,
+        action="move",
+        address=address,
+        unchanged=UNCHANGED,
+        occupied=shown,
+        output_format=output_format,
+        project=source.project.external_id,
+    )
+
+
 # --- A directory ---
 
 
@@ -334,6 +523,9 @@ async def move_directory_across(
 
     moved: list[MovedNote] = []
     failed: list[dict[str, str]] = []
+    # Moves the server keeps open (Git host only): the note left the source, not yet here.
+    pending: list[dict[str, Any]] = []
+    on_git = git_local_routing_active()
     for node in files:
         assert node.file_path is not None and node.external_id is not None
         relative = PurePosixPath(node.file_path).relative_to(directory)
@@ -350,10 +542,29 @@ async def move_directory_across(
                     destination_path,
                     None,
                     output_format,
+                    # One catch-up of the target after the folder, not one per note.
+                    catch_up=not on_git,
                 )
             )
+        except Refusal as error:
+            failed.append({"path": source.paths.path(node.file_path), "error": str(error)})
+            if error.code == "PARTIAL_FAILURE" and error.details and "move_id" in error.details:
+                failed[-1]["error"] = f"pending (move_id {error.details['move_id']})"
+                pending.append({"path": source.paths.path(node.file_path), **error.details})
         except ToolError as error:
             failed.append({"path": source.paths.path(node.file_path), "error": str(error)})
+    index_note = ""
+    if on_git and moved:
+        # Trigger: notes moved in with catch_up off.
+        # Why: reads by id or path in the target must work when the answer arrives.
+        # Outcome: one catch-up; a failed one leaves only the index behind (the worker
+        #   follows), never the move.
+        try:
+            caught = await GitMoveClient(target.client, target.project.external_id).catch_up()
+            if caught.index_pending:
+                index_note = f"; the target's index is still catching up ({caught.message})"
+        except ToolError as error:
+            index_note = f"; the target's index is still catching up ({error})"
 
     result: dict[str, Any] = {
         "action": "moved",
@@ -376,6 +587,8 @@ async def move_directory_across(
         ],
         "failed": failed,
     }
+    if on_git:
+        result["pending"] = pending
     # Trigger: some notes moved and some did not (a file that is not a note, a name
     #   already taken in the target project, a note that changed meanwhile).
     # Why: each note moved or stayed whole, but the directory did neither.
@@ -387,7 +600,11 @@ async def move_directory_across(
         done = "; ".join(
             f"{note['previous_file_path']} -> {note['file_path']} "
             f"(permalink {note['previous_permalink']} -> {note['permalink']}, "
-            f"id {note['previous_external_id']} -> {note['external_id']})"
+            + (
+                f"id {note['external_id']} kept)"
+                if note["previous_external_id"] == note["external_id"]
+                else f"id {note['previous_external_id']} -> {note['external_id']})"
+            )
             for note in result["moved_notes"]
         )
         listed = f". Moved: {done}" if done and output_format != "json" else ""
@@ -407,13 +624,25 @@ async def move_directory_across(
                 "moved_notes": result["moved_notes"],
                 "failed": failed,
                 "total_files": len(files),
+                **({"pending": pending} if on_git else {}),
             },
         )
     if output_format == "json":
         return result
-    return (
+    summary = (
         f"Moved directory {result['path']} (project {source.project.name}) to "
         f"{result['destination']} (project {target.project.name}) ({len(files)} files)"
+    )
+    if not on_git:
+        return summary
+    # Every note, one line each and no upper limit, as a folder move inside a project.
+    return "\n".join(
+        [summary + ", ids kept" + index_note]
+        + [
+            f"- {note['previous_file_path']} -> {note['file_path']} "
+            f"(id {note['external_id']}, permalink {note['permalink']})"
+            for note in result["moved_notes"]
+        ]
     )
 
 
