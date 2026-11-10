@@ -133,9 +133,11 @@ bm_move(identifier="plans/launch.md", destination="inbox/", project="demo",
   retrying.
 - On a Git host, a folder that differs from the destination only in case
   (`archive` to `Archive`) is refused: move it twice, through a different name.
-- On a Git host the old folders stay on disk, empty; nothing removes them.
-  After the move the files on disk follow within moments, old files first and
-  new ones after, so in a large folder some notes are briefly missing on disk.
+- On a Git host the files on disk follow the commit within moments. Each
+  note's new file is written before its old file is removed, so a moved note
+  is never missing on disk; for a moment it can be there twice, with the same
+  permalink. Folders the move leaves empty are removed; a folder that still
+  holds anything else (an attachment, a hidden file) stays.
 - A note moved away keeps its permalink, so a new note written later at the old
   path gets a permalink with a suffix (`drafts/a-1`).
 - If a folder move gets no answer, do not repeat it blindly: a repeat that

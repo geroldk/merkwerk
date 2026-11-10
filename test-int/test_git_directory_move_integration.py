@@ -232,8 +232,9 @@ async def test_a_folder_moves_as_one_commit_and_the_answer_lists_every_note(
             root = Path(host_setup.project.path)
             assert (root / "archive/drafts/sub/b.md").read_text() == before.files["drafts/sub/b.md"]
             assert not (root / "drafts/a.md").exists()
-            # No empty-folder cleanup exists anywhere: the old folders stay on disk.
-            assert (root / "drafts/sub").is_dir()
+            # The files stage removes the folders its own deletions left empty (F2).
+            assert not (root / "drafts").exists()
+            assert (root / "keep").is_dir()
             found = await client.request(
                 "QUERY",
                 f"/v2/projects/{project_id}/search/",
@@ -777,6 +778,55 @@ async def test_a_folder_moving_up_into_its_parent_swaps_paths_on_disk(git_host):
     assert (root / "a/x.md").read_text() == files["a/b/x.md"]
     assert (root / "a/b/x.md").read_text() == files["a/b/b/x.md"]
     assert not (root / "a/b/b/x.md").exists()
+
+
+@pytest.mark.asyncio
+async def test_disk_follows_a_folder_move_without_a_moment_lacking_a_note(git_host, monkeypatch):
+    """F2: each note's new file is written before its old file goes; old folders go too."""
+    from basic_memory.api.app import app
+    from basic_memory.index.note_content_materialization import LocalNoteContentStorage
+
+    project_id = git_host.project.external_id
+    files = {path: note(path) for path in ("src/a.md", "src/b.md", "src/sub/c.md", "src/sub/d.md")}
+    seed(git_host.repository, files)
+    root = Path(git_host.project.path)
+    missing: list[str] = []
+
+    def look(event: str) -> None:
+        # Recorded, not raised: the hook runs inside the worker, which retries on errors.
+        for old, text in files.items():
+            new = "dst/" + old.removeprefix("src/")
+            if not any(
+                (root / path).is_file() and (root / path).read_text() == text for path in (old, new)
+            ):
+                missing.append(f"{event}: {old}")
+
+    write = LocalNoteContentStorage.write_file
+    delete = LocalNoteContentStorage.delete_file_if_matches
+
+    async def watched_write(self, path, content, *, metadata=None):
+        checksum = await write(self, path, content, metadata=metadata)
+        look(f"write {path}")
+        return checksum
+
+    async def watched_delete(self, path, *, expected_checksum):
+        outcome = await delete(self, path, expected_checksum=expected_checksum)
+        look(f"delete {path}")
+        return outcome
+
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=ASGITransport(app), base_url="http://test") as client:
+            await ready(client, project_id)
+            monkeypatch.setattr(LocalNoteContentStorage, "write_file", watched_write)
+            monkeypatch.setattr(LocalNoteContentStorage, "delete_file_if_matches", watched_delete)
+            response = await move(client, project_id, "src", "dst")
+            assert response.status_code == 200, response.text
+            await files_written(project_id)
+            await ready(client, project_id)
+    assert missing == []
+    assert not (root / "src").exists()
+    for old, text in files.items():
+        assert (root / ("dst/" + old.removeprefix("src/"))).read_text() == text
 
 
 @pytest.mark.asyncio

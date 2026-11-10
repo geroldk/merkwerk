@@ -29,6 +29,7 @@ from basic_memory.repository.git_projection_repository import (
     GitProjectionConflict,
     GitProjectionContentBasis,
     GitProjectionRepository,
+    GitProjectionSuperseded,
 )
 
 
@@ -48,20 +49,20 @@ async def project_git_content(
     session_maker: async_sessionmaker[AsyncSession],
     read_cache: ReadCacheInvalidator | None = None,
     commit_id: str | None = None,
-    redrive_materialization: bool = True,
     known_ancestor: GitSnapshot | None = None,
 ) -> GitContentProjection:
     """Restore portable UUIDs and exact NoteContent, leaving file/index work pending.
 
-    Call the existing materialization recovery and project index after this returns.
-    The result confirms SQL content preparation, not complete file/graph/vector progress.
+    Only notes whose content or path changed become pending; the Git files stage checks
+    every other note's file on disk itself. The result confirms SQL content preparation,
+    not complete file/graph/vector progress.
     `known_ancestor` is a published snapshot the caller read itself and built the target
     on (a folder move publishes on top of the basis it read); local notes it holds with
     the same UUID, path and bytes need no search through Git history.
     """
     snapshot = await asyncio.to_thread(repository.snapshot, commit_id)
     if snapshot.commit_id != await asyncio.to_thread(repository.head):
-        raise GitProjectionConflict("Projection requires the current published Git head")
+        raise GitProjectionSuperseded("Projection requires the current published Git head")
     if known_ancestor is not None and not await asyncio.to_thread(
         repository.is_ancestor, known_ancestor.commit_id, snapshot.commit_id
     ):
@@ -189,7 +190,7 @@ async def project_git_content(
     )
     async with invalidation:
         if snapshot.commit_id != await asyncio.to_thread(repository.head):
-            raise GitProjectionConflict(
+            raise GitProjectionSuperseded(
                 "Published Git head advanced during projection; retry latest"
             )
         async with db.scoped_session(session_maker) as session:
@@ -221,7 +222,7 @@ async def project_git_content(
                 )
         for note in snapshot.manifest.notes:
             if snapshot.commit_id != await asyncio.to_thread(repository.head):
-                raise GitProjectionConflict(
+                raise GitProjectionSuperseded(
                     "Published Git head advanced during projection; retry latest"
                 )
             async with db.scoped_session(session_maker) as session:
@@ -233,7 +234,6 @@ async def project_git_content(
                     markdown_content=target.content,
                     checksum=target.checksum,
                     expected=bases[note.external_id],
-                    redrive_materialization=redrive_materialization,
                 )
             changed += int(restored)
     return GitContentProjection(

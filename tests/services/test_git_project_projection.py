@@ -10,6 +10,7 @@ import pytest
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 
+from basic_memory.index.git_projection import build_git_projection_pipeline
 from basic_memory.index.note_content_materialization import recover_stuck_materializations
 from basic_memory.models import Entity, NoteContent, Project
 from basic_memory.read_cache import ReadCacheChange, ReadCacheInvalidationStatus
@@ -18,6 +19,7 @@ from basic_memory.repository.git_project_repository import GitProjectRepository
 from basic_memory.repository.git_projection_repository import (
     GitProjectionConflict,
     GitProjectionRepository,
+    GitProjectionSuperseded,
     register_git_project,
 )
 from basic_memory.repository.note_content_repository import NoteContentVersionConflict
@@ -70,7 +72,7 @@ def local_entity(project_id: int, external_id: UUID, path: str = "notes/a.md") -
 @pytest.mark.asyncio
 @pytest.mark.parametrize("seed_entity", [False, True])
 async def test_retry_keeps_uuid_and_version_and_restores_a_missing_file(
-    repository, markdown, test_project, session_maker, seed_entity
+    repository, markdown, test_project, session_maker, app_config, seed_entity
 ):
     note_id = uuid4()
     publish(repository, markdown, note_id)
@@ -94,11 +96,17 @@ async def test_retry_keeps_uuid_and_version_and_restores_a_missing_file(
         repository, project_id=test_project.id, session_maker=session_maker
     )
     assert retry.notes_changed == 0
-    assert (
-        await recover_stuck_materializations(
-            session_maker=session_maker, file_service=storage, project_id=test_project.id
+    # An unchanged note stays as it is in SQL (F2): no pending flip at every commit.
+    # The Git files stage checks every file on disk itself and writes the lost one.
+    async with session_maker() as session:
+        content = await session.scalar(
+            select(NoteContent).where(NoteContent.project_id == test_project.id)
         )
-    ).written == 1
+        assert content is not None and content.file_write_status == "synced"
+    pipeline = build_git_projection_pipeline(
+        repository, project=test_project, session_maker=session_maker, app_config=app_config
+    )
+    await pipeline.apply("files", repository.head())
     assert target.read_bytes() == markdown.encode()
     async with session_maker() as session:
         entity = await session.scalar(select(Entity).where(Entity.external_id == str(note_id)))
@@ -363,18 +371,20 @@ async def test_sql_revision_is_compared_again_before_projection(
                 checksum=basis.checksum,
                 expected=None,
             )
+        # An unchanged note is not touched: no state field update, no new revision.
         monkeypatch.setattr(
-            projection.contents, "update_state_fields", AsyncMock(return_value=None)
+            projection.contents,
+            "update_state_fields",
+            AsyncMock(side_effect=AssertionError("unchanged note must keep its file state")),
         )
-        with pytest.raises(NoteContentVersionConflict, match="retry"):
-            await projection.restore_note(
-                session,
-                external_id=note_id,
-                fields=fields,
-                markdown_content=markdown,
-                checksum=basis.checksum,
-                expected=basis,
-            )
+        assert not await projection.restore_note(
+            session,
+            external_id=note_id,
+            fields=fields,
+            markdown_content=markdown,
+            checksum=basis.checksum,
+            expected=basis,
+        )
 
 
 class RecordingCache:
@@ -446,7 +456,8 @@ async def test_published_head_change_during_preparation_stops_projection(
         return checksum
 
     monkeypatch.setattr(service, "compute_checksum", publish_before_write)
-    with pytest.raises(GitProjectionConflict, match="advanced during projection"):
+    # Superseded, not a failure: the worker starts the next pass at once (F2).
+    with pytest.raises(GitProjectionSuperseded, match="advanced during projection"):
         await project_git_content(
             repository, project_id=test_project.id, session_maker=session_maker
         )

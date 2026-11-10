@@ -12,7 +12,7 @@ import pytest
 from sqlalchemy import select
 
 from basic_memory.index.git_projection import build_git_projection_pipeline
-from basic_memory.index.git_projection_worker import GitProjectionWorker
+from basic_memory.index.git_projection_worker import GitPassOutcome, GitProjectionWorker
 from basic_memory.index.local_dependencies import LocalMarkdownFileIndexer
 from basic_memory.models import Entity, Observation, Relation
 from basic_memory.repository.git_project_repository import GitProjectRepository
@@ -49,8 +49,8 @@ async def initialize(pipeline):
     }
     publish(pipeline, files)
     worker = GitProjectionWorker(pipeline)
-    assert await worker._pass(vectors=False)
-    assert await worker._pass(vectors=True)
+    assert await worker._pass(vectors=False) is GitPassOutcome.done
+    assert await worker._pass(vectors=True) is GitPassOutcome.done
     assert (await worker.status()).caught_up
     return worker, files
 
@@ -70,9 +70,9 @@ async def test_body_only_update_indexes_one_note_and_preserves_untouched_graph(
     monkeypatch.setattr(LocalMarkdownFileIndexer, "index_file", record)
     files["Source.md"] = files["Source.md"].replace("Firstprobe", "Deltaprobe")
     commit = publish(pipeline, files)
-    assert await worker._pass(vectors=False)
+    assert await worker._pass(vectors=False) is GitPassOutcome.done
     assert calls == ["Source.md"]
-    assert await worker._pass(vectors=True)
+    assert await worker._pass(vectors=True) is GitPassOutcome.done
     assert (await worker.status()).caught_up
     async with pipeline.session_maker() as session:
         assert await session.scalar(select(Observation.content)) == "Deltaprobe"
@@ -86,7 +86,7 @@ async def test_body_only_update_indexes_one_note_and_preserves_untouched_graph(
         for row in await pipeline.search_service.repository.get_entity_chunk_manifest(source_id)
     )
     restarted = GitProjectionWorker(pipeline)
-    assert await restarted._pass(vectors=False)
+    assert await restarted._pass(vectors=False) is GitPassOutcome.done
     assert calls == ["Source.md"]
     assert (
         next(
@@ -112,7 +112,7 @@ async def test_partial_intermediate_graph_is_repaired_even_when_latest_reverts_i
 
     if fault == "error":
         monkeypatch.setattr(LocalMarkdownFileIndexer, "index_file", fail_after_source)
-        assert not await worker._pass(vectors=False)
+        assert await worker._pass(vectors=False) is GitPassOutcome.failed
     else:
         config_path = tmp_path / "worker-config.json"
         config_path.write_text(app_config.model_dump_json())
@@ -148,11 +148,11 @@ async def test_partial_intermediate_graph_is_repaired_even_when_latest_reverts_i
 
     monkeypatch.setattr(LocalMarkdownFileIndexer, "index_file", record)
     restarted = GitProjectionWorker(pipeline)
-    assert await restarted._pass(vectors=False)
+    assert await restarted._pass(vectors=False) is GitPassOutcome.done
     assert calls == ["Source.md", "Target.md"]
     async with pipeline.session_maker() as session:
         assert await session.scalar(select(Observation.content)) == "Firstprobe"
-    assert await restarted._pass(vectors=True)
+    assert await restarted._pass(vectors=True) is GitPassOutcome.done
     assert (await restarted.status()).caught_up
 
 
@@ -187,13 +187,13 @@ async def test_delete_between_graph_runs_invalidates_reuse_before_the_target_is_
         return await index(self, path, source=source)
 
     monkeypatch.setattr(LocalMarkdownFileIndexer, "index_file", record)
-    assert await worker._pass(vectors=False)
+    assert await worker._pass(vectors=False) is GitPassOutcome.done
     assert calls == ["Source.md", "Target.md"]
     async with pipeline.session_maker() as session:
         target_id = await session.scalar(select(Entity.id).where(Entity.title == "Target"))
         assert target_id is not None
         assert await session.scalar(select(Relation.to_id)) == target_id
-    assert await worker._pass(vectors=True)
+    assert await worker._pass(vectors=True) is GitPassOutcome.done
     assert (await worker.status()).caught_up
 
 
@@ -218,8 +218,8 @@ async def test_identity_or_graph_policy_change_indexes_unchanged_sources(
         pipeline = replace(pipeline, graph_key=pipeline.graph_key + ":new-graph-policy")
         worker = GitProjectionWorker(pipeline)
         assert not (await worker.status()).caught_up
-    assert await worker._pass(vectors=False)
+    assert await worker._pass(vectors=False) is GitPassOutcome.done
     assert calls == ["Source.md", "Target.md"]
     assert not (await worker.status()).caught_up
-    assert await worker._pass(vectors=True)
+    assert await worker._pass(vectors=True) is GitPassOutcome.done
     assert (await worker.status()).caught_up

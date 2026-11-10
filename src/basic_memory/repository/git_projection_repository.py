@@ -24,6 +24,14 @@ class GitProjectionConflict(ValueError):
     """Local identities or content cannot be safely adopted by this snapshot."""
 
 
+class GitProjectionSuperseded(GitProjectionConflict):
+    """The target is no longer the published head; the work done for it stays valid.
+
+    Nothing is wrong with the project: a newer commit arrived. The worker starts the
+    next pass for the newer head at once, without counting a failure or backing off.
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class GitProjectionContentBasis:
     entity_id: int
@@ -128,7 +136,6 @@ class GitProjectionRepository:
         markdown_content: str,
         checksum: str,
         expected: GitProjectionContentBasis | None,
-        redrive_materialization: bool = True,
     ) -> bool:
         if fields.external_id != str(external_id):
             raise GitProjectionConflict("Prepared fields have a different note UUID")
@@ -140,21 +147,9 @@ class GitProjectionRepository:
             and current.markdown_content == markdown_content
             and current.checksum == checksum
         ):
-            if not redrive_materialization:
-                return False
-            # Re-drive lost files or interrupted materialization without creating
-            # a new content revision. The existing writer still guards disk bytes.
-            updated = await self.contents.update_state_fields(
-                session,
-                current.entity_id,
-                expected_db_version=current.db_version,
-                file_write_status="pending",
-                last_materialization_error=None,
-            )
-            if updated is None:
-                raise NoteContentVersionConflict(
-                    "Local content advanced during Git materialization retry"
-                )
+            # An unchanged note keeps its file state. The Git files stage checks every
+            # note's file on disk itself, so a lost file is rewritten without marking
+            # the whole project pending at each commit (F2).
             return False
         entity = await self._find_identity(session, external_id, fields.file_path)
         if entity is None:

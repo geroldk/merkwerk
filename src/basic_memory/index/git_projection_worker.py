@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, nullcontext
 from dataclasses import dataclass
+from enum import StrEnum
 
 from loguru import logger
 
@@ -14,6 +15,14 @@ from basic_memory.repository.git_progress_repository import (
     GitProjectionStage,
     GitStageProgress,
 )
+from basic_memory.repository.git_projection_repository import GitProjectionSuperseded
+
+
+class GitPassOutcome(StrEnum):
+    done = "done"
+    failed = "failed"
+    # A newer commit arrived; the work done stays valid and the next pass starts at once.
+    superseded = "superseded"
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,7 +56,9 @@ class GitProjectionWorker:
 
     The context owns both tasks. There is no in-memory job backlog: each pass
     samples the latest Git head and durable checkpoints. Partial failed stages
-    are retried as a whole. A crash before acknowledgement safely repeats work.
+    are retried as a whole; work already on disk costs one hash per note then. A
+    newer head supersedes a pass at once, without a failure or a backoff. A crash
+    before acknowledgement safely repeats work.
     Local root/repository bindings and OS locks enforce unique ownership.
     """
 
@@ -106,7 +117,7 @@ class GitProjectionWorker:
                     # Only SQL content gates admission. Slow files/graph/vectors
                     # start in the background after this explicit startup barrier.
                     commit_id = await asyncio.to_thread(self.pipeline.repository.head)
-                    await self.pipeline.recover_content(commit_id, redrive_materialization=False)
+                    await self.pipeline.recover_content(commit_id)
                     self.startup_content_commit = commit_id
                 index = group.create_task(self._loop(vectors=False), name="git-projection-index")
                 vectors = group.create_task(self._loop(vectors=True), name="git-projection-vectors")
@@ -125,20 +136,31 @@ class GitProjectionWorker:
             # Clear before work: a publication during the pass schedules an immediate next pass.
             wake.clear()
             try:
-                succeeded = await self._pass(vectors=vectors)
+                outcome = await self._pass(vectors=vectors)
             except Exception:
                 # The lifecycle boundary retries storage/DB failures too. Cancellation
                 # propagates; a failed checkpoint write can never acknowledge the stage.
                 logger.exception("Git projection pass failed", project_id=self.pipeline.project_id)
-                succeeded = False
-            failures = 0 if succeeded else min(failures + 1, 6)
-            delay = self.poll_interval * (2**failures)
+                outcome = GitPassOutcome.failed
+            if outcome is GitPassOutcome.superseded:
+                # Trigger: a newer commit replaced the target during the pass.
+                # Why: nothing failed, and the work done stays valid for the newer head;
+                #   a backoff would only leave disk behind Git for longer.
+                # Outcome: failures stay as they are. The index lane re-targets the newer
+                #   head right away; vectors wait for the index lane, which wakes them.
+                if not vectors:
+                    await asyncio.sleep(0)
+                    continue
+                delay = self.poll_interval
+            else:
+                failures = 0 if outcome is GitPassOutcome.done else min(failures + 1, 6)
+                delay = self.poll_interval * (2**failures)
             try:
                 await asyncio.wait_for(wake.wait(), timeout=delay)
             except TimeoutError:
                 pass
 
-    async def _pass(self, *, vectors: bool) -> bool:
+    async def _pass(self, *, vectors: bool) -> GitPassOutcome:
         await self.pipeline.require_registration()
         if not vectors:
             commit_id = await asyncio.to_thread(self.pipeline.repository.head)
@@ -154,9 +176,9 @@ class GitProjectionWorker:
             rows = {row.stage: row for row in await self.progress.read()}
             row = rows.get(stage)
             if row is None:
-                return True
+                return GitPassOutcome.done
             if stage == "vectors" and rows["graph"].completed_commit != row.target_commit:
-                return True
+                return GitPassOutcome.done
             if (
                 row.completed_commit == row.target_commit
                 and row.running_commit is None
@@ -167,7 +189,7 @@ class GitProjectionWorker:
                 stage, row.target_commit, reusable_commit=row.reusable_commit
             )
             if run_id is None:
-                return False
+                return GitPassOutcome.failed
             try:
                 gate = self.content_gate if stage == "content" else None
                 async with gate if gate is not None else nullcontext():
@@ -178,6 +200,16 @@ class GitProjectionWorker:
                     else:
                         await self.pipeline.apply(stage, row.target_commit)
                     await self.pipeline.require_head(row.target_commit)
+            except GitProjectionSuperseded as error:
+                await self.progress.finish(stage, row.target_commit, run_id, error="superseded")
+                logger.info(
+                    "Git projection stage superseded by a newer head",
+                    project_id=self.pipeline.project_id,
+                    stage=stage,
+                    commit_id=row.target_commit,
+                    reason=str(error),
+                )
+                return GitPassOutcome.superseded
             except Exception as error:
                 await self.progress.finish(stage, row.target_commit, run_id, error=str(error))
                 logger.warning(
@@ -187,9 +219,9 @@ class GitProjectionWorker:
                     commit_id=row.target_commit,
                     error=str(error),
                 )
-                return False
+                return GitPassOutcome.failed
             if not await self.progress.finish(stage, row.target_commit, run_id):
-                return False
+                return GitPassOutcome.failed
             if stage == "graph":
                 self._wake_vectors.set()
-        return True
+        return GitPassOutcome.done

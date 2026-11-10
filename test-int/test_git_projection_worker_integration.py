@@ -18,7 +18,7 @@ from basic_memory.index.git_projection import (
     PublishedGitIndexWriter,
     build_git_projection_pipeline,
 )
-from basic_memory.index.git_projection_worker import GitProjectionWorker
+from basic_memory.index.git_projection_worker import GitPassOutcome, GitProjectionWorker
 from basic_memory.indexing.models import IndexFrontmatterUpdate
 from basic_memory.models import Entity, NoteContent, Observation, Relation
 from basic_memory.repository.git_project_repository import GitProjectRepository
@@ -322,7 +322,7 @@ async def test_worker_owns_its_lifecycle_and_retries_checkpoint_failure(pipeline
         GitProjectionWorker(pipeline, poll_interval=0)
     worker = GitProjectionWorker(pipeline, poll_interval=0.02)
     assert not (await worker.status()).caught_up
-    assert await worker._pass(vectors=True)
+    assert await worker._pass(vectors=True) is GitPassOutcome.done
     target = worker.progress.target
     failures = 0
 
@@ -386,6 +386,8 @@ async def test_pipeline_rejects_missing_sql_private_file_and_head_change(pipelin
     commit = publish(pipeline)
     with pytest.raises(GitProjectionConflict, match="SQL content"):
         await pipeline.apply("files", commit)
+    with pytest.raises(GitProjectionConflict, match="SQL content"):
+        await pipeline.apply("graph", commit)
     with pytest.raises(GitProjectionConflict, match="head advanced"):
         await pipeline.require_head("0" * 40)
     target = pipeline.file_service.base_path / "notes/Source.md"
