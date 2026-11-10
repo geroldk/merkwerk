@@ -15,7 +15,10 @@ from basic_memory.repository.git_progress_repository import (
     GitProjectionStage,
     GitStageProgress,
 )
-from basic_memory.repository.git_projection_repository import GitProjectionSuperseded
+from basic_memory.repository.git_projection_repository import (
+    GitProjectionDeferred,
+    GitProjectionSuperseded,
+)
 
 
 class GitPassOutcome(StrEnum):
@@ -23,6 +26,14 @@ class GitPassOutcome(StrEnum):
     failed = "failed"
     # A newer commit arrived; the work done stays valid and the next pass starts at once.
     superseded = "superseded"
+    # Notes wait for another project to release their UUIDs (I1); nothing failed.
+    deferred = "deferred"
+
+
+# A waiting project is woken when its owner's content stage completes; polling is only
+# the fallback, so it runs at a longer, capped interval instead of backing off.
+DEFERRED_POLL_FACTOR = 6
+DEFERRED_POLL_CAP = 60.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,11 +90,35 @@ class GitProjectionWorker:
         self._wake_vectors = asyncio.Event()
         self._running = False
         self.startup_content_commit: str | None = None
+        # In memory only: which notes the content stage waits for, at which target.
+        self.deferral: GitProjectionDeferred | None = None
+        self.deferral_commit: str | None = None
+
+    @property
+    def deferred_interval(self) -> float:
+        return max(
+            self.poll_interval, min(self.poll_interval * DEFERRED_POLL_FACTOR, DEFERRED_POLL_CAP)
+        )
 
     def notify(self) -> None:
         """Optional latency hint after publication; polling never depends on delivery."""
         self._wake_index.set()
         self._wake_vectors.set()
+
+    def wake_index(self) -> None:
+        """Another project released UUIDs this one may wait for: retry content now."""
+        self._wake_index.set()
+
+    def _content_deferred(self, commit_id: str, deferral: GitProjectionDeferred) -> None:
+        self.deferral, self.deferral_commit = deferral, commit_id
+        if (identities := self.pipeline.identities) is not None:
+            identities.wait_for(self.pipeline.project_id, deferral.owner_project_ids)
+
+    def _content_settled(self) -> None:
+        """The content stage ran to completion: wake the projects that wait for this one."""
+        self.deferral = self.deferral_commit = None
+        if (identities := self.pipeline.identities) is not None:
+            identities.settled(self.pipeline.project_id)
 
     async def status(self) -> GitProjectProgress:
         await self.pipeline.require_registration()
@@ -117,8 +152,24 @@ class GitProjectionWorker:
                     # Only SQL content gates admission. Slow files/graph/vectors
                     # start in the background after this explicit startup barrier.
                     commit_id = await asyncio.to_thread(self.pipeline.repository.head)
-                    await self.pipeline.recover_content(commit_id)
-                    self.startup_content_commit = commit_id
+                    try:
+                        await self.pipeline.recover_content(commit_id)
+                    except GitProjectionDeferred as deferral:
+                        # Trigger: notes wait for another project to release their UUIDs.
+                        # Why: one waiting project must not stop the host (P4); a real
+                        #   duplicate still raises and refuses the start, loudly.
+                        # Outcome: no SQL basis is claimed, so writes here are refused
+                        #   until the loop completes the content stage.
+                        self._content_deferred(commit_id, deferral)
+                        logger.warning(
+                            "Git projection deferred at startup",
+                            project_id=self.pipeline.project_id,
+                            commit_id=commit_id,
+                            reason=str(deferral),
+                        )
+                    else:
+                        self.startup_content_commit = commit_id
+                        self._content_settled()
                 index = group.create_task(self._loop(vectors=False), name="git-projection-index")
                 vectors = group.create_task(self._loop(vectors=True), name="git-projection-vectors")
                 try:
@@ -142,7 +193,14 @@ class GitProjectionWorker:
                 # propagates; a failed checkpoint write can never acknowledge the stage.
                 logger.exception("Git projection pass failed", project_id=self.pipeline.project_id)
                 outcome = GitPassOutcome.failed
-            if outcome is GitPassOutcome.superseded:
+            if outcome is GitPassOutcome.deferred:
+                # Trigger: notes wait for another project (I1).
+                # Why: nothing failed; the owner's completed content stage wakes this
+                #   lane, so polling is a capped fallback, not an exponential backoff.
+                # Outcome: the failure count resets and the next poll waits longer.
+                failures = 0
+                delay = self.deferred_interval
+            elif outcome is GitPassOutcome.superseded:
                 # Trigger: a newer commit replaced the target during the pass.
                 # Why: nothing failed, and the work done stays valid for the newer head;
                 #   a backoff would only leave disk behind Git for longer.
@@ -210,8 +268,20 @@ class GitProjectionWorker:
                     reason=str(error),
                 )
                 return GitPassOutcome.superseded
+            except GitProjectionDeferred as deferral:
+                await self.progress.finish(stage, row.target_commit, run_id, error=str(deferral))
+                self._content_deferred(row.target_commit, deferral)
+                logger.info(
+                    "Git projection content waits for another project",
+                    project_id=self.pipeline.project_id,
+                    commit_id=row.target_commit,
+                    reason=str(deferral),
+                )
+                return GitPassOutcome.deferred
             except Exception as error:
                 await self.progress.finish(stage, row.target_commit, run_id, error=str(error))
+                if stage == "content":
+                    self.deferral = self.deferral_commit = None
                 logger.warning(
                     "Git projection stage pending after failure",
                     project_id=self.pipeline.project_id,
@@ -222,6 +292,8 @@ class GitProjectionWorker:
                 return GitPassOutcome.failed
             if not await self.progress.finish(stage, row.target_commit, run_id):
                 return GitPassOutcome.failed
+            if stage == "content":
+                self._content_settled()
             if stage == "graph":
                 self._wake_vectors.set()
         return GitPassOutcome.done

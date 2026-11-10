@@ -25,12 +25,16 @@ from basic_memory.repository.git_project_repository import GitProjectRepository,
 from basic_memory.repository.git_graph_inputs import git_graph_identities_unchanged
 from basic_memory.repository.git_progress_repository import invalidate_git_graphs
 from basic_memory.repository.git_layout_repository import GitLayoutRepository, GitPreparedNote
+from basic_memory.repository.git_host_identities import GitHostIdentities
 from basic_memory.repository.git_projection_repository import (
     GitProjectionConflict,
     GitProjectionContentBasis,
+    GitProjectionDeferred,
     GitProjectionRepository,
     GitProjectionSuperseded,
 )
+
+OWNED_ELSEWHERE = "Note UUID is already owned by another project or path"
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +54,7 @@ async def project_git_content(
     read_cache: ReadCacheInvalidator | None = None,
     commit_id: str | None = None,
     known_ancestor: GitSnapshot | None = None,
+    identities: GitHostIdentities | None = None,
 ) -> GitContentProjection:
     """Restore portable UUIDs and exact NoteContent, leaving file/index work pending.
 
@@ -59,6 +64,10 @@ async def project_git_content(
     `known_ancestor` is a published snapshot the caller read itself and built the target
     on (a folder move publishes on top of the basis it read); local notes it holds with
     the same UUID, path and bytes need no search through Git history.
+    With the host's `identities`, a note whose UUID another project still owns for a
+    proven reason waits (I1): everything else is projected, which also releases the
+    UUIDs this project gives away, and GitProjectionDeferred names the waiting notes.
+    Without them (offline tools), any foreign UUID refuses the snapshot as before.
     """
     snapshot = await asyncio.to_thread(repository.snapshot, commit_id)
     if snapshot.commit_id != await asyncio.to_thread(repository.head):
@@ -94,23 +103,45 @@ async def project_git_content(
         project = await projection.validate_project(session, snapshot.manifest)
         root = Path(project.path).resolve()
         local_notes = await layout.local_notes(session)
-        foreign = await session.scalar(
-            select(Entity.id)
-            .where(
-                Entity.external_id.in_([str(note.external_id) for note in snapshot.manifest.notes]),
-                Entity.project_id != project_id,
+        waiting: frozenset[UUID] = frozenset()
+        deferral: GitProjectionDeferred | None = None
+        if identities is None:
+            foreign = await session.scalar(
+                select(Entity.id)
+                .where(
+                    Entity.external_id.in_(
+                        [str(note.external_id) for note in snapshot.manifest.notes]
+                    ),
+                    Entity.project_id != project_id,
+                )
+                .limit(1)
             )
-            .limit(1)
-        )
-        if foreign is not None:
-            raise GitProjectionConflict("Note UUID is already owned by another project or path")
+            if foreign is not None:
+                raise GitProjectionConflict(OWNED_ELSEWHERE)
+        else:
+            owned = await identities.classify_foreign(
+                session,
+                project_id=project_id,
+                manifest=snapshot.manifest,
+                history=(repository, snapshot.commit_id),
+            )
+            if owned.duplicates:
+                raise GitProjectionConflict(identities.duplicates_message(OWNED_ELSEWHERE, owned))
+            if owned.deferred:
+                waiting = frozenset(owned.deferred)
+                deferral = identities.deferral(owned)
+    # A waiting note stays out of everything below: its path stays empty here, and the
+    # rest of the snapshot (removals and moves included) is projected as usual.
+    notes = [note for note in snapshot.manifest.notes if note.external_id not in waiting]
+    target_files = {note.path: snapshot.files[note.path] for note in notes}
+    target_ids = {note.path: note.external_id for note in notes}
     if repository.path.is_relative_to(root) or root.is_relative_to(repository.path):
         raise GitProjectionConflict(
             "Internal Git repository must be outside the indexed project root"
         )
     observed_at = await asyncio.to_thread(repository.committed_at, snapshot.commit_id)
     parser = EntityParser(root)
-    desired_paths = {note.external_id: note.path for note in snapshot.manifest.notes}
+    desired_paths = {note.external_id: note.path for note in notes}
     local_by_uuid = {note.external_id: note for note in local_notes}
     for local in local_notes:
         if desired_paths.get(local.external_id) != local.file_path:
@@ -127,7 +158,7 @@ async def project_git_content(
                 )
     prepared: dict[UUID, GitPreparedNote] = {}
     bases: dict[UUID, GitProjectionContentBasis | None] = {}
-    for note in snapshot.manifest.notes:
+    for note in notes:
         content = snapshot.files[note.path]
         local = local_by_uuid.get(note.external_id)
         basis = local.content if local is not None else None
@@ -194,6 +225,9 @@ async def project_git_content(
                 "Published Git head advanced during projection; retry latest"
             )
         async with db.scoped_session(session_maker) as session:
+            # Compared with what this pass projects, not the whole snapshot: while notes
+            # wait, SQL lacks them on every pass, and a full comparison would reset the
+            # graph and vector progress of every project on the host each time.
             if any(
                 note.content is None for note in local_notes
             ) or not git_graph_identities_unchanged(
@@ -203,8 +237,8 @@ async def project_git_content(
                     if note.content is not None
                 },
                 {note.file_path: note.external_id for note in local_notes},
-                snapshot.files,
-                snapshot.manifest.note_ids,
+                target_files,
+                target_ids,
             ):
                 await invalidate_git_graphs(session)
             moved, removed = await layout.apply(session, expected=local_notes, target=prepared)
@@ -220,7 +254,7 @@ async def project_git_content(
                     target.checksum,
                     target.content,
                 )
-        for note in snapshot.manifest.notes:
+        for note in notes:
             if snapshot.commit_id != await asyncio.to_thread(repository.head):
                 raise GitProjectionSuperseded(
                     "Published Git head advanced during projection; retry latest"
@@ -236,6 +270,9 @@ async def project_git_content(
                     expected=bases[note.external_id],
                 )
             changed += int(restored)
+    # Raised after the cache invalidation above has run for what was projected.
+    if deferral is not None:
+        raise deferral
     return GitContentProjection(
         snapshot.commit_id, len(snapshot.manifest.notes), changed, moved, removed
     )

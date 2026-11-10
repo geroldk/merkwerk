@@ -16,6 +16,7 @@ from uuid import UUID, uuid4
 
 from loguru import logger
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from basic_memory import db
 from basic_memory.file_utils import compute_checksum
@@ -37,7 +38,10 @@ from basic_memory.indexing.accepted_note_mutation_runner import (
 from basic_memory.models import Entity, NoteContent
 from basic_memory.repository.git_layout_repository import GitLayoutRepository
 from basic_memory.repository.git_graph_inputs import git_graph_identities_unchanged
-from basic_memory.repository.git_progress_repository import invalidate_git_graphs
+from basic_memory.repository.git_progress_repository import (
+    GitProgressRepository,
+    invalidate_git_graphs,
+)
 from basic_memory.repository.git_project_repository import (
     GitPublication,
     GitPublicationConflict,
@@ -45,14 +49,18 @@ from basic_memory.repository.git_project_repository import (
     GitSnapshot,
     settle_git_publication,
 )
-from basic_memory.repository.git_projection_repository import GitProjectionConflict
+from basic_memory.repository.git_projection_repository import (
+    GitProjectionConflict,
+    GitProjectionDeferred,
+)
 from basic_memory.repository.git_transaction_repository import GitTransactionError
 from basic_memory.runtime.project_partition import RuntimeProjectNoteOperation
 from basic_memory.services.note_content_writes import (
     AcceptedNoteChange,
     AcceptedNoteMutationRequest,
-    NoteContentPublicationConflict,
     NoteContentMutationServiceError,
+    NoteContentProjectWaiting,
+    NoteContentPublicationConflict,
 )
 from basic_memory.services.git_directory_moves import (
     GitDirectoryMoveConflict,
@@ -146,7 +154,16 @@ class GitProjectRuntime:
             # This immutable basis is captured before any runner/preparer reads SQL.
             base = await asyncio.to_thread(repository.snapshot)
             if self._sql_commit != base.commit_id:
-                await self.pipeline.apply("content", base.commit_id)
+                try:
+                    await self.pipeline.apply("content", base.commit_id)
+                except GitProjectionDeferred as deferral:
+                    # Trigger: notes of this head wait for another project to release them.
+                    # Why: SQL must match the basis exactly before any write here, and it
+                    #   lacks the waiting notes; this is a wait, not "SQL pending" (503).
+                    # Outcome: 409 kind=deferred naming the notes and their owners.
+                    raise NoteContentProjectWaiting(
+                        await deferral_detail(deferral, self.pipeline.session_maker)
+                    ) from deferral
                 self._sql_commit = base.commit_id
             layout = GitLayoutRepository(self.pipeline.project_id)
             publication: GitPublication | None = None
@@ -383,9 +400,9 @@ class GitProjectRuntime:
                         "published_commit": publication.commit_id,
                     },
                 ) from error
-            # Constraint for I1: if projection learns to defer (a UUID still owned by another
-            # project) instead of raising, this must answer "SQL pending" rather than move
-            # _sql_commit forward over a projection that did not happen.
+            # A deferral cannot reach this point: the basis above projected without one
+            # (accept-style catch-up), and the move only renames notes it already holds. A
+            # deferred project refuses before publication, as "not_accepting" (I1).
             self._sql_commit = publication.commit_id
         finally:
             await self._drop_candidate(transaction_id)
@@ -507,3 +524,41 @@ def _unclean_source(conflicts: Sequence[GitDirectoryMoveConflict]) -> GitDirecto
         + "; ".join(conflict.describe() for conflict in conflicts),
         conflicts,
     )
+
+
+async def owner_content_errors(
+    deferral: GitProjectionDeferred, session_maker: async_sessionmaker[AsyncSession]
+) -> dict[int, str]:
+    """Each owner's own content-stage error, by project id.
+
+    An owner whose own projection fails never releases what it holds; that error is
+    the real cause of the wait, so it is named next to it.
+    """
+    errors: dict[int, str] = {}
+    for owner_id in sorted(deferral.owner_project_ids):
+        stages = await GitProgressRepository(owner_id, session_maker).read()
+        content = next((stage for stage in stages if stage.stage == "content"), None)
+        if content is not None and content.last_error:
+            errors[owner_id] = content.last_error
+    return errors
+
+
+async def deferral_detail(
+    deferral: GitProjectionDeferred, session_maker: async_sessionmaker[AsyncSession]
+) -> dict[str, str | None]:
+    """The 409 body for a write into a waiting project: notes, owners, owners' errors."""
+    owners = sorted(
+        {(n.owner_project_id, n.owner_name, str(n.owner_external_id)) for n in deferral.waiting}
+    )
+    errors = await owner_content_errors(deferral, session_maker)
+    return {
+        "kind": "deferred",
+        "message": f"{deferral}. Nothing was changed.",
+        "waiting_note_ids": ",".join(str(note.external_id) for note in deferral.waiting),
+        "owner_projects": ",".join(name for _, name, _ in owners),
+        "owner_project_ids": ",".join(external for _, _, external in owners),
+        "owner_last_error": "; ".join(
+            f"{name}: {errors[owner_id]}" for owner_id, name, _ in owners if owner_id in errors
+        )
+        or None,
+    }

@@ -57,6 +57,7 @@ from basic_memory.repository.git_progress_repository import (
     GitProjectionStage,
 )
 from basic_memory.repository.git_graph_inputs import git_graph_identities_unchanged
+from basic_memory.repository.git_host_identities import GitHostIdentities
 from basic_memory.repository.git_layout_repository import GitLayoutRepository, GitRetiredFile
 from basic_memory.repository.git_project_repository import GitProjectRepository, GitSnapshot
 from basic_memory.repository.git_projection_repository import (
@@ -312,6 +313,9 @@ class GitProjectionPipeline:
     vector_key: str
     read_cache: ReadCacheInvalidator | None = None
     graph_key: str = "1"
+    # The host-wide ownership view (I1); None for an offline caller, which keeps the
+    # old rule: any UUID another project owns refuses the snapshot.
+    identities: GitHostIdentities | None = None
 
     async def apply(
         self,
@@ -421,6 +425,7 @@ class GitProjectionPipeline:
             read_cache=self.read_cache,
             commit_id=commit_id,
             known_ancestor=known_ancestor,
+            identities=self.identities,
         )
 
     # --- Files stage (F2): every new file first, every old file after ---
@@ -736,6 +741,7 @@ def build_git_projection_pipeline(
     session_maker: async_sessionmaker[AsyncSession],
     app_config: BasicMemoryConfig,
     read_cache: ReadCacheInvalidator | None = None,
+    identities: GitHostIdentities | None = None,
 ) -> GitProjectionPipeline:
     """Explicit local composition; no global config, new daemon or default enablement."""
     root = Path(project.path)
@@ -813,4 +819,5 @@ def build_git_projection_pipeline(
         vector_key,
         read_cache,
         graph_key,
+        identities,
     )

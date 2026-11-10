@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import UUID
@@ -30,6 +31,39 @@ class GitProjectionSuperseded(GitProjectionConflict):
     Nothing is wrong with the project: a newer commit arrived. The worker starts the
     next pass for the newer head at once, without counting a failure or backing off.
     """
+
+
+@dataclass(frozen=True, slots=True)
+class GitWaitingNote:
+    """A note this project's head holds while another project still owns its UUID (I1)."""
+
+    external_id: UUID
+    owner_project_id: int
+    owner_external_id: UUID
+    owner_name: str
+
+
+class GitProjectionDeferred(GitProjectionConflict):
+    """Everything else is projected; some notes wait until their old project lets go.
+
+    The old project releases a moved note when its own projection removes it: SQL lags
+    its head, or a proven move has not reached it yet (see GitHostIdentities). Nothing
+    is wrong with this project. A subclass, so a caller that knows no deferral still
+    refuses as before.
+    """
+
+    def __init__(self, waiting: Sequence[GitWaitingNote]) -> None:
+        self.waiting = tuple(sorted(waiting, key=lambda note: str(note.external_id)))
+        owners = ", ".join(sorted({f"'{note.owner_name}'" for note in self.waiting}))
+        notes = ", ".join(str(note.external_id) for note in self.waiting)
+        super().__init__(
+            f"Deferred: waiting for project {owners} to release moved note(s) {notes}; "
+            "sync that project, then retry"
+        )
+
+    @property
+    def owner_project_ids(self) -> frozenset[int]:
+        return frozenset(note.owner_project_id for note in self.waiting)
 
 
 @dataclass(frozen=True, slots=True)

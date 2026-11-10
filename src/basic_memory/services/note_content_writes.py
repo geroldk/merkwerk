@@ -159,6 +159,18 @@ class NoteContentPublicationConflict(NoteContentMutationServiceError):
         super().__init__(409, detail)
 
 
+class NoteContentProjectWaiting(NoteContentPublicationConflict):
+    """The Git project waits for another project to release moved note UUIDs (I1).
+
+    A 409 with kind "deferred", never an occupied path: nothing about the request is
+    wrong, the project accepts writes again once the other project lets go.
+    """
+
+
+class NoteContentIdentityTaken(NoteContentPublicationConflict):
+    """A caller-chosen note UUID is still another project's (I1), not an occupied path."""
+
+
 def note_content_mutation_error_from_rejection(
     rejection: AcceptedNoteMutationRejection,
 ) -> NoteContentMutationServiceError:

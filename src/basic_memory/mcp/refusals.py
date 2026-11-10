@@ -156,6 +156,12 @@ def api_refusal(error: ToolError) -> ApiRefusal | None:
             message = text
         case _:
             message = str(error)
+    # Trigger: a Git project waits for another project to release moved notes (I1).
+    # Why: a plain 409 reads as "changed" or, for a move, "destination exists"; this
+    #   one means only "not now", as V1's not_accepting does.
+    # Outcome: UNAVAILABLE with the server's message, which names the owner to sync.
+    if isinstance(detail, dict) and detail.get("kind") == "deferred":
+        code = "UNAVAILABLE"
     return ApiRefusal(
         code=code,
         message=message,

@@ -154,6 +154,14 @@ async def bm_project(
                 lines.append(f"{stage.stage}: {completed}")
                 if stage.last_error is not None:
                     lines.append(f"  {stage.last_error}")
+                # A waiting project (I1) names the owner's own error: it is the real cause.
+                owner_errors = {
+                    (waiting.owner_project, waiting.owner_last_error)
+                    for waiting in stage.deferred or ()
+                    if waiting.owner_last_error is not None
+                }
+                for owner, error in sorted(owner_errors):
+                    lines.append(f"  {owner} fails itself: {error}")
             if status.synchronization is not None:
                 lines.append(f"Peer (last observation): {status.synchronization.relationship}")
                 if status.synchronization.last_attempt is not None:

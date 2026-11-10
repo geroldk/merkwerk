@@ -51,6 +51,20 @@ def test_api_refusal_reads_a_revision_conflict():
     assert (refused.revision_conflict, refused.current_checksum) == (True, "abc")
 
 
+def test_api_refusal_reads_a_waiting_git_project_as_unavailable():
+    """A 409 kind=deferred (I1) is "not now", not a conflict or an occupied path."""
+    refused = api_refusal(
+        _client_error(
+            409,
+            json={"detail": {"kind": "deferred", "message": "Deferred: waiting for 'a'"}},
+        )
+    )
+
+    assert refused is not None
+    assert (refused.code, refused.message) == ("UNAVAILABLE", "Deferred: waiting for 'a'")
+    assert not refused.revision_conflict
+
+
 def test_api_refusal_without_a_json_body_keeps_the_client_message():
     refused = api_refusal(_client_error(400, text="<html>bad gateway</html>"))
 

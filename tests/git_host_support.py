@@ -94,3 +94,26 @@ def local_time_with_offset():
         else:
             os.environ["TZ"] = previous
         time.tzset()
+
+
+async def add_git_project(host_setup: HostSetup, config_manager, name: str):
+    """Another SQL project with its own Git repository next to `test-project`.
+
+    Returns the project row and its repository; the config is saved, so the next
+    lifespan hosts it too.
+    """
+    root = host_setup.repository.path.parent / name
+    root.mkdir()
+    config = host_setup.config
+    config.projects[name] = ProjectEntry(path=str(root))
+    _, factory = await db.get_or_create_db(config.database_path)
+    async with db.scoped_session(factory) as session:
+        project = await ProjectRepository().create(
+            session, {"name": name, "path": str(root), "is_active": True}
+        )
+    repository = GitProjectRepository.create(
+        root.parent / f"{name}.git", project_external_id=UUID(project.external_id)
+    )
+    config.git_repositories[UUID(project.external_id)] = repository.path
+    config_manager.save_config(config)
+    return project, repository

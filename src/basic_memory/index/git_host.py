@@ -3,7 +3,7 @@
 import asyncio
 from collections.abc import AsyncIterator, Mapping
 from contextlib import AsyncExitStack, asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
 from uuid import UUID
@@ -21,6 +21,7 @@ from basic_memory.indexing.accepted_note_mutation_runner import (
 from basic_memory.models import Project
 from basic_memory.read_cache import ReadCacheInvalidator
 from basic_memory.repository.accepted_note_repositories import AcceptedNoteRepositories
+from basic_memory.repository.git_host_identities import GitHostIdentities, GitHostProject
 from basic_memory.repository.git_project_repository import GitProjectRepository
 from basic_memory.repository.git_projection_repository import GitProjectionConflict
 from basic_memory.repository.project_repository import ProjectRepository
@@ -32,6 +33,10 @@ class GitHost:
     """All local projects are Git-owned; no mutable registry operations in this slice."""
 
     runtimes: Mapping[str, GitProjectRuntime]
+    # Host-wide note ownership (I1), shared with every runtime's projection pipeline.
+    identities: GitHostIdentities | None = None
+    # One cross-project move (or move resume) at a time on this host (I1).
+    move_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     def runtime_for(self, project_external_id: str) -> GitProjectRuntime:
         runtime = self.runtimes.get(project_external_id)
@@ -113,19 +118,30 @@ async def run_git_host(
         ),
         verify_storage_absent_on_create=True,
     )
-    runtimes: dict[str, GitProjectRuntime] = {}
+    # Every repository first: each projection asks who else holds a note UUID (I1).
+    repositories: dict[int, GitProjectRepository] = {}
     for project in projects:
         repository = GitProjectRepository(app_config.git_repositories[UUID(project.external_id)])
         snapshot = await asyncio.to_thread(repository.snapshot)
         if snapshot.manifest.project_external_id != UUID(project.external_id):
             raise GitProjectionConflict("Configured Git repository belongs to another project UUID")
+        repositories[project.id] = repository
+    identities = GitHostIdentities(
+        GitHostProject(
+            project.id, UUID(project.external_id), project.name, repositories[project.id]
+        )
+        for project in projects
+    )
+    runtimes: dict[str, GitProjectRuntime] = {}
+    for project in projects:
         runtimes[project.external_id] = GitProjectRuntime(
             build_git_projection_pipeline(
-                repository,
+                repositories[project.id],
                 project=project,
                 session_maker=session_maker,
                 app_config=app_config,
                 read_cache=read_cache,
+                identities=identities,
             ),
             dependencies,
             transaction_idle_seconds=app_config.git_transaction_idle_seconds,
@@ -133,7 +149,10 @@ async def run_git_host(
             sync_remote=app_config.git_sync_remotes.get(UUID(project.external_id)),
             sync_merge=app_config.git_sync_merge.get(UUID(project.external_id)) == "auto",
         )
+        identities.register(project.id, runtimes[project.external_id].worker.wake_index)
     async with AsyncExitStack() as stack:
         for runtime in runtimes.values():
             await stack.enter_async_context(runtime.run())
-        yield GitHost(MappingProxyType(runtimes))
+        # Runtimes start in project order; one that waited for a later owner retries now.
+        identities.nudge_waiting()
+        yield GitHost(MappingProxyType(runtimes), identities)

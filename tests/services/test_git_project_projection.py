@@ -594,3 +594,185 @@ async def test_a_known_basis_outside_the_targets_history_is_refused(
             session_maker=session_maker,
             known_ancestor=private,
         )
+
+
+# --- I1: a note whose UUID another project still owns waits; the rest is projected ---
+
+
+def canonical(test_project: Project, path: str) -> str:
+    stem = path.removesuffix(".md")
+    return f"---\ntitle: {stem}\ntype: note\npermalink: {test_project.name}/{stem}\n---\n\nBody\n"
+
+
+async def owner_project(test_project, session_maker, repository, note_id: UUID):
+    """Project `other`, whose SQL still holds `note_id`, and the host identities."""
+    from basic_memory.repository.git_host_identities import GitHostIdentities, GitHostProject
+
+    async with session_maker() as session, session.begin():
+        other = Project(name="other", path=str(repository.path.parent / "other"), is_active=True)
+        session.add(other)
+        await session.flush()
+        session.add(local_entity(other.id, note_id, "owned.md"))
+        other_id, other_uuid = other.id, UUID(other.external_id)
+    other_repository = GitProjectRepository.create(
+        repository.path.parent / "other.git", project_external_id=other_uuid
+    )
+    identities = GitHostIdentities(
+        [
+            GitHostProject(
+                test_project.id, UUID(test_project.external_id), test_project.name, repository
+            ),
+            GitHostProject(other_id, other_uuid, "other", other_repository),
+        ]
+    )
+    return other_id, other_repository, identities
+
+
+async def graph_progress(session_maker, project_id: int, commit: str) -> None:
+    from basic_memory.models import GitProjectionProgress
+
+    async with session_maker() as session, session.begin():
+        for stage in ("graph", "vectors"):
+            row = await session.get(GitProjectionProgress, (project_id, stage))
+            if row is None:
+                row = GitProjectionProgress(
+                    project_id=project_id, stage=stage, projection_key="1", target_commit=commit
+                )
+                session.add(row)
+            row.completed_commit = row.reusable_commit = commit
+
+
+async def graph_completed(session_maker, project_id: int) -> list[str | None]:
+    from basic_memory.models import GitProjectionProgress
+
+    async with session_maker() as session:
+        rows = await session.scalars(
+            select(GitProjectionProgress)
+            .where(GitProjectionProgress.project_id == project_id)
+            .order_by(GitProjectionProgress.stage)
+        )
+        return [row.completed_commit for row in rows]
+
+
+@pytest.mark.asyncio
+async def test_a_waiting_note_is_skipped_while_the_rest_is_projected(
+    repository, test_project, session_maker, monkeypatch
+):
+    from basic_memory.repository.git_projection_repository import GitProjectionDeferred
+    from basic_memory.services import git_project_projection as module
+
+    kept, removed, waiting = uuid4(), uuid4(), uuid4()
+    repository.publish(
+        repository.prepare(
+            transaction_id=uuid4(),
+            base_commit=repository.head(),
+            files={p: canonical(test_project, p) for p in ("kept.md", "removed.md")},
+            note_ids={"kept.md": kept, "removed.md": removed},
+        )
+    )
+    await project_git_content(repository, project_id=test_project.id, session_maker=session_maker)
+    other_id, _, identities = await owner_project(test_project, session_maker, repository, waiting)
+    # Two commits SQL has not seen (as from a peer): `kept` moves and `removed` goes, then
+    # `waiting` takes the very path `kept` left. `other` released it in Git (its head
+    # never held it), so only its SQL lags (rule a).
+    for files, note_ids in (
+        ({"moved/kept.md": canonical(test_project, "kept.md")}, {"moved/kept.md": kept}),
+        (
+            {
+                "moved/kept.md": canonical(test_project, "kept.md"),
+                "kept.md": canonical(test_project, "waiting.md"),
+            },
+            {"moved/kept.md": kept, "kept.md": waiting},
+        ),
+    ):
+        repository.publish(
+            repository.prepare(
+                transaction_id=uuid4(),
+                base_commit=repository.head(),
+                files=files,
+                note_ids=note_ids,
+            )
+        )
+    await graph_progress(session_maker, other_id, repository.head())
+    invalidations = 0
+    invalidate = module.invalidate_git_graphs
+
+    async def counted(session):
+        nonlocal invalidations
+        invalidations += 1
+        await invalidate(session)
+
+    monkeypatch.setattr(module, "invalidate_git_graphs", counted)
+    with pytest.raises(GitProjectionDeferred) as deferred:
+        await project_git_content(
+            repository,
+            project_id=test_project.id,
+            session_maker=session_maker,
+            identities=identities,
+        )
+    assert [note.external_id for note in deferred.value.waiting] == [waiting]
+    assert deferred.value.owner_project_ids == {other_id}
+    assert invalidations == 1  # the structural change of this pass, once
+    async with session_maker() as session:
+        rows = dict(
+            (
+                await session.execute(
+                    select(Entity.external_id, Entity.file_path).where(
+                        Entity.project_id == test_project.id
+                    )
+                )
+            ).all()
+        )
+    assert rows == {str(kept): "moved/kept.md"}
+    # Later passes wait again without touching the graph progress of any project.
+    await graph_progress(session_maker, other_id, repository.head())
+    for _ in range(3):
+        with pytest.raises(GitProjectionDeferred):
+            await project_git_content(
+                repository,
+                project_id=test_project.id,
+                session_maker=session_maker,
+                identities=identities,
+            )
+    assert invalidations == 1
+    assert await graph_completed(session_maker, other_id) == [repository.head()] * 2
+    # The owner releases the UUID (its own projection drops the row): the note arrives.
+    async with session_maker() as session, session.begin():
+        entity = await session.scalar(select(Entity).where(Entity.external_id == str(waiting)))
+        await session.delete(entity)
+    result = await project_git_content(
+        repository, project_id=test_project.id, session_maker=session_maker, identities=identities
+    )
+    assert result.notes_total == 2
+    async with session_maker() as session:
+        entity = await session.scalar(select(Entity).where(Entity.external_id == str(waiting)))
+        assert entity is not None
+        assert (entity.project_id, entity.file_path) == (test_project.id, "kept.md")
+
+
+@pytest.mark.asyncio
+async def test_a_real_duplicate_still_refuses_the_snapshot_with_names(
+    repository, test_project, session_maker
+):
+    note = uuid4()
+    _, other_repository, identities = await owner_project(
+        test_project, session_maker, repository, note
+    )
+    other_repository.publish(
+        other_repository.prepare(
+            transaction_id=uuid4(),
+            base_commit=other_repository.head(),
+            files={"owned.md": "owned"},
+            note_ids={"owned.md": note},
+        )
+    )
+    publish(repository, canonical(test_project, "notes/a.md"), note)
+    with pytest.raises(GitProjectionConflict, match="another project or path") as refused:
+        await project_git_content(
+            repository,
+            project_id=test_project.id,
+            session_maker=session_maker,
+            identities=identities,
+        )
+    assert f"{note} (owned by project 'other'" in str(refused.value)
+    assert type(refused.value) is GitProjectionConflict
