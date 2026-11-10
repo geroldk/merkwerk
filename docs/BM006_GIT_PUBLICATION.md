@@ -271,6 +271,9 @@ Further limits of part B:
   a median of 9.7 s per move, measured over 15 moves). A call of this
   length outlives an ordinary MCP or gateway timeout; a caller that loses the answer
   finds the moved notes in the target (each has its id) and the rest still in the source.
+- Every move leaves a committed transaction record next to the target repository; records
+  are never pruned, and each transaction call reads all of them (measured: 0.026 s per call
+  at 600 records, so a minor share of a large folder move).
 - The P2 title rule is not applied again when resume rebuilds a draft.
 - A merge "keep" for a note this host moved away re-creates the UUID in the source: the
   ownership guard refuses it by name (no silent duplicate); there is no re-key tool.
