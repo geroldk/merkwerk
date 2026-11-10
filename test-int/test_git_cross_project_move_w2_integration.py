@@ -570,3 +570,129 @@ async def test_a_uuid_back_in_the_source_keeps_the_moved_bytes(host_setup, two_p
     (kept,) = intents(b_repo, b)
     assert kept.target_content == planned.target_content
     assert UUID(note) not in b_repo.published_note_ids()
+
+
+@pytest.mark.asyncio
+async def test_resolve_refuses_what_would_duplicate_and_returns_where_it_can(
+    host_setup, two_projects, tmp_path
+):
+    from basic_memory.api.app import app
+
+    a, a_repo, b, b_repo = two_projects
+    note = await seeded(app, a, b)
+    await crash(tmp_path, "after_delete_before_commit", a, a_repo, b, b_repo, note, "m/Mover.md")
+    publish_into(b_repo, add={"m/Mover.md": (canonical("Besetzt", "m/Mover.md"), uuid4())})
+    # The source's old path is taken by another note meanwhile.
+    publish_into(a_repo, add={"notes/Mover.md": (canonical("Andere", "notes/mover.md"), uuid4())})
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=ASGITransport(app), base_url="http://test") as client:
+            (stuck,) = (await client.get("/v2/git/moves")).json()["moves"]
+            resolve = f"/v2/git/moves/{stuck['move_id']}/resolve"
+            occupied = await client.post(resolve, json={"choice": "source"})
+            elsewhere = await client.post(
+                resolve, json={"choice": "source", "destination_path": "zurueck/Mover.md"}
+            )
+            unknown = await client.post(
+                f"/v2/git/moves/{uuid4()}/resolve", json={"choice": "source"}
+            )
+            await ready(client, a)
+            read = await client.get(f"/v2/projects/{a}/knowledge/entities/{note}")
+    assert occupied.status_code == 409 and occupied.json()["detail"]["kind"] == "occupied"
+    assert elsewhere.status_code == 200, elsewhere.text
+    assert elsewhere.json()["state"] == "returned"
+    assert elsewhere.json()["file_path"] == "zurueck/Mover.md"
+    assert unknown.status_code == 404
+    assert read.status_code == 200 and read.json()["file_path"] == "zurueck/Mover.md"
+    assert intents(b_repo, b) == []
+
+
+@pytest.mark.asyncio
+async def test_a_uuid_back_in_the_source_can_only_be_resolved_there(
+    host_setup, two_projects, tmp_path
+):
+    from basic_memory.api.app import app
+
+    a, a_repo, b, b_repo = two_projects
+    note = await seeded(app, a, b)
+    await crash(tmp_path, "after_delete_before_commit", a, a_repo, b, b_repo, note, "m/Mover.md")
+    publish_into(a_repo, add={"notes/Mover.md": (canonical("Mover", "notes/mover.md"), UUID(note))})
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=ASGITransport(app), base_url="http://test") as client:
+            (stuck,) = (await client.get("/v2/git/moves")).json()["moves"]
+            resolve = f"/v2/git/moves/{stuck['move_id']}/resolve"
+            to_target = await client.post(resolve, json={"choice": "target"})
+            to_source = await client.post(resolve, json={"choice": "source"})
+            assert reservations() == {}
+    assert to_target.status_code == 409 and to_target.json()["detail"]["kind"] == "in_source"
+    assert to_source.status_code == 200 and to_source.json()["state"] == "returned"
+    assert "stay in its history" in to_source.json()["message"]
+    assert intents(b_repo, b) == []
+    assert a_repo.snapshot().manifest.note_ids == {"notes/Mover.md": UUID(note)}
+
+
+@pytest.mark.asyncio
+async def test_an_intent_whose_source_left_the_host_stays_stuck_and_goes_to_the_target(
+    host_setup, two_projects, tmp_path
+):
+    from basic_memory.api.app import app
+
+    a, a_repo, b, b_repo = two_projects
+    note = await seeded(app, a, b)
+    await crash(tmp_path, "after_delete_before_commit", a, a_repo, b, b_repo, note, "m/Mover.md")
+    (planned,) = intents(b_repo, b)
+    store = GitMoveIntentRepository(b_repo, UUID(b))
+    store.save(planned.model_copy(update={"source_project_id": uuid4()}))
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=ASGITransport(app), base_url="http://test") as client:
+            (stuck,) = (await client.get("/v2/git/moves")).json()["moves"]
+            resolve = f"/v2/git/moves/{stuck['move_id']}/resolve"
+            to_source = await client.post(resolve, json={"choice": "source"})
+            to_target = await client.post(resolve, json={"choice": "target"})
+    assert "not on this host" in stuck["stuck_reason"]
+    assert to_source.status_code == 409 and to_source.json()["detail"]["kind"] == "no_source"
+    assert to_target.status_code == 200 and to_target.json()["state"] == "completed"
+    assert b_repo.snapshot().manifest.note_ids == {"m/Mover.md": UUID(note)}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("answer", ["fails", "published_sql_pending", "says_nothing"])
+async def test_the_source_delete_is_judged_from_its_history_not_its_answer(
+    host_setup, two_projects, monkeypatch, answer
+):
+    from basic_memory.api.app import app
+    from basic_memory.services.note_content_writes import (
+        NoteContentMutationService,
+        NoteContentMutationServiceError,
+    )
+
+    a, a_repo, b, b_repo = two_projects
+    delete = NoteContentMutationService.delete_note
+
+    async def answered(self, **arguments):
+        if answer == "fails":
+            raise RuntimeError("connection reset")
+        if answer == "says_nothing":
+            return None
+        await delete(self, **arguments)
+        raise NoteContentMutationServiceError(
+            503, {"message": "Git published; SQL pending. Check status before retry."}
+        )
+
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=ASGITransport(app), base_url="http://test") as client:
+            note = (await write(client, a, "Mover"))["external_id"]
+            await ready(client, a)
+            await ready(client, b)
+            monkeypatch.setattr(NoteContentMutationService, "delete_note", answered)
+            moved = await move(client, a, note, b, "archive/Mover.md")
+    if answer == "published_sql_pending":
+        # The delete published: the move goes on and completes.
+        assert moved.status_code == 200 and moved.json()["state"] == "completed", moved.text
+        assert UUID(note) in b_repo.published_note_ids()
+    else:
+        # Nothing was deleted: nothing was moved, whatever the answer said.
+        assert moved.status_code == (503 if answer == "fails" else 409), moved.text
+        assert "Nothing was moved" in moved.json()["detail"]["message"]
+        assert UUID(note) in a_repo.published_note_ids()
+        assert open_drafts(b_repo, b) == []
+    assert intents(b_repo, b) == []
