@@ -61,7 +61,7 @@ The shell counterpart is cat(1).
 
 - **identifier** (string, required) — The note or file: a file path ('notes/plan.md'), permalink, memory:// URL, exact title, external id, or '<project>/path'.
 - **project** (string, required) — Required project name, 'workspace/project', or project external id. Discover projects with bm_project(command='list'). Paths are relative to this project; a qualified path must agree with it.
-- **section** (string | null, optional, default: None) — A heading to read: "Decisions", "Auth/Decisions" for a heading under "Auth", or "Decisions[1]" for the second "Decisions" heading. A heading whose own text is exactly the given text, "/" included ("KI/ML"), wins over the path reading.
+- **section** (string | null, optional, default: None) — A heading to read: "Decisions", "Auth/Decisions" for a heading under "Auth", "Decisions[1]" for the second "Decisions" heading, or the location "A > KI/ML" (full path from the top heading; "> Top" for a top heading). A heading whose own text is exactly the given text, "/" or " > " included ("KI/ML"), wins.
 - **start_line** (integer | null, optional, default: None)
 - **end_line** (integer | null, optional, default: None)
 - **max_tokens** (integer | null, optional, default: None) — Approximate token budget. Longer content is cut at a section or paragraph boundary, and the result says which line to continue from.
@@ -128,17 +128,27 @@ bm_read(identifier="plans/missing.md", project="demo")
 - A section read returns numbered lines, like `start_line`/`end_line`; a whole
   note comes back without line numbers.
 - A heading whose own text contains "/" (`KI/ML`) is named whole: when a heading
-  is named exactly as `section` is written, "/" included, that heading wins over
-  the path reading (heading `ML` under `KI`). Spaces around the "/" (`KI / ML`)
-  or an added ancestor (`Plan/KI/ML`) still reach the path, unless a heading is
-  named that way too. Such a heading cannot be qualified by its parents, so one
-  under two different parents stays ambiguous; `[n]` counts its repeats under
-  the same parent. A heading that itself ends in `[1]` is named `Heading[1][0]`.
+  is named exactly as `section` is written, "/" or " > " included, that heading
+  wins over the other readings. Spaces around the "/" (`KI / ML`) or an added
+  ancestor (`Plan/KI/ML`) still reach the path (heading `ML` under `KI`), unless
+  a heading is named that way too. A heading that itself ends in `[1]` is named
+  `Heading[1][0]`.
+- A location names a heading by its full path from the top, joined with " > ":
+  `A > KI/ML` is heading `KI/ML` under the top heading `A`, and `> Top` is the
+  top heading `Top` itself (the leading "> " tells it from any heading named
+  `Top`). The path starts at a heading with no heading above it, whatever its
+  level (also a first `## Intro`); "/" is plain text inside it; only a ">" with
+  a space on each side separates, so `a>b` stays one heading; `[n]` at the end
+  counts, in document order, the sections with that same location. It names
+  what other forms leave ambiguous: a heading under two parents, one nested in
+  itself, a top heading that recurs deeper. An old "/" path through a heading
+  whose own text contains " > " keeps its meaning.
 - The `section` of a JSON section read is a selector that reads back to the
   same heading, so bm-edit(3) can take it as it is: usually the heading path
-  (`Plan/Decisions`, `Plan/Log[1]`), or a heading's own text (`KI/ML`) when its
-  path would spell another heading. Error messages list a heading that no
-  selector reaches by its location (`A > KI/ML`); read it with
+  (`Plan/Decisions`, `Plan/Log[1]`), else a heading's own text (`KI/ML`) or its
+  location (`A > KI/ML`). Error messages offer only such names. A heading none
+  reaches (an empty heading, or one whose own text holds " > " where a location
+  needs it) is listed with its lines, `'' (lines 5-6)`; read it with
   `start_line`/`end_line`.
 - The token budget is approximate. The first nonblank line is returned whole
   even when it exceeds the budget, so a read does not return only leading blank

@@ -294,8 +294,11 @@ revision you read. For repeated headings use a section path (`Auth/Decisions`) o
 occurrence (`Decisions[1]`). A heading whose own text contains "/" (`KI/ML`) is named
 whole: a heading named exactly as written wins over the path reading. `KI / ML` with
 spaces, or an added ancestor (`Plan/KI/ML`), still means heading `ML` under `KI`,
-unless a heading is named that way too. The `section` that a JSON `bm_read` returns
-names the same heading again and can be passed to `bm_edit` unchanged.
+unless a heading is named that way too. Where these names are ambiguous (a heading
+under two parents, one nested in itself, a top heading that recurs deeper), write the
+location from the top heading that error messages offer: `B > KI/ML`, or `> Top` for
+a top heading. The `section` that a JSON `bm_read` returns names the same heading
+again and can be passed to `bm_edit` unchanged.
 `expected_replacements` must match the actual count;
 there is no `replace_all` parameter. Metadata updates preserve other fields and
 cannot remove keys with null or change title/permalink identity.

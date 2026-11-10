@@ -34,7 +34,7 @@ Edits a note in place. `command` picks the change:
   oversized results are refused before constructing the replacement.
 - `replace_section`, `insert_before_section`, `insert_after_section` — act on the
   `section` heading, named as bm_read takes it (`Decisions`, `Auth/Decisions`,
-  `Decisions[1]`).
+  `Decisions[1]`, `A > KI/ML`).
 - `set_metadata` — merge `metadata` into the frontmatter without touching the
   body. `metadata` also merges with any other command.
 
@@ -48,7 +48,7 @@ missing note is an error; create notes with bm_write.
 - **command** (required) — The edit.
 - **project** (string, required) — Required project name, 'workspace/project', or project external id. Discover projects with bm_project(command='list'). Paths are relative to this project; a qualified path must agree with it.
 - **content** (string | null, optional, default: None) — The text to add or the replacement. Not used by set_metadata.
-- **section** (string | null, optional, default: None) — The heading for section commands: "Decisions", "Auth/Decisions" for one under "Auth", or "Decisions[1]" for the second of two. A heading whose own text is exactly the given text, "/" included ("KI/ML"), wins over the path reading.
+- **section** (string | null, optional, default: None) — The heading for section commands: "Decisions", "Auth/Decisions" for one under "Auth", "Decisions[1]" for the second of two, or the location "A > KI/ML" (full path from the top heading; "> Top" for a top heading). A heading whose own text is exactly the given text, "/" or " > " included ("KI/ML"), wins.
 - **find_text** (string | null, optional, default: None) — For find_replace: the exact, case-sensitive text to replace.
 - **expected_replacements** (integer, optional, default: 1) — For find_replace: how many times find_text must occur.
 - **replace_subsections** (boolean, optional, default: True) — For replace_section: true replaces the section's subsections too; false stops at the first subsection heading.
@@ -84,11 +84,15 @@ bm_edit(identifier="plans/launch-plan.md", command="append", content="x",
 - `section` belongs to the section commands only; `append` with a `section` is
   refused. Use `insert_after_section` to add under a heading.
 - A heading whose own text contains "/" (`KI/ML`) is named whole, as in
-  bm-read(3): a heading named exactly as `section` is written wins over the path
-  reading. Spaces around the "/" (`KI / ML`) or an added ancestor (`Plan/KI/ML`)
-  still reach heading `ML` under `KI`, unless a heading is named that way too;
-  when the whole-heading reading is refused, the message names the path's
-  selector. A repeated one is named `KI/ML[1]`; the refusal lists these names.
+  bm-read(3): a heading named exactly as `section` is written wins. Spaces
+  around the "/" (`KI / ML`) or an added ancestor (`Plan/KI/ML`) still reach
+  heading `ML` under `KI`, unless a heading is named that way too; when the
+  whole-heading reading is refused, the message names the path's selector. A
+  repeated one is named `KI/ML[1]`; the refusal lists these names.
+- Where a name is ambiguous (a heading under two parents, one nested in itself,
+  a top heading that recurs deeper), write its location from the top heading as
+  the refusal offers it: `B > KI/ML`, `> Top` for a top heading, `B > KI/ML[1]`
+  for a repeat at the same location. See bm-read(3).
 - The `section` a JSON read returns names the same heading again, so it can be
   passed to the section commands as it is.
 - `set_metadata` refuses `title` and `permalink`: they are the note's identity.
