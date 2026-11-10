@@ -75,6 +75,12 @@ def local_time_with_offset():
     In UTC (as on CI runners) a UTC wall time stored as naive local time reads back as the
     right instant, so a test of stored times passes with or without the bug it guards.
     """
+    # Trigger: Windows has no time.tzset, so the process zone cannot be switched.
+    # Why: skipping would also drop the zone-independent checks of the same tests.
+    # Outcome: the test runs in the runner's own zone; Linux and macOS rows pin it.
+    if not hasattr(time, "tzset"):
+        yield
+        return
     previous = os.environ.get("TZ")
     os.environ["TZ"] = "Europe/Berlin"
     time.tzset()

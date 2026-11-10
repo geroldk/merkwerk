@@ -1019,7 +1019,11 @@ async def test_a_move_whose_answer_is_lost_after_publication_is_found_at_the_des
             count, refs = commits(git_host.repository), candidate_refs(git_host.repository)
             monkeypatch.setattr(GitProjectionPipeline, "recover_content", hangs_after_publication)
             request = asyncio.create_task(move(api, project_id, "drafts", "archive"))
-            await asyncio.wait_for(published.wait(), 30)
+            waiting = asyncio.create_task(published.wait())
+            await asyncio.wait({request, waiting}, timeout=30, return_when="FIRST_COMPLETED")
+            # An answer before publication would mean the move never got that far.
+            assert not request.done(), request.result().text
+            assert waiting.done()
             request.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await request
@@ -1112,7 +1116,10 @@ async def test_a_sync_merge_computed_before_a_folder_move_fails_and_the_next_one
             sync = runtime(project_id).sync
             monkeypatch.setattr(GitProjectRepository, "prepare_merge", held)
             attempt = asyncio.create_task(sync.synchronize())
-            await asyncio.to_thread(computed.wait, 30)
+            while not computed.is_set():
+                # A sync that ends without computing a merge would leave this waiting.
+                assert not attempt.done(), attempt.result()
+                await asyncio.sleep(0.02)
             response = await move(client, project_id, "drafts", "archive")
             assert response.status_code == 200, response.text
             release.set()
