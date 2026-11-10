@@ -3134,6 +3134,55 @@ async def test_get_entity_section_names_a_slash_heading_whole(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("selector", "content", "label"),
+    [
+        ("B > KI/ML", "## KI/ML\nb", "B > KI/ML"),
+        ("> Top", "# Top\n## Dec\nx", "> Top"),
+        ("Top > Dec", "## Dec\nx", "Top > Dec"),
+    ],
+)
+async def test_get_entity_section_takes_a_location(
+    client: AsyncClient,
+    test_project: Project,
+    v2_project_url,
+    session_maker,
+    selector,
+    content,
+    label,
+):
+    """Decision B3 C: the full path from the top reaches headings no other name reaches."""
+    external_id = await _seed_sliceable_note(
+        client,
+        v2_project_url,
+        test_project,
+        session_maker,
+        title="SliceLocation",
+        content="# A\n## KI/ML\na\n# B\n## KI/ML\nb\n# Top\n## Dec\nx\n# Other\n## Top\n### Dec\ny",
+    )
+
+    response = await client.get(
+        f"{v2_project_url}/knowledge/entities/{external_id}", params={"section": selector}
+    )
+
+    assert response.status_code == 200
+    entity = EntityResponseV2.model_validate(response.json())
+    assert (entity.content, entity.section) == (content, label)
+
+
+@pytest.mark.asyncio
+async def test_get_missing_entity_with_a_location_selector_is_a_404(
+    client: AsyncClient, v2_project_url
+):
+    """ "/etc > X" is malformed as a path but a well-formed location, so the note decides."""
+    missing = f"{v2_project_url}/knowledge/entities/{uuid.uuid4()}"
+
+    response = await client.get(missing, params={"section": "/etc > X"})
+
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
 async def test_get_entity_max_tokens_truncates_with_marker(
     client: AsyncClient, test_project: Project, v2_project_url, session_maker
 ):

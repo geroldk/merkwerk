@@ -209,8 +209,48 @@ def test_edit_refuses_paths_that_join_to_one_string():
     """
     note = "# R\n## A/B\n### X\nx-under-slash\n## A\n### B\n#### X\nx-under-path\n"
 
-    with pytest.raises(ValueError, match=r"Section 'X' is ambiguous\. Qualify it: R/A/B/X\."):
+    with pytest.raises(
+        ValueError, match=r"Section 'X' is ambiguous\. Qualify it: R > A/B > X, R/A/B/X\."
+    ):
         replace_section_content(note, "X", "new")
     assert replace_section_content(note, "R/A/B/X", "new") == (
         "# R\n## A/B\n### X\nx-under-slash\n## A\n### B\n#### X\nnew\n"
+    )
+
+
+# --- Locations: a heading's full path from the top (decision B3 C) ---
+
+TWO_PARENTS = "# A\n## KI/ML\na\n# B\n## KI/ML\nb\n"
+
+
+def test_replace_section_takes_a_location():
+    assert replace_section_content(TWO_PARENTS, "B > KI/ML", "new") == (
+        "# A\n## KI/ML\na\n# B\n## KI/ML\nnew\n"
+    )
+
+
+@pytest.mark.parametrize(
+    ("position", "expected"),
+    [
+        ("before", "added\n\n# Top\n## Dec\nx\n# Other\n## Top\n"),
+        ("after", "# Top\nadded\n\n## Dec\nx\n# Other\n## Top\n"),
+    ],
+)
+def test_insert_around_the_location_of_a_top_heading(position, expected):
+    note = "# Top\n## Dec\nx\n# Other\n## Top\n"
+
+    assert insert_relative_to_section(note, "> Top", "added", position) == expected
+
+
+def test_edit_refuses_an_ambiguous_slash_heading_and_offers_its_locations():
+    with pytest.raises(ValueError, match=r"Qualify it: A > KI/ML, B > KI/ML\."):
+        replace_section_content(TWO_PARENTS, "KI/ML", "new")
+
+
+def test_heading_written_like_a_location_is_edited_by_its_text():
+    """Regression: a heading whose own text is "A > B" wins over the location reading."""
+    note = "# R\n## A > B\nlit\n## A\n### B\npath\n"
+
+    assert replace_section_content(note, "A > B", "new") == (
+        "# R\n## A > B\nnew\n## A\n### B\npath\n"
     )

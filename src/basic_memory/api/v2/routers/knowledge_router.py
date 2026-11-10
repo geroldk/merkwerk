@@ -807,7 +807,8 @@ def _parse_note_slice_params(
     selector: SectionSelector | None = None
     if section is not None:
         # Only an empty selector fails here; one malformed as a path ("A//B") may
-        # still be a heading's whole text and is judged against the note's headings.
+        # still be a heading's whole text or a location ("/etc > X") and is judged
+        # against the note's headings.
         selector = parse_section_selector(section)
         if selector is None:
             raise HTTPException(
@@ -828,11 +829,11 @@ def _parse_note_slice_params(
 def _refuse_selector_without_headings(selector: SectionSelector | None) -> None:
     """Refuse a selector malformed as a path when no note text is there to bear it."""
     # Trigger: the entity is missing, or it has no markdown content to slice.
-    # Why: "A//B" can only be valid as a heading's whole text, and with no note there
-    #   is no heading; before headings could contain "/" such a selector was refused
-    #   with 422 before the entity was even looked up.
+    # Why: "A//B" is no location either, so it can only be valid as a heading's whole
+    #   text, and with no note there is no heading; before headings could contain "/"
+    #   such a selector was refused with 422 before the entity was even looked up.
     # Outcome: the same 422 as before, ahead of the 404 for the missing note or content.
-    if selector is not None and selector.segments is None:
+    if selector is not None and selector.malformed:
         raise HTTPException(
             status_code=422,
             detail=f"Invalid section selector: '{selector.raw}'",
@@ -914,8 +915,9 @@ async def get_entity_by_id(
         None,
         description="Return one section by heading text: 'Decisions', path form "
         "'Auth/Decisions' to disambiguate, bracket form 'Heading[1]' for duplicate "
-        "headings. A heading whose own text equals the whole selector, '/' included "
-        "('KI/ML'), wins over the path form. Mutually exclusive with lines.",
+        "headings, or location 'A > KI/ML' (full path from the top heading; '> Top' for "
+        "a top heading). A heading whose own text equals the whole selector, '/' or "
+        "' > ' included ('KI/ML'), wins. Mutually exclusive with lines.",
     ),
     lines: str | None = Query(
         None,

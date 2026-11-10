@@ -16,6 +16,7 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass
 import re
+from typing import Literal
 
 from markdown_it import MarkdownIt
 
@@ -24,9 +25,13 @@ from markdown_it import MarkdownIt
 # a heading's text wins over its reading as a path (see _selector_lookup).
 HEADING_PATH_SEPARATOR = "/"
 
-# Messages show where a heading sits with this separator when no selector names it:
-# "A > Ein/Aus" cannot be mistaken for a selector the way "A/Ein/Aus" can.
+# A location names a heading by its full path from the top, joined with " > "
+# ("A > KI/ML", "Top > Dec"); inside it "/" is plain heading text. A location of
+# one heading starts with "> " ("> Top"), which tells it from the heading name
+# "Top" that any heading of that text ends. Only a ">" with a space on each side
+# separates, so headings such as "a>b" or "x -> y" stay single heading names.
 _LOCATION_SEPARATOR = " > "
+_LOCATION_ROOT = "> "
 
 # Plain parser: heading boundaries need no observation/relation plugins, and the
 # token stream already skips fenced code blocks and handles setext headings.
@@ -241,11 +246,13 @@ _ATX_HEADING_PREFIX = re.compile(r"^#{1,6} ")
 
 @dataclass(frozen=True, slots=True)
 class SectionSelector:
-    """A parsed ``section=`` selector: its two readings plus a duplicate index.
+    """A parsed ``section=`` selector: its three readings plus a duplicate index.
 
-    ``heading`` reads the whole selector as one heading's text, "/" included;
-    ``segments`` reads it as a path split on "/", and is None when that split
-    leaves an empty segment ("/etc", "Ende/", "A//B"). Which reading applies
+    ``heading`` reads the whole selector as one heading's text, "/" and " > "
+    included; ``segments`` reads it as a path split on "/", and is None when that
+    split leaves an empty segment ("/etc", "Ende/", "A//B"); ``location`` reads it
+    as a full path from the top split on " > " ("A > KI/ML", "> Top"), and is None
+    when it is not written as one or leaves an empty segment. Which reading applies
     depends on the note's headings (``_selector_lookup``). ``raw`` keeps the
     caller's original spelling for error messages, ``stem`` the same text trimmed
     and without its ``[n]``. Bare selectors address duplicate index 0 (the first
@@ -256,9 +263,15 @@ class SectionSelector:
     stem: str
     heading: str
     segments: tuple[str, ...] | None
+    location: tuple[str, ...] | None
     duplicate_index: int
     # True when the caller wrote the [n] suffix; edits need it to pick among duplicates.
     indexed: bool = False
+
+    @property
+    def malformed(self) -> bool:
+        """True when only a heading bearing the whole text could give it a meaning."""
+        return self.segments is None and self.location is None
 
 
 def _selector_segment(text: str) -> str:
@@ -266,15 +279,29 @@ def _selector_segment(text: str) -> str:
     return _ATX_HEADING_PREFIX.sub("", text.strip()).strip()
 
 
+def _is_written_as_location(heading: str) -> bool:
+    return _LOCATION_SEPARATOR in heading or heading.startswith(_LOCATION_ROOT)
+
+
+def _location_segments(heading: str) -> tuple[str, ...] | None:
+    """Split a selector written as a location; None when it is not one or has a gap."""
+    if not _is_written_as_location(heading):
+        return None
+    text = heading.removeprefix(_LOCATION_ROOT)
+    segments = tuple(_selector_segment(part) for part in text.split(_LOCATION_SEPARATOR))
+    return segments if all(segments) else None
+
+
 def parse_section_selector(selector: str) -> SectionSelector | None:
     """Parse a section selector, or return None when it names no heading at all.
 
     Accepted forms: ``"Decisions"``, ``"Auth/Decisions"`` (path form),
     ``"Heading[1]"`` (duplicate index on the last segment), heading-styled
-    segments like ``"## Auth"`` (leading hashes plus one space are stripped), and
-    a heading whose own text contains "/" (``"Ein/Aus"``), named whole. A trailing
-    ``[n]`` is always the duplicate index, so a heading whose text itself ends in
-    ``[1]`` is named ``"Heading[1][0]"``.
+    segments like ``"## Auth"`` (leading hashes plus one space are stripped), a
+    heading whose own text contains "/" (``"Ein/Aus"``), named whole, and a
+    location from the top (``"A > KI/ML"``, ``"> Top"``). A trailing ``[n]`` is
+    always the duplicate index, so a heading whose text itself ends in ``[1]`` is
+    named ``"Heading[1][0]"``.
 
     Only an empty selector (``""``, ``"[2]"``) is refused here. One whose path
     reading has an empty segment (``"/etc"``) may still be a heading's whole text,
@@ -297,6 +324,7 @@ def parse_section_selector(selector: str) -> SectionSelector | None:
         stem=text,
         heading=heading,
         segments=segments if all(segments) else None,
+        location=_location_segments(heading),
         duplicate_index=duplicate_index,
         indexed=indexed,
     )
@@ -365,9 +393,9 @@ class NoteSliceError:
     """A slice failure: an unknown, ambiguous, or out-of-range section, or a past-end range."""
 
     message: str
-    # True when the selector is malformed as a path ("A//B") and no heading bears
-    # its whole text either: callers report it as the malformed selector it was
-    # before such a selector could name a heading.
+    # True when the selector is malformed as a path ("A//B"), is no location, and no
+    # heading bears its whole text either: callers report it as the malformed
+    # selector it was before such a selector could name a heading.
     invalid_selector: bool = False
 
 
@@ -394,24 +422,35 @@ def _frontmatter_line_count(full_text: str) -> int:
 # messages offer and that reads return are checked by looking them up again, and
 # that check must not word messages (which would offer names, and so on).
 
+type _Reading = Literal["heading", "path", "location"]
+
 
 @dataclass(frozen=True, slots=True)
 class _Headings:
-    """A note's sections, indexed by each heading's own text for repeated lookups."""
+    """A note's sections, indexed for repeated lookups."""
 
     sections: tuple[MarkdownSection, ...]
     # Own heading text -> its sections in document order. A path's last segment is a
     # heading's own text, so a lookup scans only the sections ending in it; checking
     # every offered name stays cheap on notes with thousands of headings.
     by_text: dict[str, tuple[MarkdownSection, ...]]
+    # Full path -> its sections in document order, so position equals duplicate_index.
+    by_path: dict[tuple[str, ...], tuple[MarkdownSection, ...]]
+    # Frontmatter lines before the body, to word document-absolute line numbers.
+    line_offset: int
 
 
-def _index_headings(sections: tuple[MarkdownSection, ...]) -> _Headings:
+def _index_headings(sections: tuple[MarkdownSection, ...], line_offset: int) -> _Headings:
     by_text: dict[str, list[MarkdownSection]] = {}
+    by_path: dict[tuple[str, ...], list[MarkdownSection]] = {}
     for section in sections:
         by_text.setdefault(section.heading, []).append(section)
+        by_path.setdefault(section.path, []).append(section)
     return _Headings(
-        sections=sections, by_text={text: tuple(group) for text, group in by_text.items()}
+        sections=sections,
+        by_text={text: tuple(group) for text, group in by_text.items()},
+        by_path={path: tuple(group) for path, group in by_path.items()},
+        line_offset=line_offset,
     )
 
 
@@ -419,7 +458,7 @@ def _index_headings(sections: tuple[MarkdownSection, ...]) -> _Headings:
 class _Lookup:
     """The sections one reading of a selector reaches, before any message is worded."""
 
-    by_heading: bool
+    reading: _Reading
     matches: tuple[MarkdownSection, ...]
     # Distinct full paths among the matches, told apart as tuples: ("A/B", "X") and
     # ("A", "B", "X") join to the same string but are different headings.
@@ -433,7 +472,7 @@ def _lookup(
     segments: tuple[str, ...],
     duplicate_index: int,
     *,
-    by_heading: bool,
+    reading: _Reading,
 ) -> _Lookup:
     """Find the sections whose full path ends with these segments (suffix match)."""
     matches = tuple(
@@ -448,26 +487,57 @@ def _lookup(
         if len(paths) == 1
         else None
     )
-    return _Lookup(by_heading=by_heading, matches=matches, paths=paths, section=addressed)
+    return _Lookup(reading=reading, matches=matches, paths=paths, section=addressed)
+
+
+def _location_lookup(
+    headings: _Headings, location: tuple[str, ...], duplicate_index: int
+) -> _Lookup:
+    """Find the sections whose full path is exactly this location (read from the top)."""
+    matches = headings.by_path.get(location, ())
+    return _Lookup(
+        reading="location",
+        matches=matches,
+        paths=(location,) if matches else (),
+        section=matches[duplicate_index] if duplicate_index < len(matches) else None,
+    )
 
 
 def _selector_lookup(headings: _Headings, selector: SectionSelector) -> _Lookup | None:
-    """Look a selector up as one heading or as a path; None when it is malformed."""
-    # Trigger: the selector contains "/" and some heading's own text is exactly it
-    #   ("Ein/Aus", "/etc"); a "## Ein/Aus" line inside a code fence is no heading.
+    """Look a selector up as one heading, a location or a path; None when malformed."""
+    index = selector.duplicate_index
+    # Trigger: the selector contains "/" or is written as a location, and some
+    #   heading's own text is exactly it ("Ein/Aus", "/etc", "A > B"); a "## Ein/Aus"
+    #   line inside a code fence is no heading.
     # Why: "/" otherwise always splits the path, so such a heading had no selector at
-    #   all; a heading named exactly as written takes precedence (decision B3 A).
+    #   all; a heading named exactly as written takes precedence (decisions B3 A, C).
     # Outcome: the selector names that heading, and that reading's errors (ambiguous,
-    #   index out of range, unindexed duplicates) are final, with no retry as a path.
-    #   Without such a heading the path reading runs exactly as before, so a selector
-    #   without "/" is unaffected; "Ein / Aus" (spaces around the "/") or an added
-    #   ancestor still reaches heading "Aus" under "Ein", unless a heading bears that
-    #   text as well.
-    if HEADING_PATH_SEPARATOR in selector.heading and selector.heading in headings.by_text:
-        return _lookup(headings, (selector.heading,), selector.duplicate_index, by_heading=True)
-    if selector.segments is None:
-        return None
-    return _lookup(headings, selector.segments, selector.duplicate_index, by_heading=False)
+    #   index out of range, unindexed duplicates) are final, with no retry as a path
+    #   or location. A selector without "/" and " > " reads the same either way.
+    heading = selector.heading
+    if (
+        HEADING_PATH_SEPARATOR in heading or _is_written_as_location(heading)
+    ) and heading in headings.by_text:
+        # Without "/" ("A > B") this is the one-segment path reading it always was,
+        # so it keeps that reading's messages too.
+        reading: _Reading = "heading" if HEADING_PATH_SEPARATOR in heading else "path"
+        return _lookup(headings, (heading,), index, reading=reading)
+    path = (
+        None
+        if selector.segments is None
+        else _lookup(headings, selector.segments, index, reading="path")
+    )
+    if selector.location is None:
+        return path
+    # Trigger: the selector is written as a location ("A > KI/ML", "> Top").
+    # Why: before decision B3 C " > " was plain heading text, so a "/" path through
+    #   a heading named like "A > B" ("A > B/C": heading "C" under "A > B") reached a
+    #   section; such an old selector keeps that meaning.
+    # Outcome: the old path reading when it reaches any section, its errors
+    #   included; otherwise the location, read from the top heading down.
+    if path is not None and path.matches:
+        return path
+    return _location_lookup(headings, selector.location, index)
 
 
 # --- Names that read back ---
@@ -477,7 +547,9 @@ def _selector_lookup(headings: _Headings, selector: SectionSelector) -> _Lookup 
 # only if it reaches the same section. The joined heading path is not enough: a
 # heading whose text contains "/" splits differently when read back ("Plan/KI/ML"
 # is heading "ML" under "KI"), a heading may be named like a path ("Top/Dec"), and
-# a heading ending in "[1]" loses that text to the duplicate index.
+# a heading ending in "[1]" loses that text to the duplicate index. The location
+# ("A > KI/ML", "> Top") comes last: it reads every path exactly, unless a heading
+# is named like it or its text holds " > " itself.
 
 
 def _reaches(headings: _Headings, name: str, target: MarkdownSection) -> bool:
@@ -487,19 +559,38 @@ def _reaches(headings: _Headings, name: str, target: MarkdownSection) -> bool:
     return found is not None and found.section == target
 
 
+def _spelled(path: tuple[str, ...]) -> tuple[str, ...]:
+    """Heading texts as a selector spells them, so that reading them back keeps them."""
+    # A heading text that itself starts like "# x" would lose that prefix when read
+    # back (selector segments drop a "## " prefix), so it gets one more "# " to drop.
+    return tuple(f"# {text}" if _ATX_HEADING_PREFIX.match(text) else text for text in path)
+
+
+def _location_spellings(path: tuple[str, ...]) -> list[str]:
+    """Spell a full path as a location: "A > KI/ML" (then "> A > KI/ML"), or "> Top"."""
+    joined = _LOCATION_SEPARATOR.join(_spelled(path))
+    if len(path) == 1:
+        return [_LOCATION_ROOT + joined]
+    # The "> " form is the way out when a heading is named exactly "A > KI/ML".
+    return [joined, _LOCATION_ROOT + joined]
+
+
 def _selector_name(headings: _Headings, target: MarkdownSection, *, indexed: bool) -> str | None:
     """The first spelling that reads back to ``target``, or None when none does.
 
     Tried in order: the full heading path, then shorter path suffixes, then the same
-    with spaces around "/" (which a heading named "KI/ML" does not take over).
-    ``indexed`` names the duplicate index ("Log[1]"), as twins need for an edit;
-    otherwise the bare name comes first and "[0]" is the fallback for a heading
-    whose own text ends in "[n]".
+    with spaces around "/" (which a heading named "KI/ML" does not take over), then
+    the location from the top. ``indexed`` names the duplicate index ("Log[1]"), as
+    twins need for an edit; otherwise the bare name comes first and "[0]" is the
+    fallback for a heading whose own text ends in "[n]".
     """
-    suffixes = [target.path[-length:] for length in range(len(target.path), 0, -1)]
-    stems = [HEADING_PATH_SEPARATOR.join(suffix) for suffix in suffixes] + [
-        f" {HEADING_PATH_SEPARATOR} ".join(suffix) for suffix in suffixes if len(suffix) > 1
-    ]
+    path = _spelled(target.path)
+    suffixes = [path[-length:] for length in range(len(path), 0, -1)]
+    stems = (
+        [HEADING_PATH_SEPARATOR.join(suffix) for suffix in suffixes]
+        + [f" {HEADING_PATH_SEPARATOR} ".join(suffix) for suffix in suffixes if len(suffix) > 1]
+        + _location_spellings(target.path)
+    )
     index = f"[{target.duplicate_index}]"
     for stem in stems:
         for name in (stem + index,) if indexed else (stem, stem + index):
@@ -524,22 +615,25 @@ def _section_label(
     return name if name is not None else f"{selector.stem}[{target.duplicate_index}]"
 
 
-def _location(section: MarkdownSection, *, indexed: bool) -> str:
-    """Where a section sits, for one no selector can name."""
-    index = f"[{section.duplicate_index}]" if indexed else ""
-    return _LOCATION_SEPARATOR.join(section.path) + index
+def _unreachable(headings: _Headings, section: MarkdownSection) -> str:
+    """Point to a section no selector names: its heading text and document lines."""
+    # A location string would itself be a selector now, and the one left over for
+    # such a section reaches another one, so the message gives lines instead.
+    start = headings.line_offset + section.start_line
+    end = headings.line_offset + section.end_line
+    return f"'{section.heading}' (lines {start}-{end})"
 
 
 def _offer(
     headings: _Headings, targets: list[tuple[MarkdownSection, bool]]
 ) -> tuple[list[str], list[str]]:
-    """Name each (section, indexed) target; those no selector names go by location."""
+    """Name each (section, indexed) target; those no selector names go by lines."""
     names: list[str] = []
     unreachable: list[str] = []
     for target, indexed in targets:
         name = _selector_name(headings, target, indexed=indexed)
         if name is None:
-            unreachable.append(_location(target, indexed=indexed))
+            unreachable.append(_unreachable(headings, target))
         else:
             names.append(name)
     return names, unreachable
@@ -580,7 +674,7 @@ def _path_hint(headings: _Headings, selector: SectionSelector) -> str:
     # Outcome: names that read back to the path's sections, or nothing.
     if selector.segments is None:
         return ""
-    found = _lookup(headings, selector.segments, selector.duplicate_index, by_heading=False)
+    found = _lookup(headings, selector.segments, selector.duplicate_index, reading="path")
     names, _ = _offer(headings, _with_twin_flags(found.matches))
     if not names:
         return ""
@@ -609,33 +703,40 @@ def _find_section(
     A selector matches when a section's full path ends with the selector segments
     (suffix match), so ``"Decisions"`` finds ``("Auth", "Decisions")`` and
     ``"Auth/Decisions"`` disambiguates. A selector equal to a heading's own text,
-    "/" included, matches that heading instead (``_selector_lookup``). Comparison
-    is exact and case-sensitive. Every name returned or offered reads back to its
-    section (``_selector_name``).
+    "/" or " > " included, matches that heading instead, and a location
+    (``"A > KI/ML"``) matches the full path from the top (``_selector_lookup``).
+    Comparison is exact and case-sensitive. Every name returned or offered reads
+    back to its section (``_selector_name``).
     """
     note_label = f" in note '{note_title}'" if note_title else ""
     found = _selector_lookup(headings, selector)
     if found is None:
         return NoteSliceError(f"Invalid section selector: '{selector.raw}'", invalid_selector=True)
     # The one-heading reading applies only when a heading bears its text, so only
-    # the path reading can miss.
+    # the path and the location reading can miss.
     if not found.matches:
         available = (
             _offer_text(headings, _with_twin_flags(headings.sections))
             if headings.sections
             else "(note has no headings)"
         )
+        location_hint = (
+            " A location starts at a heading with no heading above it."
+            if found.reading == "location"
+            else ""
+        )
         return NoteSliceError(
-            f"Section '{selector.raw}' not found{note_label}. Available sections: {available}."
+            f"Section '{selector.raw}' not found{note_label}.{location_hint} "
+            f"Available sections: {available}."
         )
 
+    # A location is one full path, so only the other two readings can be ambiguous.
     if len(found.paths) > 1:
-        if found.by_heading:
-            locations = ", ".join(_LOCATION_SEPARATOR.join(path) for path in found.paths)
+        if found.reading == "heading":
             return NoteSliceError(
                 f"Section '{selector.raw}' is ambiguous{note_label}: {len(found.paths)} paths "
-                f"end in a heading named '{selector.heading}' ({locations}). A heading whose "
-                "text contains '/' cannot be qualified by its parent headings."
+                f"end in a heading named '{selector.heading}'. "
+                f"Qualify it: {_offer_text(headings, _first_of_paths(found))}."
                 + _path_hint(headings, selector)
             )
         return NoteSliceError(
@@ -644,16 +745,22 @@ def _find_section(
         )
 
     if found.section is None:
-        if found.by_heading:
+        count = f"{len(found.matches)} "
+        indexes = f"(duplicate indexes 0-{len(found.matches) - 1})"
+        if found.reading == "heading":
             return NoteSliceError(
-                f"Section '{selector.raw}' not found{note_label}: {len(found.matches)} "
-                f"heading(s) named '{selector.heading}' (duplicate indexes "
-                f"0-{len(found.matches) - 1})." + _path_hint(headings, selector)
+                f"Section '{selector.raw}' not found{note_label}: {count}heading(s) named "
+                f"'{selector.heading}' {indexes}." + _path_hint(headings, selector)
+            )
+        if found.reading == "location":
+            location = _location_spellings(found.paths[0])[0]
+            return NoteSliceError(
+                f"Section '{selector.raw}' not found{note_label}: {count}section(s) have "
+                f"the location '{location}' {indexes}."
             )
         return NoteSliceError(
-            f"Section '{selector.raw}' not found{note_label}: {len(found.matches)} section(s) "
-            f"share the path '{HEADING_PATH_SEPARATOR.join(found.paths[0])}' (duplicate "
-            f"indexes 0-{len(found.matches) - 1})."
+            f"Section '{selector.raw}' not found{note_label}: {count}section(s) share the "
+            f"path '{HEADING_PATH_SEPARATOR.join(found.paths[0])}' {indexes}."
         )
     label = _section_label(headings, found.section, selector, indexed=len(found.matches) > 1)
     return _SectionMatch(section=found.section, label=label)
@@ -694,12 +801,12 @@ def locate_section(
     doc_lines = _split_lines(full_text)
     frontmatter_lines = _frontmatter_line_count(full_text)
     sections = scan_sections("\n".join(doc_lines[frontmatter_lines:]))
-    headings = _index_headings(sections)
+    headings = _index_headings(sections, frontmatter_lines)
     found = _find_section(headings, selector, note_title)
     if isinstance(found, NoteSliceError):
         return found
     matched, label = found.section, found.label
-    twins = [section for section in sections if section.path == matched.path]
+    twins = headings.by_path[matched.path]
     if len(twins) > 1 and not selector.indexed:
         note_label = f" in note '{note_title}'" if note_title else ""
         # Each choice reads back to its twin: for a heading named whole that is its
@@ -813,7 +920,8 @@ def slice_note_content(
         # normalized document suffix: re-splitting it yields these exact lines,
         # and scanned coordinates translate by the frontmatter offset.
         body = "\n".join(doc_lines[frontmatter_lines:])
-        found = _find_section(_index_headings(scan_sections(body)), section, note_title)
+        headings = _index_headings(scan_sections(body), frontmatter_lines)
+        found = _find_section(headings, section, note_title)
         if isinstance(found, NoteSliceError):
             return found
         matched, section_label = found.section, found.label

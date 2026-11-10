@@ -5,6 +5,7 @@ slicers are re-run at read time on the exact content being served, so these
 boundary cases pin canonical-content correctness.
 """
 
+import random
 from textwrap import dedent
 
 import pytest
@@ -784,16 +785,17 @@ def test_slash_heading_index_out_of_range_does_not_fall_back_to_the_path():
     assert _read_section_ok(doc, "Ein / Aus[1]").content == "### Aus\nsecond"
 
 
-def test_slash_heading_under_two_parents_is_ambiguous_and_says_why():
+def test_slash_heading_under_two_parents_is_ambiguous_and_names_each_location():
     doc = "# A\n## Ein/Aus\na\n# B\n## Ein/Aus\nb"
 
     error = _read_section_error(doc, "Ein/Aus")
 
+    # Decision B3 C: the locations read back, so the refusal offers them as names.
     assert error.message == (
-        "Section 'Ein/Aus' is ambiguous: 2 paths end in a heading named 'Ein/Aus' "
-        "(A > Ein/Aus, B > Ein/Aus). A heading whose text contains '/' cannot be qualified "
-        "by its parent headings."
+        "Section 'Ein/Aus' is ambiguous: 2 paths end in a heading named 'Ein/Aus'. "
+        "Qualify it: A > Ein/Aus, B > Ein/Aus."
     )
+    assert _read_section_ok(doc, "B > Ein/Aus").content == "## Ein/Aus\nb"
 
 
 def test_slash_paths_that_join_to_one_string_stay_apart():
@@ -855,12 +857,15 @@ _PLAN_TWICE = "# Plan\n## KI/ML\none\n## KI/ML\ntwo\n## KI\n### ML\nx\n### ML\ny
 _LITERAL_SPELLS_A_PATH = "# Top\n## Dec\nx\n# Top/Dec\ny\n"
 # "Top/Log[1]" reads as the second "Log", not the heading "Log[1]".
 _BRACKETED_HEADING = "# Top\n## Log\none\n## Log\ntwo\n## Log[1]\nb\n"
-# ("R", "A/B", "X") and ("R", "A", "B", "X") both join to "R/A/B/X".
+# ("R", "A/B", "X") and ("R", "A", "B", "X") both join to "R/A/B/X"; only the
+# location "R > A/B > X" names the first "X".
 _PATHS_JOIN_ALIKE = (
     "# R\n\n## A/B\n\n### X\n\nx-under-slash\n\n## A\n\n### B\n\n#### X\n\nx-under-path\n"
 )
-# Neither "KI/ML" can be named: the selector "KI/ML" ends in both.
+# The selector "KI/ML" ends in both "KI/ML"; only their locations tell them apart.
 _NESTED_IN_ITSELF = "## KI/ML\nouter\n### KI/ML\ninner\n"
+# A top heading "Top" that recurs deeper: "Top" and "Top/Dec" end in both (B3 C).
+_TOP_RECURS = "# Top\n## Dec\nx\n# Other\n## Top\n### Dec\ny\n"
 
 
 def _assert_reads_back(doc: str, name: str, start_line: int) -> None:
@@ -894,8 +899,15 @@ def test_returned_section_name_reads_back_to_the_same_section(doc, selector, con
 
 
 def test_returned_name_falls_back_to_the_callers_spelling():
-    """No canonical spelling reaches heading "Aus" under "Ein" here, the caller's does."""
-    doc = "# Ein/Aus\nliteral\n# Ein / Aus\nspaced\n# Ein\n## Aus\nnested\n# Aus\nroot"
+    """No canonical spelling reaches heading "Aus" under "Ein" here, the caller's does.
+
+    Headings named like each spelling take it over: the path, the spaced path, the
+    location "Ein > Aus" and its "> " form.
+    """
+    doc = (
+        "# Ein/Aus\nliteral\n# Ein / Aus\nspaced\n# Ein > Aus\ngt\n# > Ein > Aus\nrooted\n"
+        "# Ein\n## Aus\nnested\n# Aus\nroot"
+    )
 
     sliced = _read_section_ok(doc, " Ein /Aus ")
 
@@ -925,14 +937,15 @@ def _offered(message: str, intro: str) -> tuple[list[str], list[str]]:
         ),
         (_LITERAL_SPELLS_A_PATH, "Top, Dec, Top/Dec."),
         (_BRACKETED_HEADING, "Top, Top/Log[0], Top/Log[1], Top/Log[1][0]."),
+        (_PATHS_JOIN_ALIKE, "R, A/B, R > A/B > X, R/A, R/A/B, R/A/B/X."),
+        (_NESTED_IN_ITSELF, "> KI/ML, KI/ML > KI/ML."),
+        (_TOP_RECURS, "> Top, Top > Dec, Other, Other/Top, Other/Top/Dec."),
         (
-            _PATHS_JOIN_ALIKE,
-            "R, A/B, R/A, R/A/B, R/A/B/X. Not reachable by a section selector "
-            "(read by lines): R > A/B > X.",
-        ),
-        (
-            _NESTED_IN_ITSELF,
-            "(none). Not reachable by a section selector (read by lines): KI/ML, KI/ML > KI/ML.",
+            # An empty heading has no name, nor does "X" under it: "X" is the top "X",
+            # and a location cannot spell the empty text.
+            "# Top\n#\nempty\n## X\nx\n# X\nroot\n",
+            "Top, > X. Not reachable by a section selector (read by lines): "
+            "'' (lines 2-5), 'X' (lines 4-5).",
         ),
     ],
 )
@@ -944,7 +957,7 @@ def test_available_sections_offers_only_names_that_read_back(doc, available):
     reached = [_read_section_ok(doc, name).start_line for name in names]
     for name, start_line in zip(names, reached):
         _assert_reads_back(doc, name, start_line)
-    # Every heading is offered once: by a name of its own, or by its location.
+    # Every heading is offered once: by a name of its own, or by its lines.
     assert len(set(reached)) == len(names)
     assert len(names) + len(unreachable) == len(scan_sections(doc))
 
@@ -953,10 +966,7 @@ def test_paths_that_join_to_one_string_are_ambiguous():
     """Finding 5: two headings "X" whose paths join alike were taken as one path."""
     error = _read_section_error(_PATHS_JOIN_ALIKE, "X")
 
-    assert error.message == (
-        "Section 'X' is ambiguous. Qualify it: R/A/B/X. Not reachable by a section "
-        "selector (read by lines): R > A/B > X."
-    )
+    assert error.message == "Section 'X' is ambiguous. Qualify it: R > A/B > X, R/A/B/X."
     # An edit refuses as well instead of changing the first "X" it meets.
     assert isinstance(locate_section(_PATHS_JOIN_ALIKE, _selector("X")), NoteSliceError)
     # "X[1]" names no second section of one path; it is the same ambiguity.
@@ -969,9 +979,8 @@ def test_paths_that_join_to_one_string_are_ambiguous():
         (
             "# A\n## KI/ML\na\n# B\n## KI/ML\nb\n## KI\n### ML\nnested\n",
             "KI/ML",
-            "Section 'KI/ML' is ambiguous: 2 paths end in a heading named 'KI/ML' "
-            "(A > KI/ML, B > KI/ML). A heading whose text contains '/' cannot be "
-            "qualified by its parent headings. For the path (heading 'ML' under 'KI') "
+            "Section 'KI/ML' is ambiguous: 2 paths end in a heading named 'KI/ML'. "
+            "Qualify it: A > KI/ML, B > KI/ML. For the path (heading 'ML' under 'KI') "
             "write B/KI/ML.",
             ["B/KI/ML"],
         ),
@@ -986,18 +995,16 @@ def test_paths_that_join_to_one_string_are_ambiguous():
         (
             _NESTED_IN_ITSELF,
             "KI/ML",
-            "Section 'KI/ML' is ambiguous: 2 paths end in a heading named 'KI/ML' "
-            "(KI/ML, KI/ML > KI/ML). A heading whose text contains '/' cannot be "
-            "qualified by its parent headings.",
+            "Section 'KI/ML' is ambiguous: 2 paths end in a heading named 'KI/ML'. "
+            "Qualify it: > KI/ML, KI/ML > KI/ML.",
             [],
         ),
         (
             # "/etc" spells no path at all, so there is none to point to.
             "# A\n## /etc\na\n# B\n## /etc\nb\n",
             "/etc",
-            "Section '/etc' is ambiguous: 2 paths end in a heading named '/etc' "
-            "(A > /etc, B > /etc). A heading whose text contains '/' cannot be "
-            "qualified by its parent headings.",
+            "Section '/etc' is ambiguous: 2 paths end in a heading named '/etc'. "
+            "Qualify it: A > /etc, B > /etc.",
             [],
         ),
     ],
@@ -1017,3 +1024,321 @@ def test_offered_duplicate_names_read_back_for_an_edit():
     assert isinstance(refused, NoteSliceError)
     assert refused.message.endswith("Name one: Plan/KI/ML[0], Plan/KI/ML[1].")
     _assert_reads_back(_PLAN_TWICE, "Plan/KI/ML[1]", 9)
+
+
+# --- Locations: a heading's full path from the top (decision B3 C) ---
+#
+# Messages wrote where an unnamed heading sits as "A > KI/ML"; that location is now a
+# selector itself, read from the heading with no heading above it down to the
+# heading, "/" being plain text inside it. "> Top" is the location of a top heading.
+
+_TWO_PARENTS = "# A\n## KI/ML\na\n# B\n## KI/ML\nb\n## KI\n### ML\nnested\n"
+
+
+@pytest.mark.parametrize(
+    ("selector", "location", "duplicate_index"),
+    [
+        ("A > KI/ML", ("A", "KI/ML"), 0),
+        ("> Top", ("Top",), 0),
+        ("Top  >  Dec", ("Top", "Dec"), 0),
+        ("## Top > ## Dec", ("Top", "Dec"), 0),
+        ("> A > Log[1]", ("A", "Log"), 1),
+        ("A > Log[1][0]", ("A", "Log[1]"), 0),
+        ("R > A/B > X", ("R", "A/B", "X"), 0),
+    ],
+)
+def test_parse_section_selector_reads_a_location(selector, location, duplicate_index):
+    parsed = _selector(selector)
+
+    assert parsed.location == location
+    assert parsed.duplicate_index == duplicate_index
+
+
+@pytest.mark.parametrize(
+    "selector", ["a>b", "a >b", "a> b", "x -> y", "A >= B", ">", ">Top", "Top >", "A >  > B"]
+)
+def test_parse_section_selector_bare_gt_or_a_gap_is_no_location(selector):
+    parsed = _selector(selector)
+
+    assert parsed.location is None
+    assert parsed.heading == selector
+
+
+@pytest.mark.parametrize(
+    ("doc", "selector", "content", "label"),
+    [
+        (_TWO_PARENTS, "A > KI/ML", "## KI/ML\na", "A > KI/ML"),
+        (_TWO_PARENTS, "B > KI/ML", "## KI/ML\nb", "B > KI/ML"),
+        (_NESTED_IN_ITSELF, "> KI/ML", "## KI/ML\nouter\n### KI/ML\ninner", "> KI/ML"),
+        (_NESTED_IN_ITSELF, "KI/ML > KI/ML", "### KI/ML\ninner", "KI/ML > KI/ML"),
+        (_TOP_RECURS, "> Top", "# Top\n## Dec\nx", "> Top"),
+        (_TOP_RECURS, "Top > Dec", "## Dec\nx", "Top > Dec"),
+        (_TOP_RECURS, "  Top  >  Dec ", "## Dec\nx", "Top > Dec"),
+        (_PATHS_JOIN_ALIKE, "R > A/B > X", "### X\n\nx-under-slash\n", "R > A/B > X"),
+    ],
+)
+def test_location_reaches_headings_no_other_selector_names(doc, selector, content, label):
+    sliced = _read_section_ok(doc, selector)
+
+    assert sliced.content == content
+    assert sliced.section == label
+    _assert_reads_back(doc, label, sliced.start_line)
+
+
+@pytest.mark.parametrize(
+    ("doc", "selector", "content", "label"),
+    [
+        # A note whose first heading is "## Intro": nothing is above it, so it starts
+        # a location, like the "# Main" after it.
+        ("## Intro\nx\n# Main\n## Intro\ny\n", "> Intro", "## Intro\nx", "> Intro"),
+        ("## Intro\nx\n# Main\n## Intro\ny\n", "Main > Intro", "## Intro\ny", "Main/Intro"),
+        # Levels skipped on the way down do not count, only the headings above.
+        ("# A\n### Deep\nd\n", "A > Deep", "### Deep\nd", "A/Deep"),
+        # A location that names every heading works in an ordinary note too; the name
+        # returned stays the usual path.
+        (
+            "# Plan\n## Auth\n### Decisions\nd\n",
+            "Plan > Auth > Decisions",
+            "### Decisions\nd",
+            "Plan/Auth/Decisions",
+        ),
+    ],
+)
+def test_location_is_read_from_the_heading_with_none_above_it(doc, selector, content, label):
+    sliced = _read_section_ok(doc, selector)
+
+    assert (sliced.content, sliced.section) == (content, label)
+
+
+@pytest.mark.parametrize("selector", ["KI > ML", "top > dec", "Top > dec", "> Dec"])
+def test_location_is_no_suffix_and_compares_exactly(selector):
+    doc = _TWO_PARENTS if selector == "KI > ML" else _TOP_RECURS
+
+    error = _read_section_error(doc, selector)
+
+    assert error.message.startswith(
+        f"Section '{selector}' not found. A location starts at a heading with no heading "
+        "above it. Available sections: "
+    )
+
+
+def test_location_index_counts_the_sections_of_that_location():
+    """Twins share one location, so [n] picks among them, and children of twins too."""
+    doc = (
+        "# A\n## KI/ML\none\n### Note\nn0\n### Note\nn1\n## KI/ML\ntwo\n### Note\nn2\n"
+        "# B\n## KI/ML\nb\n"
+    )
+
+    assert _read_section_ok(doc, "A > KI/ML[1]").content == "## KI/ML\ntwo\n### Note\nn2"
+    # The Note under the second twin is the third of location "A > KI/ML > Note".
+    assert _read_section_ok(doc, "A > KI/ML > Note[2]").content == "### Note\nn2"
+    refused = locate_section(doc, _selector("A > KI/ML"))
+    assert isinstance(refused, NoteSliceError)
+    assert refused.message == (
+        "Multiple sections found with header 'A > KI/ML'. Name one: A > KI/ML[0], A > KI/ML[1]."
+    )
+    assert _read_section_error(doc, "A > KI/ML[2]").message == (
+        "Section 'A > KI/ML[2]' not found: 2 section(s) have the location 'A > KI/ML' "
+        "(duplicate indexes 0-1)."
+    )
+    assert _read_section_error(doc, "> B[1]").message == (
+        "Section '> B[1]' not found: 1 section(s) have the location '> B' (duplicate indexes 0-0)."
+    )
+
+
+def test_heading_named_like_a_location_wins():
+    """Regression: a heading whose own text is "A > B" is read by that text, as before."""
+    doc = "# R\n## A > B\nlit\n## A\n### B\npath\n"
+
+    assert _read_section_ok(doc, "A > B").content == "## A > B\nlit"
+    assert _read_section_ok(doc, "R/A > B").content == "## A > B\nlit"
+
+
+def test_heading_named_like_a_location_keeps_its_old_refusals():
+    """Regression: refusals for "A > B" read as before, with no hint at a path."""
+    doc = "# R\n## A > B\nr\n# S\n## A > B\ns\n## A > B\nt\n"
+
+    assert _read_section_error(doc, "A > B").message == (
+        "Section 'A > B' is ambiguous. Qualify it: R/A > B, S/A > B."
+    )
+    assert _read_section_error(doc, "S/A > B[2]").message == (
+        "Section 'S/A > B[2]' not found: 2 section(s) share the path 'S/A > B' "
+        "(duplicate indexes 0-1)."
+    )
+
+
+def test_location_reaches_the_path_beside_a_heading_named_like_it():
+    doc = "# A > B\nlit\n# A/B\nslash\n# A / B\nspaced\n# A\n## B\npath\n# B\nroot\n"
+
+    # "A > B", "A/B" and "A / B" are headings' own texts; "B" ends two paths.
+    assert _read_section_ok(doc, "> A > B").content == "## B\npath"
+    error = _read_section_error(doc, "Nope")
+    assert "> A > B" in _offered(error.message, "Available sections: ")[0]
+    _assert_reads_back(doc, "> A > B", 8)
+
+
+def test_old_slash_path_through_a_gt_heading_keeps_its_meaning():
+    """Regression: "A > B/C" read heading "C" under "A > B" before B3 C, and still does."""
+    doc = "# A > B\n## C\nold\n# A\n## B/C\nloc\n"
+
+    assert _read_section_ok(doc, "A > B/C").content == "## C\nold"
+
+
+def test_location_through_a_slash_heading_beside_an_old_path():
+    doc = "# A > B\n## C\nold\n# A\n## B/C\nloc\n"
+
+    assert _read_section_ok(doc, "> A > B/C").content == "## B/C\nloc"
+
+
+@pytest.mark.parametrize("heading", ["a>b", "a >b", "a> b", "x -> y", "A >= B", ">", ">Top"])
+def test_headings_with_a_bare_gt_keep_working(heading):
+    """Regression: only a ">" with a space on each side separates a location."""
+    doc = f"# Top\n## {heading}\nbody\n## Next\nz\n"
+
+    sliced = _read_section_ok(doc, heading)
+
+    assert (sliced.content, sliced.section) == (f"## {heading}\nbody", f"Top/{heading}")
+
+
+def test_heading_that_starts_like_a_location_is_read_by_its_text():
+    """Regression: a heading "> quote" is named by its text, ahead of the location form."""
+    doc = "# Top\n## > quote\nbody\n# quote\nroot\n"
+
+    assert _read_section_ok(doc, "> quote").content == "## > quote\nbody"
+
+
+def test_names_keep_a_heading_text_that_starts_like_a_heading_prefix():
+    """Selector segments drop a "## " prefix, so a name adds one for heading "# x"."""
+    doc = "# A\n## # x\na\n# B\n## # x\nb\n"
+
+    error = _read_section_error(doc, "Nope")
+
+    assert error.message.endswith("Available sections: A, A/# # x, B, B/# # x.")
+    assert _read_section_ok(doc, "B/# # x").content == "## # x\nb"
+    assert _read_section_ok(doc, "B > # # x").content == "## # x\nb"
+
+
+def test_unreachable_sections_are_pointed_to_by_document_lines():
+    """An empty heading has no name; the message gives the lines to read it by."""
+    doc = "---\ntitle: E\n---\n# Top\n#\nempty\n"
+
+    error = _read_section_error(doc, "Nope")
+
+    assert error.message == (
+        "Section 'Nope' not found. Available sections: Top. Not reachable by a section "
+        "selector (read by lines): '' (lines 5-6)."
+    )
+    by_lines = slice_note_content(doc, lines=LineRange(start=5, end=6))
+    assert isinstance(by_lines, NoteSlice)
+    assert by_lines.content == "#\nempty"
+
+
+# --- Property: every heading has a name, and every name reads back ---
+#
+# Generated notes mix repeated texts, "/" and ">" in heading texts, top headings that
+# recur deeper, notes starting at "##", setext headings and fake headings in code
+# fences. Texts hold no ", " or ".", which would blur the comma-joined offers.
+
+_CLEAN_TEXTS = (
+    "A", "B", "Top", "Log", "KI", "ML", "KI/ML", "/etc", "A/B", "Q/A",
+    "a>b", "x -> y", "Log[1]", "# x",
+)  # fmt: skip
+# Texts a location cannot spell: empty, " > " inside, or a ">" at an edge.
+_HARD_TEXTS = (*_CLEAN_TEXTS, "A > B", "> A", "B >", "")
+_SETEXT_TEXTS = ("A", "B", "Top", "KI/ML", "a>b")
+
+
+def _generated_note(rng: random.Random, texts: tuple[str, ...]) -> str:
+    lines = ["---", "title: G", "---"] if rng.random() < 0.3 else []
+    for _ in range(rng.randint(1, 12)):
+        level = rng.randint(1, 4)
+        if level <= 2 and rng.random() < 0.15:
+            lines += ["", rng.choice(_SETEXT_TEXTS), "===" if level == 1 else "---"]
+        else:
+            lines.append(f"{'#' * level} {rng.choice(texts)}".rstrip())
+        if rng.random() < 0.15:
+            lines += ["```", f"## {rng.choice(texts)}", "```"]
+        lines.append("body")
+    return "\n".join(lines) + "\n"
+
+
+def _start_line(doc: str, name: str) -> int:
+    """Read by name and check the edit side and the returned name land on the same line."""
+    sliced = _read_section_ok(doc, name)
+    span = locate_section(doc, _selector(name))
+    if isinstance(span, NoteSliceError):
+        # Only twins refuse an unindexed edit; the offered names carry [n] for them.
+        assert span.message.startswith("Multiple sections found"), span.message
+    else:
+        assert span.heading_start + 1 == sliced.start_line
+    assert sliced.section is not None
+    _assert_reads_back(doc, sliced.section, sliced.start_line)
+    return sliced.start_line
+
+
+def _offer_names(message: str, intro: str) -> list[str]:
+    """The names after an intro such as "Qualify it: ", up to the end of that sentence."""
+    if intro not in message:
+        return []
+    names = message.split(intro, 1)[1].split(".", 1)[0]
+    return [] if names == "(none)" else names.split(", ")
+
+
+def _written_as_location(text: str) -> bool:
+    """A heading text a location cannot hold, or that takes a location's spelling."""
+    return not text or " > " in text or text.startswith("> ") or text.endswith(" >")
+
+
+def _check_generated_note(doc: str, *, every_heading_named: bool) -> None:
+    body_lines = doc.split("\n")[_frontmatter_line_count(doc) :]
+    sections = scan_sections("\n".join(body_lines))
+    offset = len(doc.split("\n")) - len(body_lines)
+
+    def headings_at(start: int) -> list[str]:
+        return [s.heading for s in sections if offset + s.start_line == start]
+
+    # Every heading is offered once: by a name that reads back, or by its lines.
+    names, unreachable = _offered(_read_section_error(doc, "Nope").message, "Available sections: ")
+    reached = [_start_line(doc, name) for name in names]
+    assert len(set(reached)) == len(names)
+    assert len(names) + len(unreachable) == len(sections)
+    unnamed = [s for s in sections if offset + s.start_line not in reached]
+    assert [
+        f"'{s.heading}' (lines {offset + s.start_line}-{offset + s.end_line})" for s in unnamed
+    ] == unreachable
+    # Decision B3 C: without such texts in the note, every heading has a name. With
+    # them, a heading may stay unnamed only when the note holds one.
+    if every_heading_named:
+        assert unreachable == []
+    elif unnamed:
+        assert any(_written_as_location(s.heading) for s in sections)
+
+    # The names a refusal offers read back into the sections the selector matched.
+    for text in {s.heading for s in sections if s.heading}:
+        selector = _selector(text)
+        # "Log[1]" is the second "Log", and "# x" is heading "x", as for any selector.
+        matched = selector.heading
+        sliced = _read_section(doc, text)
+        offered = (
+            [] if isinstance(sliced, NoteSlice) else _offer_names(sliced.message, "Qualify it: ")
+        )
+        for name in offered:
+            assert matched in headings_at(_start_line(doc, name)), (text, name)
+        span = locate_section(doc, selector)
+        if isinstance(span, NoteSliceError):
+            for name in _offer_names(span.message, "Name one: "):
+                assert matched in headings_at(_start_line(doc, name)), (text, name)
+
+
+@pytest.mark.parametrize("seed", range(3))
+def test_every_heading_of_a_generated_note_has_a_name_that_reads_back(seed):
+    rng = random.Random(seed)
+    for _ in range(40):
+        _check_generated_note(_generated_note(rng, _CLEAN_TEXTS), every_heading_named=True)
+
+
+@pytest.mark.parametrize("seed", range(3))
+def test_names_read_back_even_where_a_location_cannot_spell_the_path(seed):
+    rng = random.Random(1000 + seed)
+    for _ in range(40):
+        _check_generated_note(_generated_note(rng, _HARD_TEXTS), every_heading_named=False)
