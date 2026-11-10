@@ -85,6 +85,12 @@ bm_edit(identifier="plans/launch-plan.md", command="append", content="x",
   refused. Use `insert_after_section` to add under a heading.
 - `set_metadata` refuses `title` and `permalink`: they are the note's identity.
   Rename with bm_move.
+- A call that ends without an answer (the client says the connection closed,
+  or that the tool "may have run") may have made the edit. On a Git host an
+  edit that has begun to publish is finished even when the client leaves or
+  the server stops; only the answer is lost. bm_read the note before trying
+  again: an `append` repeated blindly adds its text twice. Retry with the
+  `expected_checksum` that read returns.
 
 ## SEE ALSO
 

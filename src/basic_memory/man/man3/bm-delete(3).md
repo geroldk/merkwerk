@@ -57,6 +57,14 @@ bm_delete(identifier="plans/launch-plan.md", expected_checksum="stale", project=
 #   (current checksum 77a457af…). Nothing was deleted.
 ```
 
+## GOTCHAS
+
+- A call that ends without an answer (the client says the connection closed,
+  or that the tool "may have run") may have deleted the note. On a Git host a
+  delete that has begun to publish is finished even when the client leaves or
+  the server stops; only the answer is lost. bm_read the note first: if it is
+  not found, the delete happened.
+
 ## SEE ALSO
 
 - see_also [[bm-move(3)]]

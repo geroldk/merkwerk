@@ -89,6 +89,14 @@ bm_write(identifier="plans/launch-plan.md", content="# again", project="demo")
   (`Release Checklist.md`); its permalink is the slug (`release-checklist`).
 - A folder name the model would rewrite (unsupported characters) is refused
   rather than silently changed.
+- A call that ends without an answer (the client says the connection closed,
+  or that the tool "may have run") may have written the note. On a Git host a
+  write that has begun to publish is finished even when the client leaves or
+  the server stops; only the answer is lost. bm_read the note before writing
+  again: if it holds your content, it is done. Replace it only with the
+  `expected_checksum` that read returns, so a newer revision is never
+  overwritten. A repeated create of a note that was written is refused as
+  `ALREADY_EXISTS`.
 
 ## SEE ALSO
 
