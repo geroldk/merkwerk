@@ -74,9 +74,10 @@ stores; there is no implicit migration/fallback for that format.
 with a local root/name. Existing local names/roots or UUIDs bound elsewhere are not
 silently adopted. `services/git_project_projection.py` restores exact `NoteContent`
 under the manifest's note UUIDs, with short per-note SQL transactions and read-cache
-invalidation. Repetition keeps the UUID and content version, while making missing
-or interrupted file materialization retryable. The normal BM guarded materializer
-then writes bytes; it preserves an unexpected editor file and reports conflict.
+invalidation. Repetition keeps the UUID and content version; an unchanged note keeps
+its file state, since the files stage checks every note's file on disk itself and
+rewrites a missing or interrupted one. The normal BM guarded materializer then writes
+bytes; it preserves an unexpected editor file and reports conflict.
 
 Existing SQL revisions use version CAS. An earlier absence uses a unique-key INSERT,
 so a concurrently appearing content row cannot be overwritten by an initial-version
@@ -88,8 +89,8 @@ the selected published history, not every object in the repository.
 See [git-rev-list](https://git-scm.com/docs/git-rev-list).
 
 The projector accepts only the current published head and checks it again before
-each per-note write. If Git advances it stops and requires a retry on the latest
-head; it does not finish an older target over newer SQL. A partial pass can leave a
+each per-note write. If Git advances it stops as superseded and the worker retries on
+the latest head at once; it does not finish an older target over newer SQL. A partial pass can leave a
 mixture of published revisions, which V1 permits. It does not acknowledge complete
 project/index progress. Proven moves/deletions are reconciled as described below.
 Unproven local notes and raw imports lacking canonical BM `title`/`type`/`permalink`
@@ -113,10 +114,24 @@ Permissions include proven accepted bytes and known materialized lineage. Repeat
 moves merge older permissions; a stale acknowledgement cannot erase a newer one.
 An inconsistent accepted checksum grants no cleanup permission.
 
-The files stage retires old files before writing destinations, supporting path
-reuse and swaps. It uses BM's existing checksum-guarded storage deletion. A missing
-file is already retired; a reused path containing its exact current Git bytes is
-preserved. Unexpected editor bytes keep the retirement and files progress pending.
+The files stage writes each note's new file before its old file goes (F2), so a
+moved note is never missing from disk; for the length of one note it can be there
+twice. `index/git_file_projection_plan.py` classifies every path from one look at
+SQL, disk and the retirement rows and orders the steps; the stage in
+`index/git_projection.py` carries them out with BM's checksum-guarded storage
+deletion. Old bytes go only after the note they belong to is verified on disk (the
+owner is named from the bytes, or from the last fully written commit where disk still
+holds its bytes); an unknown owner waits until every other note is on disk. A path
+another note still occupies is cleared right before its own write, one path at a
+time; a swap is broken at one delete, so one note is absent for two deletes and two
+materializations. A missing file is already retired; a reused path containing its
+exact current Git bytes is kept and its row still published as synced. Unexpected
+editor bytes keep the retirement and files progress pending, while the other notes
+are still written. Bytes nothing in SQL explains are replaced only when Git published
+them at that path. A case- or Unicode-only alias of a live file is renamed, never
+deleted; manifests whose paths would merge on such file systems are refused. Files
+and folders may trade places, and folders the stage's own deletions left empty are
+removed (never the root or a hidden folder). A final check reads every note.
 The graph stage purges orphan full-text rows; the vector stage removes stale
 manifest/physical vectors through the normal repository cleanup/reconciliation.
 These guards do not replace the preproduction requirement to control all writers.
@@ -124,10 +139,15 @@ These guards do not replace the preproduction requirement to control all writers
 `test-int/test_git_layout_integration.py` covers moves, swaps, deletions through an
 empty project, path reuse, coalesced moves and rapid round trips without intervening
 file work. It verifies preserved identities, incoming unresolved relations, FTS and
-physical vector cleanup. Child processes terminate after layout/file work and
-immediately after file deletion but before retirement acknowledgement. Restart
-repeats safely, including when an old file has disappeared or a new file now owns
-its path. Editor conflicts remain visible and preserve the editor's bytes.
+physical vector cleanup. Child processes terminate after layout/file work,
+immediately after file deletion but before retirement acknowledgement, after all new
+files are written but before the first old one goes, between a reused path's delete
+and its write, and after a write before its publish. Restart repeats safely,
+including when an old file has disappeared or a new file now owns its path. Editor
+conflicts remain visible and preserve the editor's bytes.
+`test-int/test_git_file_projection_integration.py` watches disk during the files
+stage (no moment without a note, at most one duplicate at a time, a 110-note folder
+move without empty folders left) and covers commits arriving during a pass.
 
 The one-ref rule matters: Git documents atomic updates of individual refs while
 concurrent readers can observe a subset of a multi-ref update. This implementation
@@ -214,13 +234,18 @@ version must be bumped when the derived chunk/index policy changes in code.
 lifecycle. It owns two serial tasks: content → files → graph, and vectors after
 graph completion. A slow embedding call cannot block newer content/file/graph
 catch-up. Each lane retries failures with bounded exponential backoff (poll
-interval × up to 64); publication notifications only reduce latency. Polling Git
+interval × up to 64); publication notifications only reduce latency. A pass
+superseded by a newer head is not a failure: it records `superseded`, keeps the
+failure count and starts the next pass at once (vectors wait for the index lane). Polling Git
 and SQL on startup and subsequent passes recovers even completely lost wakeups.
 There is no per-write coroutine backlog and no new daemon. Local worker ownership
 is now enforced by `index/git_project_ownership.py` before either task starts.
 
-Work samples the latest published head and may coalesce A/B into C. Head changes
-stop an old pass; attempt/target guards reject late acknowledgements. The worker
+Work samples the latest published head and may coalesce A/B into C. A head change
+supersedes an old pass: the content stage stops at once, the files stage finishes its
+writes (each fenced by the materializer's version claim and the checksum-guarded
+delete) and checks HEAD at its end; attempt/target guards reject late
+acknowledgements. The worker
 records completion only after work returns. Cancellation/process death before that
 point leaves a durable running marker; a new owner repeats the stage safely.
 Context exit cancels and awaits both tasks. SQL transactions do not span embedding
