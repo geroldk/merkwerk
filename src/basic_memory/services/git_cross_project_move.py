@@ -39,7 +39,6 @@ from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Any, NoReturn
 from uuid import UUID, uuid4
 
-import anyio
 from loguru import logger
 from sqlalchemy import select
 
@@ -58,6 +57,7 @@ from basic_memory.repository.git_project_repository import (
     GitPublicationError,
     GitSnapshot,
     quote_in_message,
+    settle_atomic,
 )
 from basic_memory.repository.git_projection_repository import (
     GitProjectionConflict,
@@ -168,20 +168,10 @@ async def _settled[T](operation: Coroutine[Any, Any, T]) -> T:
 
     A cancelled request would otherwise release the target gate between the source
     delete and the target commit, the window the gate is held to close. The caller
-    still receives its cancellation once the move has reached its outcome.
+    still receives its cancellation once the move has reached its outcome, also when
+    it is cancelled more than once (see settle_atomic).
     """
-    task = asyncio.ensure_future(operation)
-    try:
-        return await asyncio.shield(task)
-    except asyncio.CancelledError:
-        # Constraint: an anyio cancel scope (FastMCP, Starlette middleware) delivers its
-        #   cancellation again on every loop tick; a loop around asyncio.shield would spin.
-        # Outcome: one shielded wait for the move, then the caller's cancellation.
-        with anyio.CancelScope(shield=True):
-            await asyncio.wait({task})
-        if not task.cancelled():
-            task.exception()
-        raise
+    return await settle_atomic(operation)
 
 
 def _project_name(runtime: GitProjectRuntime) -> str:

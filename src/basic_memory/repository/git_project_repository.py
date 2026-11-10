@@ -12,15 +12,19 @@ import json
 import os
 import re
 import subprocess
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Coroutine, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from functools import partial
 from tempfile import TemporaryDirectory
-from typing import Literal
+from typing import Any, Literal
 from uuid import UUID, uuid4
 
+import anyio
+from anyio.lowlevel import checkpoint_if_cancelled
+
+from basic_memory.runtime.call_publications import note_held_cancellation, note_publication
 from basic_memory.schemas.git_project import (
     GIT_PROJECT_MANIFEST_PATH,
     GitNoteIdentity,
@@ -119,16 +123,39 @@ async def settle_git_publication(
 
 async def settle_git_operation[T](operation: Callable[[], T]) -> T:
     """Finish a short filesystem mutation before its caller releases ownership."""
-    task = asyncio.create_task(asyncio.to_thread(operation))
+    return await settle_atomic(asyncio.to_thread(operation))
+
+
+async def settle_atomic[T](operation: Coroutine[Any, Any, T]) -> T:
+    """Run one bounded atomic step to its outcome, even when its caller is cancelled.
+
+    The step runs as a task of its own, which no cancellation of the caller reaches; the
+    caller waits for it and only then receives its cancellation. This is for steps whose
+    halves must not be separated (a candidate commit, its publication and the SQL that
+    follows it), never for a loop over many notes: a stop waits for the whole step.
+    """
+    task = asyncio.ensure_future(operation)
     cancelled: asyncio.CancelledError | None = None
     while not task.done():
         try:
-            await asyncio.shield(task)
+            # Constraint: an anyio cancel scope (an MCP client that disconnects, a stopping
+            #   server) delivers its cancellation again on every loop tick, so a bare wait
+            #   would spin; shielded, it sleeps. A native task.cancel() passes an anyio
+            #   shield; it is kept, and the wait goes on.
+            with anyio.CancelScope(shield=True):
+                await asyncio.wait({task})
         except asyncio.CancelledError as error:
             cancelled = error
-    if cancelled is not None:
-        task.exception()
-        raise cancelled
+    if not task.cancelled():
+        task.exception()  # retrieved: a cancellation below replaces the step's outcome
+    try:
+        if cancelled is not None:
+            raise cancelled
+        # An anyio cancellation that arrived while the step ran is delivered now.
+        await checkpoint_if_cancelled()
+    except asyncio.CancelledError:
+        note_held_cancellation()
+        raise
     return task.result()
 
 
@@ -315,6 +342,7 @@ class GitProjectRepository:
             if actual != base_commit:
                 raise GitPublicationConflict(base_commit, actual)
             raise GitPublicationError("Incoming reference changed before publication")
+        note_publication(self.path.name, commit_id)
 
     def push_published(self, remote: str, commit_id: str) -> None:
         _require_commit_id(commit_id)
@@ -465,6 +493,7 @@ class GitProjectRepository:
             if actual != merge.local_commit:
                 raise GitPublicationConflict(merge.local_commit, actual)
             raise GitPublicationError("Incoming reference changed before merge publication")
+        note_publication(self.path.name, merge.commit_id)
 
     def initial_snapshot(self) -> GitSnapshot:
         """Require the empty initialization commit before adopting a legacy project."""
@@ -535,6 +564,7 @@ class GitProjectRepository:
         return frozenset(
             UUID(reference.split("/")[3]) for reference in refs.decode("ascii").splitlines()
         )
+
 
     def _read_snapshot(self, commit_id: str) -> GitSnapshot:
         tree = self._git("ls-tree", "-r", "-z", "--full-tree", commit_id)
@@ -941,6 +971,7 @@ class GitProjectRepository:
             )
         result = self._run("update-ref", "--stdin", input_bytes=commands.encode("ascii"))
         if result.returncode == 0:
+            note_publication(self.path.name, prepared.commit_id)
             return GitPublication(prepared.commit_id, already_committed=False)
         # A lost answer or a competing commit of this same explicit transaction
         # is resolved before classifying an ordinary stale-basis conflict.

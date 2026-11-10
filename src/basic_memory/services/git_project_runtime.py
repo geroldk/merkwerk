@@ -47,6 +47,7 @@ from basic_memory.repository.git_project_repository import (
     GitPublicationConflict,
     GitPublicationError,
     GitSnapshot,
+    settle_atomic,
     settle_git_publication,
 )
 from basic_memory.repository.git_host_identities import GitNoteOwnedElsewhere
@@ -169,7 +170,6 @@ class GitProjectRuntime:
                     ) from deferral
                 self._sql_commit = base.commit_id
             layout = GitLayoutRepository(self.pipeline.project_id)
-            publication: GitPublication | None = None
             try:
                 async with db.scoped_session(self.pipeline.session_maker) as session:
                     before = await layout.local_notes(session)
@@ -255,16 +255,9 @@ class GitProjectRuntime:
                         base.files, base.manifest.note_ids, files, note_ids
                     ):
                         await invalidate_git_graphs(session)
-                    prepared = await asyncio.to_thread(
-                        repository.prepare,
-                        transaction_id=uuid4(),
-                        base_commit=base.commit_id,
-                        files=files,
-                        note_ids=note_ids,
-                    )
-                    publication = await settle_git_publication(repository, prepared)
-                    self.last_publication = publication
-                self._sql_commit = publication.commit_id
+                    # Everything up to here only reads Git and writes the uncommitted
+                    # session: a cancellation so far changes nothing.
+                    await settle_atomic(self._publish_accepted(session, base, files, note_ids))
                 # Legacy route materialization must not run after this executor.
                 # The lifecycle worker alone owns files/graph/FTS/vectors.
                 return replace(
@@ -281,20 +274,53 @@ class GitProjectRuntime:
                         "source_commit": error.actual,
                     },
                 ) from error
-            except Exception as error:
-                if publication is not None:
-                    raise NoteContentMutationServiceError(
-                        503,
-                        {
-                            "message": "Git published; SQL pending. Check status before retry.",
-                            "published_commit": publication.commit_id,
-                        },
-                    ) from error
-                raise
             finally:
                 # Even a cancelled/lost publication response or failed SQL commit
                 # must wake durable Git recovery. Polling covers process death.
                 self.worker.notify()
+
+    async def _publish_accepted(
+        self,
+        session: AsyncSession,
+        base: GitSnapshot,
+        files: dict[str, str],
+        note_ids: dict[str, UUID],
+    ) -> None:
+        """The atomic step of one write: candidate commit, publication, SQL commit.
+
+        accept() runs this through settle_atomic, so a client that disconnects (or a
+        stop) while it runs cannot separate its halves: Git, the session's accepted rows
+        and this runtime's SQL basis reach one outcome, and no candidate ref is left.
+        It is bounded: one prepare, one publication and one SQL commit, each Git call
+        with its 30 s timeout, all inside the admission gate already held.
+        """
+        repository = self.pipeline.repository
+        transaction_id = uuid4()
+        try:
+            prepared = await asyncio.to_thread(
+                repository.prepare,
+                transaction_id=transaction_id,
+                base_commit=base.commit_id,
+                files=files,
+                note_ids=note_ids,
+            )
+            publication = await settle_git_publication(repository, prepared)
+            self.last_publication = publication
+            try:
+                await session.commit()
+            except Exception as error:
+                raise NoteContentMutationServiceError(
+                    503,
+                    {
+                        "message": "Git published; SQL pending. Check status before retry.",
+                        "published_commit": publication.commit_id,
+                    },
+                ) from error
+            self._sql_commit = publication.commit_id
+        finally:
+            # The candidate ref has done its job (published, or refused); a lost one
+            # is swept at the next start.
+            await asyncio.to_thread(self._remove_candidates, transaction_id)
 
     # --- SQL catch-up for cross-project moves (I1) ---
 
