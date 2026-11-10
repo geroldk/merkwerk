@@ -6,6 +6,8 @@ from enum import Enum, auto
 from pathlib import Path
 from typing import Any, AsyncGenerator, Optional
 
+import anyio
+
 from basic_memory.config import BasicMemoryConfig, ConfigManager, DatabaseBackend
 from alembic import command
 from alembic.config import Config
@@ -193,8 +195,15 @@ async def scoped_session(
         await owned_session.rollback()
         raise
     finally:
-        await owned_session.close()
-        await factory.remove()
+        # Constraint: a cancelled request (an MCP client that disconnects) is cancelled
+        #   by an anyio cancel scope, which cancels every later await again. Cut short,
+        #   close() never checks the connection back in: SQLAlchemy then reports a
+        #   "non-checked-in connection" and terminates it from the garbage collector.
+        # Outcome: the connection always returns to the pool (rolled back when the
+        #   transaction did not commit); the cancellation goes on afterwards.
+        with anyio.CancelScope(shield=True):
+            await owned_session.close()
+            await factory.remove()
 
 
 _SQLITE_SYNCHRONOUS = {"OFF", "NORMAL", "FULL", "EXTRA"}
