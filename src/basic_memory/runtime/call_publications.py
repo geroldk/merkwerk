@@ -28,6 +28,11 @@ class CallPublications:
     commits: list[str] = field(default_factory=list)
     # Atomic steps that a cancellation reached while they ran; each finished first.
     held: int = 0
+    # A call that changes several notes one after another, each on its own (a folder move
+    # into another project): how many it set out to change, and how many reached their
+    # outcome. None for a call that is one step.
+    items: int | None = None
+    items_done: int = 0
     _lock: Lock = field(default_factory=Lock, repr=False)
 
     def published(self, repository: str, commit_id: str) -> None:
@@ -37,6 +42,11 @@ class CallPublications:
     def held_cancellation(self) -> None:
         with self._lock:
             self.held += 1
+
+    @property
+    def cut_off(self) -> bool:
+        """A call of several items was cancelled before its last item reached an outcome."""
+        return self.items is not None and self.items_done < self.items
 
 
 _current: ContextVar[CallPublications | None] = ContextVar("bm_call_publications", default=None)
@@ -63,3 +73,15 @@ def note_held_cancellation() -> None:
     """A cancellation waited for an atomic step of the current call to finish."""
     if (record := _current.get()) is not None:
         record.held_cancellation()
+
+
+def note_items(count: int) -> None:
+    """The current call changes `count` items one after another, each on its own."""
+    if (record := _current.get()) is not None:
+        record.items, record.items_done = count, 0
+
+
+def note_item_done() -> None:
+    """One more item of the current call reached its outcome (changed, or refused)."""
+    if (record := _current.get()) is not None:
+        record.items_done += 1

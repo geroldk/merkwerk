@@ -53,6 +53,18 @@ def outcome(publications: CallPublications) -> str:
     held = (
         f"; the cancel waited for {publications.held} atomic step(s)" if publications.held else ""
     )
+    # Trigger: a call of several items (a folder move into another project) was cut off
+    #   after it had published something.
+    # Why: each item moved whole or not at all, but the call did neither; "completed"
+    #   would tell the reader that the whole folder moved.
+    # Outcome: the line names where it stopped; the published items are in effect.
+    if publications.commits and publications.cut_off:
+        return (
+            f"outcome=partial published={','.join(publications.commits)} "
+            f"(cut off at item {publications.items_done + 1} of {publications.items}: "
+            "what is listed is in effect, the items after it were not started; "
+            f"check before retrying){held}"
+        )
     if publications.commits:
         return (
             f"outcome=completed published={','.join(publications.commits)} "
