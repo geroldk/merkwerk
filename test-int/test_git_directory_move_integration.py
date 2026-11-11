@@ -9,6 +9,7 @@ import asyncio
 import json
 import os
 import shutil
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -1101,6 +1102,52 @@ async def test_a_move_whose_answer_is_lost_after_publication_is_found_at_the_des
     assert "may already have moved" in payload["message"]
     assert "bm_list(path='archive'" in payload["try_instead"]
     assert commits(git_host.repository) == count + 1
+
+
+@pytest.mark.asyncio
+async def test_a_move_cancelled_during_its_candidate_commit_leaves_no_candidate_ref(
+    git_host, monkeypatch
+):
+    """A cancel while prepare() runs moves nothing and leaves no private ref behind.
+
+    The cancelled caller waits for the candidate commit (one bounded step) and only then
+    drops its ref; before, the cleanup ran while the thread was still writing the ref.
+    """
+    from basic_memory.api.app import app
+
+    project_id = git_host.project.external_id
+    seed(git_host.repository, {"src/a.md": note("src/a.md"), "src/b.md": note("src/b.md")})
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=ASGITransport(app), base_url="http://test") as client:
+            await ready(client, project_id)
+            repository = runtime(project_id).pipeline.repository
+            before = await state(git_host)
+            prepare = repository.prepare
+            entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+
+            def held_prepare(**kwargs):
+                entered.set()
+                assert release.wait(10)
+                try:
+                    return prepare(**kwargs)
+                finally:
+                    finished.set()
+
+            monkeypatch.setattr(repository, "prepare", held_prepare)
+            request = asyncio.create_task(move(client, project_id, "src", "dst"))
+            assert await asyncio.to_thread(entered.wait, 10)
+            request.cancel()
+            # The cancellation reaches the move while its candidate commit still runs.
+            await asyncio.sleep(0.1)
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await request
+            # Whatever the caller saw, the thread wrote its candidate ref by now.
+            assert await asyncio.to_thread(finished.wait, 10)
+            monkeypatch.setattr(repository, "prepare", prepare)
+            await ready(client, project_id)
+            assert candidate_refs(git_host.repository) == before[2]
+            assert await state(git_host) == before
 
 
 @pytest.fixture

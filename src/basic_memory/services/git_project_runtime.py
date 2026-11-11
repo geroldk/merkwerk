@@ -50,6 +50,7 @@ from basic_memory.repository.git_project_repository import (
     GitPublicationError,
     GitSnapshot,
     settle_atomic,
+    settle_git_operation,
     settle_git_publication,
 )
 from basic_memory.repository.git_host_identities import GitNoteOwnedElsewhere
@@ -457,13 +458,20 @@ class GitProjectRuntime:
         transaction_id = uuid4()
         try:
             try:
-                prepared = await asyncio.to_thread(
-                    repository.prepare,
-                    transaction_id=transaction_id,
-                    base_commit=base.commit_id,
-                    files=files,
-                    note_ids=note_ids,
-                    message=plan.message,
+                # Constraint: prepare() writes the candidate ref in its thread; a cancelled
+                #   to_thread returns at once while the thread goes on, so the cleanup in
+                #   the finally below would run before the ref exists and miss it.
+                # Outcome: a cancellation waits for the candidate commit (one bounded
+                #   step), then nothing is published and the ref is dropped.
+                prepared = await settle_git_operation(
+                    partial(
+                        repository.prepare,
+                        transaction_id=transaction_id,
+                        base_commit=base.commit_id,
+                        files=files,
+                        note_ids=note_ids,
+                        message=plan.message,
+                    )
                 )
             except ValueError as error:
                 raise GitDirectoryMoveRefused(
