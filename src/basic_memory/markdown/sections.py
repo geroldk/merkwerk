@@ -14,7 +14,8 @@ are still section-addressable.
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import dataclass
+from collections.abc import Iterator
+from dataclasses import dataclass, field
 import re
 from typing import Literal
 
@@ -447,24 +448,37 @@ class _Headings:
     # heading's own text, so a lookup scans only the sections ending in it; checking
     # every offered name stays cheap on notes with thousands of headings.
     by_text: dict[str, tuple[MarkdownSection, ...]]
-    # Full path -> its sections in document order, so position equals duplicate_index.
-    by_path: dict[tuple[str, ...], tuple[MarkdownSection, ...]]
     # Frontmatter lines before the body, to word document-absolute line numbers.
     line_offset: int
+    # Full path -> its sections in document order, so position equals duplicate_index.
+    # Filled on first use (_sections_at): only a location and an edit's twins need it,
+    # and building it up front doubled the index cost of every section read.
+    by_path: dict[tuple[str, ...], list[MarkdownSection]] = field(default_factory=dict)
+    # Selector name -> the section it addresses, None for none. Naming tries the same
+    # spelling for many sections ("KI/ML" for the one under each of its parents), and
+    # each lookup scans every heading of that text: without this a refusal costs the
+    # square of the parents. Built per request, so it never outlives the note text.
+    addressed_by_name: dict[str, MarkdownSection | None] = field(default_factory=dict)
 
 
 def _index_headings(sections: tuple[MarkdownSection, ...], line_offset: int) -> _Headings:
     by_text: dict[str, list[MarkdownSection]] = {}
-    by_path: dict[tuple[str, ...], list[MarkdownSection]] = {}
     for section in sections:
         by_text.setdefault(section.heading, []).append(section)
-        by_path.setdefault(section.path, []).append(section)
     return _Headings(
         sections=sections,
         by_text={text: tuple(group) for text, group in by_text.items()},
-        by_path={path: tuple(group) for path, group in by_path.items()},
         line_offset=line_offset,
     )
+
+
+def _sections_at(headings: _Headings, path: tuple[str, ...]) -> tuple[MarkdownSection, ...]:
+    """The sections whose full path is exactly ``path``, in document order."""
+    by_path = headings.by_path
+    if not by_path:
+        for section in headings.sections:
+            by_path.setdefault(section.path, []).append(section)
+    return tuple(by_path.get(path, ()))
 
 
 @dataclass(frozen=True, slots=True)
@@ -507,7 +521,7 @@ def _location_lookup(
     headings: _Headings, location: tuple[str, ...], duplicate_index: int
 ) -> _Lookup:
     """Find the sections whose full path is exactly this location (read from the top)."""
-    matches = headings.by_path.get(location, ())
+    matches = _sections_at(headings, location)
     return _Lookup(
         reading="location",
         matches=matches,
@@ -567,15 +581,22 @@ def _selector_lookup(headings: _Headings, selector: SectionSelector) -> _Lookup 
 
 def _reaches(headings: _Headings, name: str, target: MarkdownSection) -> bool:
     """True when the selector ``name`` addresses exactly ``target``."""
-    selector = parse_section_selector(name)
-    found = None if selector is None else _selector_lookup(headings, selector)
-    return found is not None and found.section == target
+    addressed = headings.addressed_by_name
+    if name not in addressed:
+        selector = parse_section_selector(name)
+        found = None if selector is None else _selector_lookup(headings, selector)
+        addressed[name] = None if found is None else found.section
+    return addressed[name] == target
 
 
 def _spelled(path: tuple[str, ...]) -> tuple[str, ...]:
     """Heading texts as a selector spells them, so that reading them back keeps them."""
     # A heading text that itself starts like "# x" would lose that prefix when read
     # back (selector segments drop a "## " prefix), so it gets one more "# " to drop.
+    # Most paths hold no "#" at all; one search over them spares a match per heading
+    # when every heading of a note is named.
+    if "#" not in "".join(path):
+        return path
     return tuple(f"# {text}" if _ATX_HEADING_PREFIX.match(text) else text for text in path)
 
 
@@ -588,6 +609,19 @@ def _location_spellings(path: tuple[str, ...]) -> list[str]:
     return [joined, _LOCATION_ROOT + joined]
 
 
+def _name_stems(path: tuple[str, ...]) -> Iterator[str]:
+    """The spellings of a heading path, in the order ``_selector_name`` tries them."""
+    spelled = _spelled(path)
+    suffixes = [spelled[-length:] for length in range(len(spelled), 0, -1)]
+    yield from (HEADING_PATH_SEPARATOR.join(suffix) for suffix in suffixes)
+    yield from (
+        f" {HEADING_PATH_SEPARATOR} ".join(suffix) for suffix in suffixes if len(suffix) > 1
+    )
+    # Spelled only when asked for: most headings read back by their path, and listing
+    # every heading of a note should not pay for the locations they never need.
+    yield from _location_spellings(path)
+
+
 def _selector_name(headings: _Headings, target: MarkdownSection, *, indexed: bool) -> str | None:
     """The first spelling that reads back to ``target``, or None when none does.
 
@@ -597,15 +631,8 @@ def _selector_name(headings: _Headings, target: MarkdownSection, *, indexed: boo
     twins need for an edit; otherwise the bare name comes first and "[0]" is the
     fallback for a heading whose own text ends in "[n]".
     """
-    path = _spelled(target.path)
-    suffixes = [path[-length:] for length in range(len(path), 0, -1)]
-    stems = (
-        [HEADING_PATH_SEPARATOR.join(suffix) for suffix in suffixes]
-        + [f" {HEADING_PATH_SEPARATOR} ".join(suffix) for suffix in suffixes if len(suffix) > 1]
-        + _location_spellings(target.path)
-    )
     index = f"[{target.duplicate_index}]"
-    for stem in stems:
+    for stem in _name_stems(target.path):
         for name in (stem + index,) if indexed else (stem, stem + index):
             if _reaches(headings, name, target):
                 return name
@@ -671,10 +698,12 @@ def _with_twin_flags(
 
 def _first_of_paths(found: _Lookup) -> list[tuple[MarkdownSection, bool]]:
     """One target per distinct path, named without an index ("Qualify it")."""
-    return [
-        (next(section for section in found.matches if section.path == path), False)
-        for path in found.paths
-    ]
+    # One pass over the matches: searching them again for each path cost the square
+    # of the paths for a heading under thousands of parents (review B3 C).
+    first: dict[tuple[str, ...], MarkdownSection] = {}
+    for section in found.matches:
+        first.setdefault(section.path, section)
+    return [(section, False) for section in first.values()]
 
 
 def _path_hint(headings: _Headings, selector: SectionSelector) -> str:
@@ -819,7 +848,7 @@ def locate_section(
     if isinstance(found, NoteSliceError):
         return found
     matched, label = found.section, found.label
-    twins = headings.by_path[matched.path]
+    twins = _sections_at(headings, matched.path)
     if len(twins) > 1 and not selector.indexed:
         note_label = f" in note '{note_title}'" if note_title else ""
         # Each choice reads back to its twin: for a heading named whole that is its

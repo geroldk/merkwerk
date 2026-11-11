@@ -10,6 +10,7 @@ from textwrap import dedent
 
 import pytest
 
+from basic_memory.markdown import sections as sections_module
 from basic_memory.markdown.sections import (
     LineRange,
     NoteSlice,
@@ -1246,6 +1247,35 @@ def test_unreachable_sections_are_pointed_to_by_document_lines():
     by_lines = slice_note_content(doc, lines=LineRange(start=5, end=6))
     assert isinstance(by_lines, NoteSlice)
     assert by_lines.content == "#\nempty"
+
+
+# --- What a refusal costs ---
+#
+# Naming the sections a refusal offers tries the same spelling for many of them
+# ("KI/ML" for the one under each parent), and each lookup of that spelling scans
+# every heading of its text: looked up again for each section, a refusal cost the
+# square of the parents (review B3 C).
+
+
+def test_a_refusal_looks_up_a_shared_spelling_once(monkeypatch):
+    looked_up: list[str] = []
+    lookup = sections_module._selector_lookup
+
+    def counting_lookup(headings, selector):
+        looked_up.append(selector.heading)
+        return lookup(headings, selector)
+
+    monkeypatch.setattr(sections_module, "_selector_lookup", counting_lookup)
+
+    def lookups_of_the_heading_text(parents: int) -> int:
+        doc = "".join(f"# P{k}\n## KI/ML\nx\n" for k in range(parents))
+        looked_up.clear()
+        assert "is ambiguous" in _read_section_error(doc, "KI/ML").message
+        refused = locate_section(doc, _selector("KI/ML"))
+        assert isinstance(refused, NoteSliceError) and "is ambiguous" in refused.message
+        return looked_up.count("KI/ML")
+
+    assert lookups_of_the_heading_text(5) == lookups_of_the_heading_text(50)
 
 
 # --- Property: every heading has a name, and every name reads back ---
