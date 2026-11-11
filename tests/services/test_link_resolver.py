@@ -1534,6 +1534,81 @@ async def test_short_file_suffixed_permalinks_without_project_prefixes(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "resource_paths,identifier",
+    [
+        (["notes/foo.txt"], "notes/Foo.txt"),
+        (["notes/foo.txt"], "NOTES/FOO.TXT"),
+        (["notes/foo_bar.txt"], "notes/foo-bar.txt"),
+        # Two resources collide on the spelling; it still names a file, not the note.
+        (["notes/foo.txt", "notes/FOO.txt"], "notes/Foo.txt"),
+    ],
+)
+async def test_a_file_spelled_like_the_identifier_blocks_the_routed_permalink(
+    entity_repository, session_maker, link_resolver, project_prefix, resource_paths, identifier
+):
+    """Another spelling of a resource's path names no note: edit and delete stay NOT_FOUND."""
+    await add_entities(
+        entity_repository,
+        session_maker,
+        [
+            *(("resource", path, None) for path in resource_paths),
+            # Moved away; its permalink is the slug of the resource's path.
+            ("Foo note", "archive/Foo note.txt.md", f"{project_prefix}/{identifier.lower()}"),
+        ],
+    )
+
+    assert await link_resolver.resolve_entity(identifier, strict=True) is None
+    assert await link_resolver.resolve_link(identifier, strict=True) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("include_project", [True, False])
+@pytest.mark.parametrize("stored_with_workspace", [True, False])
+async def test_a_qualified_resource_path_beats_the_routed_permalink_on_a_workspace_route(
+    entity_repository,
+    search_service,
+    session_maker,
+    app_config,
+    link_resolver,
+    project_prefix,
+    include_project,
+    stored_with_workspace,
+):
+    """The reading below the project prefix finds the file before any routed form (#1629)."""
+    from basic_memory.workspace_context import workspace_permalink_context
+
+    stored = f"{project_prefix}/notes/foo.txt"
+    resource, _ = await add_entities(
+        entity_repository,
+        session_maker,
+        [
+            ("foo.txt", "notes/foo.txt", None),
+            (
+                "Foo note",
+                "archive/Foo note.txt.md",
+                f"team-paul/{stored}" if stored_with_workspace else stored,
+            ),
+        ],
+    )
+    resolver = LinkResolver(
+        entity_repository,
+        search_service,
+        session_maker,
+        app_config.model_copy(update={"permalinks_include_project": include_project}),
+    )
+    # Each spelling is the other form of the note's permalink, never its verbatim one.
+    identifier = stored if stored_with_workspace else f"team-paul/{stored}"
+
+    with workspace_permalink_context("team-paul", "organization"):
+        entity = await resolver.resolve_entity(identifier, strict=True)
+        assert entity is not None and entity.id == resource.id
+        for strict in (True, False):
+            link = await resolver.resolve_link(identifier, strict=strict)
+            assert link is not None and link.id == resource.id, strict
+
+
+@pytest.mark.asyncio
 async def test_workspace_qualified_title_resolves_exactly(link_resolver, project_prefix):
     """Workspace routes qualify as `<workspace>/<project>/<Title>` (#1626 review)."""
     from basic_memory.workspace_context import workspace_permalink_context

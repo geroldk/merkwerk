@@ -122,6 +122,8 @@ class ProjectEntityIdentityIndex:
     by_title: Mapping[str, tuple[Entity, ...]]
     by_file_path: Mapping[str, Entity]
     by_file_path_alias: Mapping[str, Entity]
+    # Every file's alias, colliding ones included; by_file_path_alias keeps only unique ones.
+    file_path_aliases: frozenset[str]
 
     @classmethod
     def from_entities(
@@ -160,6 +162,7 @@ class ProjectEntityIdentityIndex:
                 for alias, matches in file_path_alias_matches.items()
                 if len(matches) == 1
             },
+            file_path_aliases=frozenset(file_path_alias_matches),
         )
 
     def resolve_strict(
@@ -207,8 +210,8 @@ class ProjectEntityIdentityIndex:
 
         # The routed permalinks of a file-suffixed identifier (`threads/fix.py`), at the
         # point LinkResolver tries them: after the exact file paths, never past a title
-        # several notes share.
-        if not ambiguous_title:
+        # several notes share, and never while a file is spelled like the identifier.
+        if not ambiguous_title and file_path_alias(normalized_path) not in self.file_path_aliases:
             for candidate_permalink in build_permalink_candidates_after_file_paths(
                 identifier,
                 self.project.permalink,

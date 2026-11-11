@@ -575,15 +575,31 @@ def build_permalink_candidates_after_file_paths(
     whose permalink spells the same (#1629). A note's own permalink can end that way too
     (`Fix in tax_costs.py.md` stores `<project>/threads/fix-in-tax-costs.py`), and routing
     strips the project prefix a caller wrote. Every resolver tries this list after its
-    exact file-path lookups and before forgiving aliases, and never for a title several
-    notes share (#1148).
+    exact file-path lookups and before forgiving aliases, never for a title several
+    notes share (#1148), and never while a file is spelled like the identifier
+    (`notes/Foo.txt` beside the resource `notes/foo.txt`).
 
     The routes are those the builder adds to other identifiers: the workspace form when
     a workspace is set, then the project form when project prefixes are on or a workspace
-    is set. Any identifier without such a suffix, or without a project, gets none.
+    is set. Any identifier without such a suffix, or without a project, gets none, and
+    neither does one that already starts with this project's own route prefix: callers
+    try it again below that prefix, and that reading reaches the same routed forms only
+    after its own exact file paths (`<project>/notes/foo.txt` is still the resource
+    `notes/foo.txt` first).
     """
     exact_path = normalize_project_reference(str(identifier)).strip("/")
     if not project_permalink or not has_non_markdown_file_extension(exact_path):
+        return []
+    # Trigger: the identifier is already qualified (`<project>/…`, `<workspace>/<project>/…`).
+    # Why: requalifying it here would try `<project>/notes/foo.txt` before the reading
+    #   below the prefix checks the exact file `notes/foo.txt` (#1629).
+    # Outcome: no routed forms; the below-prefix reading supplies them in their place.
+    if (
+        own_project_remainder(
+            exact_path, project_permalink, workspace_permalink=workspace_permalink
+        )
+        is not None
+    ):
         return []
 
     spellings = _file_suffixed_permalink_spellings(exact_path)

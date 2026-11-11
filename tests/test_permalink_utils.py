@@ -168,7 +168,12 @@ def test_non_markdown_identifiers_keep_their_extension():
             "personal",
             ["personal/main/threads/fix.py", "main/threads/fix.py"],
         ),
-        ("personal/main/threads/fix.py", True, "personal", ["main/threads/fix.py"]),
+        # Already qualified on a workspace route, in either form: the reading below the
+        # prefix supplies these routes after its own exact file paths (#1629).
+        ("personal/main/threads/fix.py", True, "personal", []),
+        ("personal/main/threads/fix.py", False, "personal", []),
+        ("main/threads/fix.py", True, "personal", []),
+        ("Main/threads/Fix.py", False, "personal", []),
     ],
 )
 def test_file_suffixed_identifiers_get_routed_candidates_after_file_paths(

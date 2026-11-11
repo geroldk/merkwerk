@@ -240,6 +240,26 @@ class EntityRepository(Repository[Entity]):
         fallback only returns an entity when the forgiving alias is unique within the project;
         colliding files such as ``alpha-note.md`` and ``alpha_note.md`` remain unresolved.
         """
+        matching_ids = await self._ids_by_file_path_alias(session, file_path)
+        if len(matching_ids) != 1:
+            return None
+        return await self.get_by_id(
+            session,
+            matching_ids[0],
+            load_relations=load_relations,
+        )
+
+    async def has_file_path_alias(self, session: AsyncSession, file_path: Union[Path, str]) -> bool:
+        """Whether any stored file is spelled like ``file_path``, colliding spellings included.
+
+        Unlike :meth:`get_unique_by_file_path_alias`, a collision still counts: the question is
+        whether a file carries this name in some spelling, not which one it is.
+        """
+        return bool(await self._ids_by_file_path_alias(session, file_path))
+
+    async def _ids_by_file_path_alias(
+        self, session: AsyncSession, file_path: Union[Path, str]
+    ) -> list[int]:
         normalized_alias = file_path_alias(file_path)
 
         # SQLite's lower() only folds ASCII while Postgres follows its configured collation.
@@ -248,18 +268,11 @@ class EntityRepository(Repository[Entity]):
         # bulk relation resolution builds the equivalent project-wide index once instead.
         query = self.select(Entity.id, Entity.file_path)
         result = await self.execute_query(session, query, use_query_options=False)
-        matching_ids = [
+        return [
             entity_id
             for entity_id, stored_file_path in result.all()
             if file_path_alias(stored_file_path) == normalized_alias
         ]
-        if len(matching_ids) != 1:
-            return None
-        return await self.get_by_id(
-            session,
-            matching_ids[0],
-            load_relations=load_relations,
-        )
 
     # -------------------------------------------------------------------------
     # Lightweight methods for permalink resolution (no eager loading)

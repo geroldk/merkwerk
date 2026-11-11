@@ -140,6 +140,38 @@ async def test_a_resource_keeps_its_path_beside_a_note_spelled_the_same(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("tool", ["edit", "delete"])
+async def test_another_spelling_of_a_resource_path_changes_no_note(
+    client, test_project, test_files, project_repository, session_maker, tool
+):
+    """`notes/Foo.txt` stays NOT_FOUND although a moved note's permalink is `<p>/notes/foo.txt`."""
+    root = test_files["image"].parent
+    (root / "notes").mkdir(parents=True, exist_ok=True)
+    (root / "notes" / "foo.txt").write_text("RESOURCE BYTES\n")
+    (root / "archive").mkdir(parents=True, exist_ok=True)
+    note_file = root / "archive" / "Foo note.md"
+    note_file.write_text(
+        f"---\ntitle: Foo note\npermalink: {test_project.permalink}/notes/foo.txt\n---\n\n"
+        "NOTE BODY\n"
+    )
+    await LocalProjectIndexRunner(
+        project_repository=project_repository, session_maker=session_maker
+    ).index_project(test_project.id, force_full=True)
+    project = test_project.name
+
+    with pytest.raises(ToolError, match="^NOT_FOUND"):
+        if tool == "edit":
+            await bm_edit(
+                identifier="notes/Foo.txt", command="append", content="EDITED", project=project
+            )
+        else:
+            await bm_delete(identifier="notes/Foo.txt", project=project)
+
+    assert note_file.read_text().rstrip().endswith("NOTE BODY")
+    assert (root / "notes" / "foo.txt").read_text() == "RESOURCE BYTES\n"
+
+
+@pytest.mark.asyncio
 async def test_workspace_permalink_reads_without_its_prefixes(client, test_project):
     project = test_project.name
     permalink = f"team-paul/{test_project.permalink}/threads/fix-in-tax-costs.py"
