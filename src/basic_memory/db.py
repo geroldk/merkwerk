@@ -280,7 +280,8 @@ def _stop_aiosqlite_worker_once(connection: Any) -> None:
       leaves its freeing to the garbage collector, whose finalizer still stops the thread.
     """
     first_stop = getattr(connection, "stop", None)
-    if first_stop is None:
+    # pyproject allows aiosqlite >= 0.20, the lock pins 0.22.1: no test runs without stop().
+    if first_stop is None:  # pragma: no cover
         return
     stops: list[asyncio.Future[Any] | None] = []
 
