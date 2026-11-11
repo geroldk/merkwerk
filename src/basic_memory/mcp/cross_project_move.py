@@ -43,6 +43,7 @@ from basic_memory.mcp.refusals import (
     revision_conflict,
 )
 from basic_memory.mcp.tool_params import OutputFormat
+from basic_memory.runtime.call_publications import note_item_done, note_items
 from basic_memory.runtime.git_routing import git_local_routing_active
 from basic_memory.runtime.storage import runtime_file_path_is_markdown_note
 from basic_memory.schemas.base import Entity
@@ -528,6 +529,8 @@ async def move_directory_across(
     # Moves the server keeps open (Git host only): the note left the source, not yet here.
     pending: list[dict[str, Any]] = []
     on_git = git_local_routing_active()
+    # A cancelled call is logged with how far the folder got (CancelledCallMiddleware).
+    note_items(len(files))
     for node in files:
         assert node.file_path is not None and node.external_id is not None
         relative = PurePosixPath(node.file_path).relative_to(directory)
@@ -557,6 +560,7 @@ async def move_directory_across(
                 pending.append({"path": source.paths.path(node.file_path), **error.details})
         except ToolError as error:
             failed.append({"path": source.paths.path(node.file_path), "error": str(error)})
+        note_item_done()
     index_note = ""
     if on_git and moved:
         # Trigger: notes moved in with catch_up off.

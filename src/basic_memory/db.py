@@ -6,6 +6,8 @@ from enum import Enum, auto
 from pathlib import Path
 from typing import Any, AsyncGenerator, Optional
 
+import anyio
+
 from basic_memory.config import BasicMemoryConfig, ConfigManager, DatabaseBackend
 from alembic import command
 from alembic.config import Config
@@ -193,8 +195,15 @@ async def scoped_session(
         await owned_session.rollback()
         raise
     finally:
-        await owned_session.close()
-        await factory.remove()
+        # Constraint: a cancelled request (an MCP client that disconnects) is cancelled
+        #   by an anyio cancel scope, which cancels every later await again. Cut short,
+        #   close() never checks the connection back in: SQLAlchemy then reports a
+        #   "non-checked-in connection" and terminates it from the garbage collector.
+        # Outcome: the connection always returns to the pool (rolled back when the
+        #   transaction did not commit); the cancellation goes on afterwards.
+        with anyio.CancelScope(shield=True):
+            await owned_session.close()
+            await factory.remove()
 
 
 _SQLITE_SYNCHRONOUS = {"OFF", "NORMAL", "FULL", "EXTRA"}
@@ -254,6 +263,46 @@ def _configure_sqlite_connection(
         logger.warning(f"Failed to configure SQLite connection: {e}")
     finally:
         cursor.close()
+
+
+def _stop_aiosqlite_worker_once(connection: Any) -> None:
+    """Let an aiosqlite connection tell its worker thread to stop only once.
+
+    Constraint: aiosqlite 0.22's close() calls stop() again in its finally block and waits
+      for that call's future, but the worker thread ends at the first stop and never
+      answers a second one. SQLAlchemy calls stop() itself when a cancellation cuts the
+      graceful close of an invalidated connection (terminate(), SQLAlchemy #10717), while
+      that close() goes on in a shielded task, which then waits forever. A server stopped
+      with writes in flight hung on such a task until it was killed (B4 review, finding 1).
+    Outcome: a later stop() waits for the first stop to be done (or not at all once it
+      is), and the thread is told to stop exactly once. aiosqlite before 0.22 has no
+      stop() and never stops twice. The closure holds the connection: the cycle only
+      leaves its freeing to the garbage collector, whose finalizer still stops the thread.
+    """
+    first_stop = getattr(connection, "stop", None)
+    # pyproject allows aiosqlite >= 0.20, the lock pins 0.22.1: no test runs without stop().
+    if first_stop is None:  # pragma: no cover
+        return
+    stops: list[asyncio.Future[Any] | None] = []
+
+    def stop_once() -> asyncio.Future[Any] | None:
+        if not stops:
+            stops.append(first_stop())
+            return stops[0]
+        first = stops[0]
+        if first is None or first.done():
+            return None
+        # A future of its own: a waiter that is cancelled must not cancel the first stop.
+        waiter: asyncio.Future[Any] = first.get_loop().create_future()
+
+        def release(_: asyncio.Future[Any]) -> None:
+            if not waiter.done():
+                waiter.set_result(None)
+
+        first.add_done_callback(release)
+        return waiter
+
+    connection.stop = stop_once
 
 
 def _create_sqlite_engine(
@@ -323,6 +372,7 @@ def _create_sqlite_engine(
     @event.listens_for(engine.sync_engine, "connect")
     def enable_wal_mode(dbapi_conn, connection_record):
         """Apply WAL + tunable PRAGMAs on each connection."""
+        _stop_aiosqlite_worker_once(dbapi_conn.driver_connection)
         _configure_sqlite_connection(
             dbapi_conn,
             enable_wal=enable_wal,

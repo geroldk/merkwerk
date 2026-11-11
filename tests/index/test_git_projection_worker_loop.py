@@ -119,3 +119,37 @@ def test_content_outcomes_drive_the_host_wake_ups():
     assert calls == [("wait", (1, {2})), ("settled", 1)]
     worker.wake_index()
     assert worker._wake_index.is_set() and not worker._wake_vectors.is_set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ended", ["raised", "returned"])
+async def test_a_lane_stops_when_the_stop_s_cancel_comes_out_as_another_error(monkeypatch, ended):
+    """aiosqlite's cleanup can turn the stop's CancelledError into "Connection closed" (B4).
+
+    Before, the lane took that for a failed pass and polled on, so the worker's task
+    group, and the server's whole stop, waited until the process was killed.
+    """
+    worker = GitProjectionWorker(
+        SimpleNamespace(project_id=1, session_maker=None),  # ty: ignore[invalid-argument-type]
+        poll_interval=60,
+    )
+    entered = asyncio.Event()
+
+    async def pass_cut_by_the_stop(*, vectors: bool) -> GitPassOutcome:
+        entered.set()
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            # A stage catches the error and reports a failed pass; elsewhere it escapes.
+            if ended == "returned":
+                return GitPassOutcome.failed
+            raise ValueError("Connection closed") from None
+        return GitPassOutcome.done
+
+    monkeypatch.setattr(worker, "_pass", pass_cut_by_the_stop)
+    lane = asyncio.create_task(worker._loop(vectors=False))
+    await entered.wait()
+    lane.cancel()
+    done, _ = await asyncio.wait({lane}, timeout=5)
+    assert done, "the cancelled lane went on polling"
+    assert lane.cancelled()

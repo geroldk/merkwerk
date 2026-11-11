@@ -101,6 +101,15 @@ bm_edit(identifier="plans/launch-plan.md", command="append", content="x",
   passed to the section commands as it is.
 - `set_metadata` refuses `title` and `permalink`: they are the note's identity.
   Rename with bm_move.
+- A call that ends without an answer (the client says the connection closed,
+  or that the tool "may have run") may have made the edit. On a Git host an
+  edit that has begun to publish is finished when the client leaves; when the
+  server stops, it is finished too, or it fails without changing anything if
+  the stop interrupts Git itself. Only the answer is lost. bm_read the note
+  before trying again: an `append` repeated blindly adds its text twice. A read
+  in the first moments after the lost answer can still show the note without
+  the edit while it finishes, so retry only with the `expected_checksum` that
+  read returns: an edit that finished meanwhile then refuses the retry.
 
 ## SEE ALSO
 

@@ -12,15 +12,20 @@ import json
 import os
 import re
 import subprocess
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Coroutine, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from functools import partial
 from tempfile import TemporaryDirectory
-from typing import Literal
+from typing import Any, Literal
 from uuid import UUID, uuid4
 
+import anyio
+from anyio.lowlevel import checkpoint_if_cancelled
+from loguru import logger
+
+from basic_memory.runtime.call_publications import note_held_cancellation, note_publication
 from basic_memory.schemas.git_project import (
     GIT_PROJECT_MANIFEST_PATH,
     GitNoteIdentity,
@@ -101,6 +106,18 @@ class GitPublication:
     already_committed: bool
 
 
+@dataclass(frozen=True, slots=True)
+class GitCandidateRef:
+    """One private candidate ref (`refs/bm/candidates/<transaction>/<commit>`)."""
+
+    reference: str
+    transaction_id: UUID
+    commit_id: str
+    # Published history already holds the commit: dropping the ref loses nothing.
+    published: bool
+    committed_at: datetime
+
+
 def _require_commit_id(commit_id: str) -> None:
     if _COMMIT_ID.fullmatch(commit_id) is None:
         raise ValueError("Expected a full SHA-1 Git commit ID")
@@ -119,16 +136,49 @@ async def settle_git_publication(
 
 async def settle_git_operation[T](operation: Callable[[], T]) -> T:
     """Finish a short filesystem mutation before its caller releases ownership."""
-    task = asyncio.create_task(asyncio.to_thread(operation))
+    return await settle_atomic(asyncio.to_thread(operation))
+
+
+async def settle_atomic[T](operation: Coroutine[Any, Any, T]) -> T:
+    """Run one bounded atomic step to its outcome, even when its caller is cancelled.
+
+    The step runs as a task of its own, which no cancellation of the caller reaches; the
+    caller waits for it and only then receives its cancellation. This is for steps whose
+    halves must not be separated (a candidate commit, its publication and the SQL that
+    follows it), never for a loop over many notes: a stop waits for the whole step.
+    """
+    task = asyncio.ensure_future(operation)
     cancelled: asyncio.CancelledError | None = None
     while not task.done():
         try:
-            await asyncio.shield(task)
+            # Constraint: an anyio cancel scope (an MCP client that disconnects, a stopping
+            #   server) delivers its cancellation again on every loop tick, so a bare wait
+            #   would spin; shielded, it sleeps. A native task.cancel() passes an anyio
+            #   shield; it is kept, and the wait goes on.
+            with anyio.CancelScope(shield=True):
+                await asyncio.wait({task})
         except asyncio.CancelledError as error:
             cancelled = error
-    if cancelled is not None:
-        task.exception()
-        raise cancelled
+    failure = None if task.cancelled() else task.exception()
+    try:
+        if cancelled is not None:
+            raise cancelled
+        # An anyio cancellation that arrived while the step ran is delivered now.
+        await checkpoint_if_cancelled()
+    except asyncio.CancelledError:
+        if failure is not None:
+            # Trigger: the step failed (SQL behind a publication, a locked branch ref)
+            #   while its caller was being cancelled.
+            # Why: the cancellation replaces the step's outcome, so no caller receives
+            #   the error and no error handler above logs it.
+            # Outcome: logged here with its traceback; the cancellation goes on.
+            logger.opt(exception=failure).warning(
+                "Atomic Git step failed after its caller was cancelled: {}: {}",
+                type(failure).__name__,
+                failure,
+            )
+        note_held_cancellation()
+        raise
     return task.result()
 
 
@@ -315,6 +365,7 @@ class GitProjectRepository:
             if actual != base_commit:
                 raise GitPublicationConflict(base_commit, actual)
             raise GitPublicationError("Incoming reference changed before publication")
+        note_publication(self.path.name, commit_id)
 
     def push_published(self, remote: str, commit_id: str) -> None:
         _require_commit_id(commit_id)
@@ -465,6 +516,7 @@ class GitProjectRepository:
             if actual != merge.local_commit:
                 raise GitPublicationConflict(merge.local_commit, actual)
             raise GitPublicationError("Incoming reference changed before merge publication")
+        note_publication(self.path.name, merge.commit_id)
 
     def initial_snapshot(self) -> GitSnapshot:
         """Require the empty initialization commit before adopting a legacy project."""
@@ -535,6 +587,35 @@ class GitProjectRepository:
         return frozenset(
             UUID(reference.split("/")[3]) for reference in refs.decode("ascii").splitlines()
         )
+
+    def candidate_refs(self) -> list[GitCandidateRef]:
+        """Every private candidate ref, in two Git calls: published commits, then the rest."""
+        found: list[GitCandidateRef] = []
+        for published, reachable in ((True, "--merged"), (False, "--no-merged")):
+            refs = self._git(
+                "for-each-ref",
+                "--format=%(refname) %(objectname) %(committerdate:raw)",
+                f"{reachable}={PUBLISHED_REF}",
+                "refs/bm/candidates/",
+            )
+            for line in refs.decode("ascii").splitlines():
+                reference, commit_id, timestamp, _zone = line.split()
+                found.append(
+                    GitCandidateRef(
+                        reference,
+                        UUID(reference.split("/")[3]),
+                        commit_id,
+                        published,
+                        datetime.fromtimestamp(int(timestamp), tz=UTC),
+                    )
+                )
+        return found
+
+    def remove_candidate_refs(self, refs: Iterable[GitCandidateRef]) -> None:
+        """Delete candidate refs in one Git transaction: all of them, or none if one moved."""
+        commands = "".join(f"delete {ref.reference} {ref.commit_id}\n" for ref in refs)
+        if commands:
+            self._git("update-ref", "--stdin", input_bytes=commands.encode("ascii"))
 
     def _read_snapshot(self, commit_id: str) -> GitSnapshot:
         tree = self._git("ls-tree", "-r", "-z", "--full-tree", commit_id)
@@ -941,11 +1022,19 @@ class GitProjectRepository:
             )
         result = self._run("update-ref", "--stdin", input_bytes=commands.encode("ascii"))
         if result.returncode == 0:
+            note_publication(self.path.name, prepared.commit_id)
             return GitPublication(prepared.commit_id, already_committed=False)
         # A lost answer or a competing commit of this same explicit transaction
         # is resolved before classifying an ordinary stale-basis conflict.
         previous = self.transaction_status(prepared.transaction_id)
         if previous is not None:
+            # Trigger: update-ref failed, yet the transaction is published: Git applied
+            #   this update and then failed to answer (a signal to git after the ref
+            #   moved), or a competing commit of the same transaction got there first.
+            # Why: either way the change of this call is in effect; a log line saying
+            #   "not-published" would invite a retry that applies it twice.
+            # Outcome: recorded as this call's publication, like a clean update-ref.
+            note_publication(self.path.name, previous.commit_id)
             return previous
         actual = self.head()
         if actual != prepared.base_commit:

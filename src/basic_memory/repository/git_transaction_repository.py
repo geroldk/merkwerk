@@ -227,6 +227,27 @@ class GitTransactionRepository:
             if identity in protected and record.source_transaction_id is not None
         }
 
+    def sweep_candidates(self, *, kept: frozenset[UUID], older_than: timedelta) -> int:
+        """Drop the candidate refs that no transaction record and no `kept` id names.
+
+        accept() and folder moves prepare under a fresh id that never gets a record, so
+        their refs have no owner here; accept() dropped none of them before B4. A
+        published one holds nothing the branch lacks. An unpublished one is kept until
+        it is `older_than`, in case a process that does not take this lock is still
+        about to publish it. Returns how many refs were dropped.
+        """
+        with self.locked():
+            recorded = {UUID(path.stem) for path in self.path.glob("*.json")} | kept
+            now = self.clock()
+            orphans = [
+                ref
+                for ref in self.repository.candidate_refs()
+                if ref.transaction_id not in recorded
+                and (ref.published or now - ref.committed_at >= older_than)
+            ]
+            self.repository.remove_candidate_refs(orphans)
+            return len(orphans)
+
     def start(self, request: GitTransactionStart) -> GitTransactionStarted:
         with self.locked():
             self.maintain_locked()

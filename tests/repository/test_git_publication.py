@@ -16,6 +16,7 @@ from basic_memory.repository.git_project_repository import (
     PreparedGitPublication,
     validate_note_path,
 )
+from basic_memory.runtime.call_publications import recording_publications
 
 
 def prepare(
@@ -350,6 +351,35 @@ def test_competing_completion_between_status_check_and_cas_returns_original_sha(
     assert result.already_committed
     assert result.commit_id == winner.commit_id == competitor.head()
     assert competitor.snapshot().files == {"a.md": "winner"}
+
+
+def test_a_publication_whose_answer_is_lost_is_recorded_as_published(
+    repository: GitProjectRepository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """update-ref moves main, then exits 1 (a signal to git after the ref moved).
+
+    The cancelled-call log line reads the record: "not-published" here would invite a
+    retry that applies the change a second time.
+    """
+    prepared = prepare(
+        repository, transaction_id=uuid4(), base_commit=repository.head(), files={"a.md": "A"}
+    )
+    run = repository._run
+
+    def lost_answer(
+        *arguments: str, input_bytes: bytes | None = None, index_path: Path | None = None
+    ) -> subprocess.CompletedProcess[bytes]:
+        result = run(*arguments, input_bytes=input_bytes, index_path=index_path)
+        if arguments == ("update-ref", "--stdin") and b"refs/heads/main" in (input_bytes or b""):
+            assert result.returncode == 0
+            return subprocess.CompletedProcess(result.args, 1, b"", b"")
+        return result
+
+    monkeypatch.setattr(repository, "_run", lost_answer)
+    with recording_publications() as record:
+        result = repository.publish(prepared)
+    assert result.commit_id == prepared.commit_id == repository.head()
+    assert record.commits == [f"{repository.path.name}@{prepared.commit_id[:12]}"]
 
 
 def test_manifest_and_notes_travel_together_to_an_independent_clone(

@@ -429,3 +429,58 @@ def test_maintenance_lists_candidate_refs_once_however_many_records_are_kept(sto
     calls.clear()
     store.rollback(started.transaction_id, started.transaction_key, expected_revision=0)
     assert store.repository.candidate_transaction_ids() == frozenset()
+
+
+def test_the_sweep_drops_only_candidates_that_nothing_refers_to(tmp_path):
+    """accept() left one record-less candidate ref per write before B4 (and a crash can)."""
+    identity = uuid4()
+    repository = GitProjectRepository.create(tmp_path / "notes.git", project_external_id=identity)
+    clock = Clock(datetime.now(UTC))
+    store = GitTransactionRepository(repository, identity, clock=clock)
+    text = "---\ntitle: A\ntype: note\npermalink: a\n---\n\nA\n"
+    # Published by an accept() that never dropped its ref.
+    published = repository.prepare(
+        transaction_id=uuid4(),
+        base_commit=repository.head(),
+        files={"a.md": text},
+        note_ids={"a.md": uuid4()},
+    )
+    repository.publish(published)
+    snapshot = repository.snapshot()
+
+    # Never published, no record: a cancelled accept() before B4, or a crash.
+    young = repository.prepare(
+        transaction_id=uuid4(),
+        base_commit=snapshot.commit_id,
+        files={**snapshot.files, "b.md": text},
+        note_ids={**snapshot.manifest.note_ids, "b.md": uuid4()},
+    )
+    # Never published, named by an open cross-project move intent.
+    moving = repository.prepare(
+        transaction_id=uuid4(),
+        base_commit=snapshot.commit_id,
+        files={**snapshot.files, "c.md": text},
+        note_ids={**snapshot.manifest.note_ids, "c.md": uuid4()},
+    )
+    # An agent draft: it has a record, and its no-op candidate is the published head.
+    started = store.start(GitTransactionStart())
+    kept = frozenset({moving.transaction_id})
+
+    assert store.sweep_candidates(kept=kept, older_than=timedelta(hours=1)) == 1
+    assert {ref.transaction_id for ref in repository.candidate_refs()} == {
+        young.transaction_id,
+        moving.transaction_id,
+        started.transaction_id,
+    }
+
+    # An unpublished orphan goes once it is old enough that nobody can still publish it.
+    clock.advance(2 * 3600)
+    assert store.sweep_candidates(kept=kept, older_than=timedelta(hours=1)) == 1
+    assert {ref.transaction_id for ref in repository.candidate_refs()} == {
+        moving.transaction_id,
+        started.transaction_id,
+    }
+    # The draft and the move's candidate still read.
+    store.read(started.transaction_id, started.transaction_key)
+    assert repository.candidate_snapshot(moving).files["c.md"] == text
+    assert store.sweep_candidates(kept=kept, older_than=timedelta(hours=1)) == 0

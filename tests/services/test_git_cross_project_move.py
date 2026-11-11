@@ -33,15 +33,17 @@ async def test_a_cancelled_caller_waits_until_the_move_has_settled():
 @pytest.mark.asyncio
 async def test_an_anyio_cancel_scope_waits_once_instead_of_spinning(monkeypatch):
     """anyio re-delivers a scope's cancellation on every tick; one shielded wait suffices."""
-    shields = 0
-    shield = asyncio.shield
+    waits = 0
+    wait = asyncio.wait
 
-    def counting(task):
-        nonlocal shields
-        shields += 1
-        return shield(task)
+    def counting(tasks):
+        nonlocal waits
+        waits += 1
+        return wait(tasks)
 
-    monkeypatch.setattr(asyncio, "shield", counting)
+    # settle_atomic waits inside an anyio shield (B4); a wait that each tick's
+    # re-delivered cancellation interrupted would be entered again and again.
+    monkeypatch.setattr(asyncio, "wait", counting)
     finished = asyncio.Event()
 
     async def move() -> None:
@@ -53,7 +55,7 @@ async def test_an_anyio_cancel_scope_waits_once_instead_of_spinning(monkeypatch)
         await _settled(move())
     assert scope.cancelled_caught
     assert finished.is_set()
-    assert shields == 1
+    assert waits == 1
 
 
 def test_a_refusal_carries_its_kind_and_details_into_the_body():

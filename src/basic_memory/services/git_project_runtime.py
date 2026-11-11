@@ -10,7 +10,8 @@ import subprocess
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timedelta
+from functools import partial
 from typing import assert_never
 from uuid import UUID, uuid4
 
@@ -42,11 +43,14 @@ from basic_memory.repository.git_progress_repository import (
     GitProgressRepository,
     invalidate_git_graphs,
 )
+from basic_memory.repository.git_move_intent_repository import GitMoveIntentRepository
 from basic_memory.repository.git_project_repository import (
     GitPublication,
     GitPublicationConflict,
     GitPublicationError,
     GitSnapshot,
+    settle_atomic,
+    settle_git_operation,
     settle_git_publication,
 )
 from basic_memory.repository.git_host_identities import GitNoteOwnedElsewhere
@@ -79,6 +83,11 @@ from basic_memory.services.git_transactions import GitTransactionService, valida
 from basic_memory.services.note_times import stamp_markdown_times, wanted_note_times
 from basic_memory.schemas.git_sync import GitSyncRemote
 from basic_memory.services.git_sync import GitSyncService
+
+
+# An unpublished candidate ref without a record is swept only once it is this old: a
+# process outside the transaction lock may still be about to publish a younger one.
+CANDIDATE_SWEEP_AGE = timedelta(hours=1)
 
 
 class GitProjectRuntime:
@@ -125,6 +134,7 @@ class GitProjectRuntime:
             self._running = True
             try:
                 await self.transactions.maintain()
+                await self._sweep_candidates()
                 await self.sync.recover()
                 yield self
             finally:
@@ -169,7 +179,6 @@ class GitProjectRuntime:
                     ) from deferral
                 self._sql_commit = base.commit_id
             layout = GitLayoutRepository(self.pipeline.project_id)
-            publication: GitPublication | None = None
             try:
                 async with db.scoped_session(self.pipeline.session_maker) as session:
                     before = await layout.local_notes(session)
@@ -255,16 +264,9 @@ class GitProjectRuntime:
                         base.files, base.manifest.note_ids, files, note_ids
                     ):
                         await invalidate_git_graphs(session)
-                    prepared = await asyncio.to_thread(
-                        repository.prepare,
-                        transaction_id=uuid4(),
-                        base_commit=base.commit_id,
-                        files=files,
-                        note_ids=note_ids,
-                    )
-                    publication = await settle_git_publication(repository, prepared)
-                    self.last_publication = publication
-                self._sql_commit = publication.commit_id
+                    # Everything up to here only reads Git and writes the uncommitted
+                    # session: a cancellation so far changes nothing.
+                    await settle_atomic(self._publish_accepted(session, base, files, note_ids))
                 # Legacy route materialization must not run after this executor.
                 # The lifecycle worker alone owns files/graph/FTS/vectors.
                 return replace(
@@ -281,20 +283,53 @@ class GitProjectRuntime:
                         "source_commit": error.actual,
                     },
                 ) from error
-            except Exception as error:
-                if publication is not None:
-                    raise NoteContentMutationServiceError(
-                        503,
-                        {
-                            "message": "Git published; SQL pending. Check status before retry.",
-                            "published_commit": publication.commit_id,
-                        },
-                    ) from error
-                raise
             finally:
                 # Even a cancelled/lost publication response or failed SQL commit
                 # must wake durable Git recovery. Polling covers process death.
                 self.worker.notify()
+
+    async def _publish_accepted(
+        self,
+        session: AsyncSession,
+        base: GitSnapshot,
+        files: dict[str, str],
+        note_ids: dict[str, UUID],
+    ) -> None:
+        """The atomic step of one write: candidate commit, publication, SQL commit.
+
+        accept() runs this through settle_atomic, so a client that disconnects (or a
+        stop) while it runs cannot separate its halves: Git, the session's accepted rows
+        and this runtime's SQL basis reach one outcome, and no candidate ref is left.
+        It is bounded: one prepare, one publication and one SQL commit, each Git call
+        with its 30 s timeout, all inside the admission gate already held.
+        """
+        repository = self.pipeline.repository
+        transaction_id = uuid4()
+        try:
+            prepared = await asyncio.to_thread(
+                repository.prepare,
+                transaction_id=transaction_id,
+                base_commit=base.commit_id,
+                files=files,
+                note_ids=note_ids,
+            )
+            publication = await settle_git_publication(repository, prepared)
+            self.last_publication = publication
+            try:
+                await session.commit()
+            except Exception as error:
+                raise NoteContentMutationServiceError(
+                    503,
+                    {
+                        "message": "Git published; SQL pending. Check status before retry.",
+                        "published_commit": publication.commit_id,
+                    },
+                ) from error
+            self._sql_commit = publication.commit_id
+        finally:
+            # The candidate ref has done its job (published, or refused); a lost one
+            # is swept at the next start.
+            await asyncio.to_thread(self._remove_candidates, transaction_id)
 
     # --- SQL catch-up for cross-project moves (I1) ---
 
@@ -423,13 +458,20 @@ class GitProjectRuntime:
         transaction_id = uuid4()
         try:
             try:
-                prepared = await asyncio.to_thread(
-                    repository.prepare,
-                    transaction_id=transaction_id,
-                    base_commit=base.commit_id,
-                    files=files,
-                    note_ids=note_ids,
-                    message=plan.message,
+                # Constraint: prepare() writes the candidate ref in its thread; a cancelled
+                #   to_thread returns at once while the thread goes on, so the cleanup in
+                #   the finally below would run before the ref exists and miss it.
+                # Outcome: a cancellation waits for the candidate commit (one bounded
+                #   step), then nothing is published and the ref is dropped.
+                prepared = await settle_git_operation(
+                    partial(
+                        repository.prepare,
+                        transaction_id=transaction_id,
+                        base_commit=base.commit_id,
+                        files=files,
+                        note_ids=note_ids,
+                        message=plan.message,
+                    )
                 )
             except ValueError as error:
                 raise GitDirectoryMoveRefused(
@@ -533,6 +575,49 @@ class GitProjectRuntime:
             files[move.file_path] = text if wanted is None else stamp_markdown_times(text, wanted)
             note_ids[move.file_path] = move.external_id
         return files, note_ids
+
+    async def _sweep_candidates(self) -> None:
+        """At start, drop the candidate refs that nothing refers to any more.
+
+        Before B4 every accept() left its candidate ref behind, one per write, and a
+        crash still can. Nothing of this process can hold one yet: requests are not
+        admitted before run() yields. A ref named by a transaction record or by an open
+        move intent stays; the transaction lock keeps out offline transaction tools.
+        """
+        intents, problems = await asyncio.to_thread(
+            GitMoveIntentRepository(
+                self.pipeline.repository, UUID(self.pipeline.project_external_id)
+            ).load_each
+        )
+        repository = self.pipeline.repository.path.name
+        # Trigger: an intent file cannot be read, so the draft it names is unknown.
+        # Why: dropping that draft's ref could lose the bytes of an unfinished move.
+        # Outcome: nothing is swept this time; the start goes on.
+        if problems:
+            logger.warning(
+                "Git candidate sweep skipped in {}: {} unreadable move intent file(s)",
+                repository,
+                len(problems),
+            )
+            return
+        try:
+            removed = await self.transactions.call(
+                partial(
+                    self.transactions.repository.sweep_candidates,
+                    kept=frozenset(intent.transaction_id for intent in intents),
+                    older_than=CANDIDATE_SWEEP_AGE,
+                )
+            )
+        except (GitTransactionError, subprocess.SubprocessError) as error:
+            # Trigger: Git refuses, or one of its calls hits the 30 s timeout (many old
+            #   refs on a slow disk); the transaction service passes a timeout through.
+            # Why: a leftover ref is residue, never a reason to refuse the start; a failed
+            #   start would only repeat under the service manager's restart policy.
+            # Outcome: a warning; the refs stay for the next start.
+            logger.warning("Git candidate sweep failed in {}: {}", repository, error)
+            return
+        if removed:
+            logger.info("Git candidate sweep removed {} unused ref(s) in {}", removed, repository)
 
     async def _drop_candidate(self, transaction_id: UUID) -> None:
         """Remove the private candidate ref prepare() leaves, published or not."""

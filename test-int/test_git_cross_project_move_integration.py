@@ -423,6 +423,75 @@ async def test_a_folder_moves_note_by_note_and_every_id_is_kept(host_setup, seco
     assert first_repo.snapshot().files == {}
 
 
+class RecordedWarnings:
+    """Stands in for the middleware's logger: the server's start replaces loguru's sinks."""
+
+    def __init__(self) -> None:
+        self.lines: list[str] = []
+
+    def warning(self, message: str, *args: object) -> None:
+        self.lines.append(message.format(*args))
+
+
+@pytest.mark.asyncio
+async def test_a_folder_move_cut_off_after_its_first_note_is_logged_as_partial(
+    host_setup, second_repository, monkeypatch
+):
+    """Each note moved whole or not at all, the folder did neither: never "completed"."""
+    import anyio
+
+    from basic_memory.mcp import cancelled_calls, cross_project_move
+    from basic_memory.mcp.server import mcp
+    import basic_memory.mcp.tools  # noqa: F401
+
+    second, second_repo = second_repository
+    first_repo = host_setup.repository
+    recorded = RecordedWarnings()
+    monkeypatch.setattr(cancelled_calls, "logger", recorded)
+    move_one = cross_project_move._move_one
+    first_moved = asyncio.Event()
+
+    async def stops_after_the_first(*arguments, **options):
+        if first_moved.is_set():
+            await asyncio.Event().wait()  # until the client gives up
+        moved = await move_one(*arguments, **options)
+        first_moved.set()
+        return moved
+
+    async with Client(mcp) as client:
+        for title in ("Alpha", "Beta", "Gamma"):
+            await written_note(client, title, directory="ordner")
+        await caught_up(host_setup.project.external_id)
+        monkeypatch.setattr(cross_project_move, "_move_one", stops_after_the_first)
+        async with anyio.create_task_group() as group:
+            group.start_soon(
+                client.call_tool,
+                "bm_move",
+                {
+                    "path": "ordner",
+                    "destination": "ziel",
+                    "project": "test-project",
+                    "destination_project": "second",
+                },
+            )
+            await first_moved.wait()
+            group.cancel_scope.cancel()
+        # The client's cancellation reaches the server as a cancel notification.
+        async with asyncio.timeout(10):
+            while not recorded.lines:
+                await asyncio.sleep(0.01)
+        await caught_up(host_setup.project.external_id, second.external_id)
+    [line] = recorded.lines
+    assert (
+        "tool=bm_move project=test-project destination_project=second outcome=partial published="
+        in line
+    ), line
+    assert "(cut off at item 2 of 3: what is listed is in effect" in line, line
+    # One note moved, two stayed: exactly what the line says.
+    assert len(second_repo.snapshot().manifest.note_ids) == 1
+    assert len(first_repo.snapshot().manifest.note_ids) == 2
+
+
 @pytest.mark.asyncio
 async def test_a_move_that_cannot_commit_yet_is_reported_and_resumes(
     host_setup, second_repository, monkeypatch
