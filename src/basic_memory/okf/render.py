@@ -26,8 +26,10 @@ from basic_memory.services.bulk_link_resolver import RelationTargetReference
 from basic_memory.services.link_resolver import normalize_link_text
 from basic_memory.utils import (
     build_file_path_permalink,
+    build_permalink_candidates_after_file_paths,
     build_permalink_resolution_candidates,
     generate_permalink,
+    has_non_markdown_file_extension,
 )
 
 from basic_memory.okf.validation import Document, parse_document
@@ -200,6 +202,32 @@ def convert_wikilinks(
             resolved = title_targets.get(target)
         if not rooted and resolved is None:
             resolved = targets.get(target)
+        # Trigger: the target ends in a non-Markdown file suffix (`threads/fix.py`).
+        # Why: the graph tries such a target's routed permalink only after its exact
+        #   file paths, `<target>.md` included, so a resource keeps its name (#1629)
+        #   while a note whose permalink ends that way still links. Like the graph, the
+        #   `.md` path stays exact past a shared title when the target has a folder; the
+        #   routed permalink never passes such a title, nor a file spelled like the target.
+        # Outcome: the exact `.md` file first, also without project prefixes, then the
+        #   project-qualified permalink.
+        suffixed = not rooted and resolved is None and has_non_markdown_file_extension(target)
+        routed = (
+            build_permalink_candidates_after_file_paths(target, project, include_project)
+            if suffixed
+            else []
+        )
+        if suffixed and ("/" in target or target not in ambiguous_aliases):
+            resolved = targets.get(f"{target}.md")
+        if (
+            routed
+            and resolved is None
+            and target not in ambiguous_aliases
+            and file_path_alias(target) not in path_aliases
+        ):
+            known_permalinks = permalinks or {}
+            resolved = next(
+                (known_permalinks[name] for name in routed if name in known_permalinks), None
+            )
         if (
             not rooted
             and resolved is None

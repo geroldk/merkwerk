@@ -624,6 +624,61 @@ tags: []
     assert relation.to_id == target_entity.id
 
 
+async def test_local_project_index_resolves_stored_links_to_file_suffixed_permalinks(
+    test_project: Project,
+    project_config,
+    relation_repository,
+    session_maker: async_sessionmaker[AsyncSession],
+    config_manager,
+    monkeypatch,
+) -> None:
+    """An index pass with no changed file links what the old resolver left unresolved.
+
+    Startup and `bm reindex` run this pass; it re-reads every unresolved relation.
+    """
+    del config_manager
+    from basic_memory.services import bulk_link_resolver
+
+    target_dir = project_config.home / "archive" / "threads"
+    target_dir.mkdir(parents=True)
+    (target_dir / "Fix in tax_costs.py.md").write_text(
+        f"---\ntitle: Fix\npermalink: {test_project.permalink}/threads/fix-in-tax-costs.py\n"
+        "---\n\nThe fix\n",
+        encoding="utf-8",
+    )
+    (project_config.home / "source.md").write_text(
+        "---\ntitle: Source\n---\n\n- relates_to [[threads/fix-in-tax-costs.py]]\n",
+        encoding="utf-8",
+    )
+
+    async def link_targets() -> list[int | None]:
+        async with db.scoped_session(session_maker) as session:
+            relations = await relation_repository.find_all(session)
+        return [r.to_id for r in relations if r.to_name == "threads/fix-in-tax-costs.py"]
+
+    with monkeypatch.context() as old_resolver:
+        old_resolver.setattr(
+            bulk_link_resolver,
+            "build_permalink_candidates_after_file_paths",
+            lambda *args, **kwargs: [],
+            raising=False,
+        )
+        await run_local_project_index_for_project(
+            test_project,
+            runtime_factory=LocalProjectIndexRuntimeFactory(batch_size=10),
+            force_full=True,
+        )
+    assert await link_targets() == [None]
+
+    result = await run_local_project_index_for_project(
+        test_project, runtime_factory=LocalProjectIndexRuntimeFactory(batch_size=10)
+    )
+
+    assert result.enqueued_files == 0
+    targets = await link_targets()
+    assert len(targets) == 1 and targets[0] is not None
+
+
 @dataclass(slots=True)
 class MutatingObservedFileSource:
     source: ProjectIndexObservedFileSource

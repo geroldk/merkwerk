@@ -95,6 +95,7 @@ async def test_bulk_resolution_matches_regular_strict_resolution(
     search_service,
     session_maker,
     app_config: BasicMemoryConfig,
+    test_project: Project,
     bulk_entities: list[Entity],
 ) -> None:
     """The bulk flavor preserves the regular resolver's exact-match contract."""
@@ -107,6 +108,23 @@ async def test_bulk_resolution_matches_regular_strict_resolution(
     bulk_resolver = BulkLinkResolver(entity_repository, app_config)
     auth_service, _, _, image = bulk_entities
     assert auth_service.permalink is not None
+    # A note whose permalink ends in a file suffix, filed in another folder; its title
+    # differs from the link text, so only the routed permalink can name it.
+    now = datetime.now(timezone.utc)
+    async with db.scoped_session(session_maker) as session:
+        suffixed = await entity_repository.add(
+            session,
+            Entity(
+                title="Fix in tax_costs",
+                note_type="note",
+                content_type="text/markdown",
+                file_path="archive/threads/Fix in tax_costs.py.md",
+                permalink=note_permalink(test_project, "threads/fix-in-tax-costs.py", app_config),
+                created_at=now,
+                updated_at=now,
+                project_id=test_project.id,
+            ),
+        )
     link_texts = [
         auth_service.external_id.upper(),
         auth_service.title,
@@ -114,6 +132,7 @@ async def test_bulk_resolution_matches_regular_strict_resolution(
         auth_service.file_path,
         "components/Auth Service",
         image.title,
+        "threads/fix-in-tax-costs.py",
         "Does Not Exist",
         "Core Service",
     ]
@@ -134,6 +153,9 @@ async def test_bulk_resolution_matches_regular_strict_resolution(
             assert (bulk_result.id if bulk_result else None) == (
                 regular_result.id if regular_result else None
             )
+        # Agreement alone would also hold if both missed it.
+        suffixed_result = bulk_results[RelationTargetRequest("threads/fix-in-tax-costs.py")]
+        assert suffixed_result is not None and suffixed_result.id == suffixed.id
 
         with pytest.raises(AmbiguousIdentifierError):
             await regular_resolver.resolve_link(
@@ -144,6 +166,203 @@ async def test_bulk_resolution_matches_regular_strict_resolution(
             )
 
     assert bulk_results[RelationTargetRequest("Core Service")] is None
+
+
+@pytest.mark.asyncio
+async def test_bulk_and_regular_resolution_agree_on_file_suffixed_identifiers(
+    entity_repository: EntityRepository,
+    search_service,
+    session_maker,
+    app_config: BasicMemoryConfig,
+    test_project: Project,
+) -> None:
+    """Routed permalinks after file paths, a resource first (#1629), titles guarded (#1148)."""
+    now = datetime.now(timezone.utc)
+    rows = {
+        "resource": ("foo.txt", "notes/foo.txt", None),
+        "spelled like the resource": ("Foo note", "notes/foo.txt.md", "notes/foo.txt"),
+        "moved": ("Fix in tax_costs", "archive/threads/Fix.py.md", "threads/fix-in-tax-costs.py"),
+        "mirror": ("Mirror", "mirror/korpus-zeilen.py.md", "mirror/korpus-zeilen.py"),
+        "duplicate owning the permalink": ("threads/dup.py", "archive/one.md", "threads/dup.py"),
+        "duplicate": ("threads/dup.py", "archive/two.md", "archive/two"),
+    }
+    entities: dict[str, Entity] = {}
+    async with db.scoped_session(session_maker) as session:
+        for name, (title, file_path, permalink) in rows.items():
+            entities[name] = await entity_repository.add(
+                session,
+                Entity(
+                    title=title,
+                    note_type="note" if permalink else "file",
+                    content_type="text/markdown" if permalink else "text/plain",
+                    file_path=file_path,
+                    permalink=(
+                        note_permalink(test_project, permalink, app_config) if permalink else None
+                    ),
+                    created_at=now,
+                    updated_at=now,
+                    project_id=test_project.id,
+                ),
+            )
+    expected = {
+        "notes/foo.txt": "resource",
+        "threads/fix-in-tax-costs.py": "moved",
+        f"{test_project.permalink}/threads/fix-in-tax-costs.py": "moved",
+        "mirror/korpus-zeilen.py": "mirror",
+        "threads/dup.py": None,
+    }
+    regular_resolver = LinkResolver(entity_repository, search_service, session_maker, app_config)
+
+    async with db.scoped_session(session_maker) as session:
+        bulk_results = await BulkLinkResolver(
+            entity_repository, app_config
+        ).resolve_relation_targets(
+            [RelationTargetRequest(link_text) for link_text in expected], session=session
+        )
+        for link_text, name in expected.items():
+            bulk = bulk_results[RelationTargetRequest(link_text)]
+            if name is None:
+                assert bulk is None, link_text
+                with pytest.raises(AmbiguousIdentifierError):
+                    await regular_resolver.resolve_link(link_text, strict=True, session=session)
+                continue
+            regular = await regular_resolver.resolve_link(
+                link_text, strict=True, load_relations=False, session=session
+            )
+            assert regular is not None and regular.id == entities[name].id, link_text
+            assert bulk is not None and bulk.id == entities[name].id, link_text
+
+
+@pytest.mark.parametrize("workspace", [None, "team-paul"])
+@pytest.mark.parametrize("include_project", [True, False])
+def test_project_entity_index_routes_file_suffixed_permalinks_after_file_paths(
+    test_project: Project, workspace: str | None, include_project: bool
+) -> None:
+    """Each configuration's stored form; workspace permalinks are always complete."""
+    now = datetime.now(timezone.utc)
+    stored = (
+        f"{workspace}/{test_project.permalink}/"
+        if workspace
+        else f"{test_project.permalink}/"
+        if include_project
+        else ""
+    )
+    note = Entity(
+        title="Fix",
+        note_type="note",
+        content_type="text/markdown",
+        file_path="archive/Fix.py.md",
+        permalink=f"{stored}threads/fix.py",
+        external_id="00000000-0000-4000-8000-000000000001",
+        created_at=now,
+        updated_at=now,
+        project_id=test_project.id,
+    )
+    index = ProjectEntityIdentityIndex.from_entities(test_project, [note])
+
+    match = index.resolve_strict(
+        "threads/fix.py", include_project_permalinks=include_project, workspace_permalink=workspace
+    )
+
+    assert match.entity is note
+
+
+def test_project_entity_index_keeps_a_spelled_resource_ahead_of_the_routed_permalink(
+    test_project: Project,
+) -> None:
+    """`notes/Foo.txt` names the colliding resources in another spelling, not the note."""
+    now = datetime.now(timezone.utc)
+    rows = [
+        ("foo.txt", "notes/foo.txt", None),
+        ("FOO.txt", "notes/FOO.txt", None),
+        ("Foo note", "archive/Foo note.txt.md", f"{test_project.permalink}/notes/foo.txt"),
+    ]
+    entities = [
+        Entity(
+            title=title,
+            note_type="note" if permalink else "file",
+            content_type="text/markdown" if permalink else "text/plain",
+            file_path=file_path,
+            permalink=permalink,
+            external_id=f"00000000-0000-4000-8000-00000000000{number}",
+            created_at=now,
+            updated_at=now,
+            project_id=test_project.id,
+        )
+        for number, (title, file_path, permalink) in enumerate(rows)
+    ]
+    index = ProjectEntityIdentityIndex.from_entities(test_project, entities)
+
+    match = index.resolve_strict(
+        "notes/Foo.txt", include_project_permalinks=True, workspace_permalink=None
+    )
+
+    assert match.entity is None and not match.ambiguous
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("workspace", [None, "team-paul"])
+@pytest.mark.parametrize("include_project", [True, False])
+async def test_bulk_and_regular_resolution_keep_resources_ahead_of_routed_permalinks(
+    entity_repository: EntityRepository,
+    search_service,
+    session_maker,
+    app_config: BasicMemoryConfig,
+    test_project: Project,
+    workspace: str | None,
+    include_project: bool,
+) -> None:
+    """Another spelling, or the other qualified form, of a resource path stays the resource."""
+    from basic_memory.workspace_context import workspace_permalink_context
+
+    project = test_project.permalink
+    now = datetime.now(timezone.utc)
+    rows = {
+        "foo resource": ("foo.txt", "notes/foo.txt", None),
+        "foo note": ("Foo note", "archive/Foo note.txt.md", f"{project}/notes/foo.txt"),
+        "bar resource": ("bar.txt", "docs/bar.txt", None),
+        "bar note": ("Bar note", "archive/Bar note.txt.md", f"team-paul/{project}/docs/bar.txt"),
+    }
+    entities: dict[str, Entity] = {}
+    async with db.scoped_session(session_maker) as session:
+        for name, (title, file_path, permalink) in rows.items():
+            entities[name] = await entity_repository.add(
+                session,
+                Entity(
+                    title=title,
+                    note_type="note" if permalink else "file",
+                    content_type="text/markdown" if permalink else "text/plain",
+                    file_path=file_path,
+                    permalink=permalink,
+                    created_at=now,
+                    updated_at=now,
+                    project_id=test_project.id,
+                ),
+            )
+    expected: dict[str, str | None] = {
+        "notes/Foo.txt": None,
+        f"{project}/docs/bar.txt": "bar resource",
+    }
+    if workspace:
+        expected[f"{workspace}/{project}/notes/foo.txt"] = "foo resource"
+    config = app_config.model_copy(update={"permalinks_include_project": include_project})
+    regular_resolver = LinkResolver(entity_repository, search_service, session_maker, config)
+
+    with workspace_permalink_context(workspace, "organization" if workspace else None):
+        async with db.scoped_session(session_maker) as session:
+            bulk_results = await BulkLinkResolver(
+                entity_repository, config
+            ).resolve_relation_targets(
+                [RelationTargetRequest(link_text) for link_text in expected], session=session
+            )
+            for link_text, name in expected.items():
+                regular = await regular_resolver.resolve_link(
+                    link_text, strict=True, load_relations=False, session=session
+                )
+                bulk = bulk_results[RelationTargetRequest(link_text)]
+                want = entities[name].id if name else None
+                assert (regular.id if regular else None) == want, link_text
+                assert (bulk.id if bulk else None) == want, link_text
 
 
 @pytest.mark.asyncio

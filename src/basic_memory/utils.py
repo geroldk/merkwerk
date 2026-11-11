@@ -445,11 +445,10 @@ def build_permalink_resolution_candidates(
     # Why: resource entities carry no permalink, so dropping the extension could
     #   only ever match the same-stem Markdown note, which is the wrong file (#1629).
     # Outcome: the extension stays; callers reach the file through their exact
-    #   file-path lookups instead.
+    #   file-path lookups instead, and only then try the routed forms from
+    #   `build_permalink_candidates_after_file_paths`.
     if has_non_markdown_file_extension(exact_path):
-        return list(
-            dict.fromkeys([exact_path, generate_permalink(exact_path, split_extension=False)])
-        )
+        return _file_suffixed_permalink_spellings(exact_path)
 
     normalized_path = generate_permalink(exact_path).strip("/")
     normalized_project = generate_permalink(project_permalink) if project_permalink else None
@@ -551,6 +550,78 @@ def build_permalink_resolution_candidates(
         add_remainder(normalized_project)
 
     return candidates
+
+
+def _file_suffixed_permalink_spellings(exact_path: str) -> list[str]:
+    """The two spellings of a file-suffixed identifier: as written, then its slug.
+
+    The slug keeps the suffix (`Fix.py` -> `fix.py`), which is how a note named
+    `Fix.py.md` stores its permalink.
+    """
+    return list(dict.fromkeys([exact_path, generate_permalink(exact_path, split_extension=False)]))
+
+
+def build_permalink_candidates_after_file_paths(
+    identifier: Union[Path, str, PathLike],
+    project_permalink: Optional[str],
+    include_project: bool = True,
+    *,
+    workspace_permalink: Optional[str] = None,
+) -> list[str]:
+    """Return the routed permalinks a file-suffixed identifier may still name.
+
+    `build_permalink_resolution_candidates` keeps `threads/fix.py` as written and adds no
+    workspace or project route, so a resource `notes/foo.txt` is not shadowed by a note
+    whose permalink spells the same (#1629). A note's own permalink can end that way too
+    (`Fix in tax_costs.py.md` stores `<project>/threads/fix-in-tax-costs.py`), and routing
+    strips the project prefix a caller wrote. Every resolver tries this list after its
+    exact file-path lookups and before forgiving aliases, never for a title several
+    notes share (#1148), and never while a file is spelled like the identifier
+    (`notes/Foo.txt` beside the resource `notes/foo.txt`).
+
+    The routes are those the builder adds to other identifiers: the workspace form when
+    a workspace is set, then the project form when project prefixes are on or a workspace
+    is set. Any identifier without such a suffix, or without a project, gets none, and
+    neither does one that already starts with this project's own route prefix: callers
+    try it again below that prefix, and that reading reaches the same routed forms only
+    after its own exact file paths (`<project>/notes/foo.txt` is still the resource
+    `notes/foo.txt` first).
+    """
+    exact_path = normalize_project_reference(str(identifier)).strip("/")
+    if not project_permalink or not has_non_markdown_file_extension(exact_path):
+        return []
+    # Trigger: the identifier is already qualified (`<project>/…`, `<workspace>/<project>/…`).
+    # Why: requalifying it here would try `<project>/notes/foo.txt` before the reading
+    #   below the prefix checks the exact file `notes/foo.txt` (#1629).
+    # Outcome: no routed forms; the below-prefix reading supplies them in their place.
+    if (
+        own_project_remainder(
+            exact_path, project_permalink, workspace_permalink=workspace_permalink
+        )
+        is not None
+    ):
+        return []
+
+    spellings = _file_suffixed_permalink_spellings(exact_path)
+    normalized_project = generate_permalink(project_permalink)
+    normalized_workspace = generate_permalink(workspace_permalink) if workspace_permalink else None
+    routed: list[str] = []
+    if normalized_workspace:
+        workspace_forms = [
+            build_qualified_permalink_reference(
+                normalized_project, spelling, workspace_permalink=normalized_workspace
+            )
+            for spelling in spellings
+        ]
+        routed.extend(workspace_forms)
+        # Older rows in a workspace may still be stored as `project/path`.
+        routed.extend(form.removeprefix(f"{normalized_workspace}/") for form in workspace_forms)
+    elif include_project:
+        routed.extend(
+            build_qualified_permalink_reference(normalized_project, spelling)
+            for spelling in spellings
+        )
+    return [candidate for candidate in dict.fromkeys(routed) if candidate not in spellings]
 
 
 def setup_logging(

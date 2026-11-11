@@ -18,6 +18,7 @@ from basic_memory.repository.search_repository import create_search_repository
 from basic_memory.schemas.search import SearchQuery, SearchItemType
 from basic_memory.services.search_service import SearchService
 from basic_memory.utils import (
+    build_permalink_candidates_after_file_paths,
     build_permalink_resolution_candidates,
     generate_permalink,
     normalize_project_reference,
@@ -48,7 +49,9 @@ class LinkResolver:
     1. Try exact permalink match (fastest)
     2. Try exact title match
     3. Try exact file path match
-    4. Try file path with .md extension (for root or folder/title patterns)
+    4. Try file path with .md extension (for root or folder/title patterns), then the
+       routed permalinks of an identifier that ends in a file suffix (`threads/fix.py`),
+       unless a file is spelled like that identifier
     5. Try a unique case-insensitive underscore/hyphen file-path alias
     6. Fall back to search for fuzzy matching
 
@@ -551,6 +554,35 @@ class LinkResolver:
             if found_path_md:
                 logger.debug(f"Found entity with path (with .md): {found_path_md.file_path}")
                 return found_path_md
+
+        # Trigger: the identifier ends in a non-Markdown file suffix (`threads/fix.py`) and
+        #   no file path matched it.
+        # Why: a note's permalink can end that way, stored as `<project>/threads/fix.py`,
+        #   but the candidates above keep the suffix unrouted so a resource keeps its name
+        #   (#1629). None of these is the caller's verbatim identifier, so a title several
+        #   notes share must not be bypassed through them (#1148). Nor may a file spelled
+        #   like the identifier (`notes/Foo.txt` for the resource `notes/foo.txt`): the
+        #   caller named that file in another spelling, and a note whose permalink is its
+        #   slug must not be edited or deleted in its place.
+        # Outcome: the routed permalink names the note before any forgiving alias; the bulk
+        #   resolver and the OKF export try the same list at the same point.
+        if not ambiguous_title_candidates:
+            for candidate_permalink in build_permalink_candidates_after_file_paths(
+                clean_text,
+                project_permalink,
+                include_project=include_project,
+                workspace_permalink=workspace_permalink,
+            ):
+                entity = await entity_repository.get_by_permalink(
+                    session,
+                    candidate_permalink,
+                    load_relations=load_relations,
+                )
+                if entity:
+                    if await entity_repository.has_file_path_alias(session, clean_text):
+                        break
+                    logger.debug(f"Found routed permalink after file paths: {entity.permalink}")
+                    return entity
 
         # 5. Direct-on-disk vaults commonly mix filename separators and case in
         # wikilinks. Treat those spellings as aliases only after every exact semantic
