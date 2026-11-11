@@ -190,10 +190,13 @@ bm_move(identifier="plans/launch.md", destination="inbox/", project="demo",
   finds the folder empty is refused as not found. bm_list the destination.
 - If a move of one note gets no answer (the client says the connection
   closed, or that the tool "may have run"), it may have moved. On a Git host a
-  move within a project that has begun to publish is finished even when the
-  client leaves or the server stops; only the answer is lost. bm_read the note
-  by its permalink or `memory://` URL and look at `file_path` before moving it
-  again.
+  move within a project that has begun to publish is finished when the client
+  leaves; when the server stops, it is finished too, or it fails without
+  changing anything if the stop interrupts Git itself. Only the answer is lost.
+  bm_read the note by its permalink or `memory://` URL and look at `file_path`
+  before moving it again. A read in the first moments after the lost answer
+  can still show the old path while the move finishes; read again a few
+  seconds later before you conclude that it did not move.
 - On a Git host a note edited on disk outside Basic Memory blocks the folder
   move, and saving the editor again does not help: Basic Memory does not take
   in disk edits there. Undo the edit, or make it with bm_edit or bm_write.

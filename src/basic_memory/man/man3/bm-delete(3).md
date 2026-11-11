@@ -61,9 +61,14 @@ bm_delete(identifier="plans/launch-plan.md", expected_checksum="stale", project=
 
 - A call that ends without an answer (the client says the connection closed,
   or that the tool "may have run") may have deleted the note. On a Git host a
-  delete that has begun to publish is finished even when the client leaves or
-  the server stops; only the answer is lost. bm_read the note first: if it is
-  not found, the delete happened.
+  delete that has begun to publish is finished when the client leaves; when the
+  server stops, it is finished too, or it fails without changing anything if
+  the stop interrupts Git itself. Only the answer is lost. bm_read the note
+  first: if it is not found, the delete happened. If it is still there in the
+  first moments after the lost answer, the delete may still be finishing: read
+  again a few seconds later, or repeat the delete with the `expected_checksum`
+  that read returns (a repeat after the delete finished is an error, because
+  the note no longer exists).
 
 ## SEE ALSO
 
