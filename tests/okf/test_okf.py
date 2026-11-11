@@ -606,7 +606,8 @@ def test_file_suffixed_spelling_of_a_resource_stays_broken_like_the_graph():
     assert b"[notes/Foo.txt](/notes/Foo.txt) [notes/foo.txt](/notes/foo.txt)" in source
 
 
-def test_file_suffixed_md_path_stays_exact_past_a_shared_title_like_the_graph():
+@pytest.mark.parametrize("include_project", [True, False])
+def test_file_suffixed_md_path_stays_exact_past_a_shared_title_like_the_graph(include_project):
     """A folder target's `<target>.md` file wins over a title two notes share, as in the graph."""
     from basic_memory.models import Entity, Project
     from basic_memory.services.bulk_link_resolver import ProjectEntityIdentityIndex
@@ -625,6 +626,7 @@ def test_file_suffixed_md_path_stays_exact_past_a_shared_title_like_the_graph():
             for path, title, permalink in rows
         )
         + (ExportFile("source.md", b"[[threads/dup.py]]"),),
+        permalinks_include_project=include_project,
     )
     source = next(file.content for file in render_bundle(snapshot) if file.path == "source.md")
     assert b"[threads/dup.py](/threads/dup.py.md)" in source
@@ -647,7 +649,9 @@ def test_file_suffixed_md_path_stays_exact_past_a_shared_title_like_the_graph():
             )
             for number, (path, title, permalink) in enumerate(rows)
         ],
-    ).resolve_strict("threads/dup.py", include_project_permalinks=True, workspace_permalink=None)
+    ).resolve_strict(
+        "threads/dup.py", include_project_permalinks=include_project, workspace_permalink=None
+    )
     assert graph.entity is not None and graph.entity.file_path == "threads/dup.py.md"
 
 

@@ -29,6 +29,7 @@ from basic_memory.utils import (
     build_permalink_candidates_after_file_paths,
     build_permalink_resolution_candidates,
     generate_permalink,
+    has_non_markdown_file_extension,
 )
 
 from basic_memory.okf.validation import Document, parse_document
@@ -207,13 +208,15 @@ def convert_wikilinks(
         #   while a note whose permalink ends that way still links. Like the graph, the
         #   `.md` path stays exact past a shared title when the target has a folder; the
         #   routed permalink never passes such a title, nor a file spelled like the target.
-        # Outcome: the exact `.md` file first, then the project-qualified permalink.
+        # Outcome: the exact `.md` file first, also without project prefixes, then the
+        #   project-qualified permalink.
+        suffixed = not rooted and resolved is None and has_non_markdown_file_extension(target)
         routed = (
             build_permalink_candidates_after_file_paths(target, project, include_project)
-            if not rooted and resolved is None
+            if suffixed
             else []
         )
-        if routed and ("/" in target or target not in ambiguous_aliases):
+        if suffixed and ("/" in target or target not in ambiguous_aliases):
             resolved = targets.get(f"{target}.md")
         if (
             routed
