@@ -83,7 +83,8 @@ async def bm_edit(
                 'under "Auth", "Decisions[1]" for the second of two, or the location '
                 '"A > KI/ML" (full path from the top heading; "> Top" for a top heading). '
                 'A heading whose own text is exactly the given text, "/" or " > " included '
-                '("KI/ML"), wins.'
+                '("KI/ML"), wins, and so does a "/" path through a heading whose text holds '
+                '" > " ("A > B/C": "C" under "A > B"; the location is then "> A > B/C").'
             ),
         ),
     ] = None,

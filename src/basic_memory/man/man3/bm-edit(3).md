@@ -48,7 +48,7 @@ missing note is an error; create notes with bm_write.
 - **command** (required) — The edit.
 - **project** (string, required) — Required project name, 'workspace/project', or project external id. Discover projects with bm_project(command='list'). Paths are relative to this project; a qualified path must agree with it.
 - **content** (string | null, optional, default: None) — The text to add or the replacement. Not used by set_metadata.
-- **section** (string | null, optional, default: None) — The heading for section commands: "Decisions", "Auth/Decisions" for one under "Auth", "Decisions[1]" for the second of two, or the location "A > KI/ML" (full path from the top heading; "> Top" for a top heading). A heading whose own text is exactly the given text, "/" or " > " included ("KI/ML"), wins.
+- **section** (string | null, optional, default: None) — The heading for section commands: "Decisions", "Auth/Decisions" for one under "Auth", "Decisions[1]" for the second of two, or the location "A > KI/ML" (full path from the top heading; "> Top" for a top heading). A heading whose own text is exactly the given text, "/" or " > " included ("KI/ML"), wins, and so does a "/" path through a heading whose text holds " > " ("A > B/C": "C" under "A > B"; the location is then "> A > B/C").
 - **find_text** (string | null, optional, default: None) — For find_replace: the exact, case-sensitive text to replace.
 - **expected_replacements** (integer, optional, default: 1) — For find_replace: how many times find_text must occur.
 - **replace_subsections** (boolean, optional, default: True) — For replace_section: true replaces the section's subsections too; false stops at the first subsection heading.
@@ -94,6 +94,9 @@ bm_edit(identifier="plans/launch-plan.md", command="append", content="x",
   the refusal offers it: `B > KI/ML`, `> Top` for a top heading, `B > KI/ML[1]`
   for a repeat at the same location; headings under such repeats are numbered
   across them (`Day > Q/A > Note[2]`). See bm-read(3).
+- An old "/" path through a heading whose own text contains " > " keeps its
+  meaning: with headings `A > B` and `A`, `A > B/C` is heading `C` under
+  `A > B`, not `B/C` under `A`; write `> A > B/C` for that location.
 - The `section` a JSON read returns names the same heading again, so it can be
   passed to the section commands as it is.
 - `set_metadata` refuses `title` and `permalink`: they are the note's identity.

@@ -29,7 +29,9 @@ URL, or exact title. The content can be sliced by a 1-indexed inclusive line ran
 (`--section Decisions`, path form `Auth/Decisions`, `Heading[1]` for a
 duplicate, or the location `"A > KI/ML"` from the top heading, `"> Top"` for a
 top heading; a heading named exactly as given, "/" or " > " included, such as
-`KI/ML`, wins), or truncated to an approximate token budget (`--max-tokens`).
+`KI/ML`, wins, as does a "/" path through a heading named with " > ", such as
+`A > B/C`, whose location is then `"> A > B/C"`), or truncated to an
+approximate token budget (`--max-tokens`).
 
 A text file that is not a note (an indexed `.txt` source, say) takes
 `--lines` too; `--section` and `--max-tokens` are for notes. Line numbers count
@@ -52,7 +54,7 @@ has_more, next_start_line, truncated, continue_line).
 ## OPTIONS
 
 - **--lines** — Line range "N-M", "N-" (to end), or "N" (one line); 1-indexed, frontmatter included
-- **--section** — Heading slice: "Decisions", "Auth/Decisions", "Heading[1]", or location "A > KI/ML" (full path from the top heading; "> Top" for a top heading); a heading named exactly as given, "/" or " > " included ("KI/ML"), wins
+- **--section** — Heading slice: "Decisions", "Auth/Decisions", "Heading[1]", or location "A > KI/ML" (full path from the top heading; "> Top" for a top heading); a heading named exactly as given, "/" or " > " included ("KI/ML"), wins, as does a "/" path through a heading named with " > " ("A > B/C"; the location is then "> A > B/C")
 - **--max-tokens** — Approximate token budget; cuts at a section or paragraph boundary
 - **--frontmatter / --no-frontmatter** (default: --frontmatter) — Include the YAML frontmatter in a whole-note read
 - **--project** — Project name, 'workspace/project', or project id. Defaults to the default project.

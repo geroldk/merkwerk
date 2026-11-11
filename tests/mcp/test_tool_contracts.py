@@ -298,6 +298,21 @@ async def test_list_directory_sort_schema_exposes_supported_orders():
 
 
 @pytest.mark.asyncio
+async def test_section_descriptions_name_the_old_path_through_a_gt_heading():
+    """Review B3 C: "A > B/C" still edits heading "C" under a heading named "A > B".
+
+    A caller that follows only the schema took it for the location and changed
+    another section, so the description names the exception and the way out.
+    """
+    tools_by_name = {tool.name: tool for tool in await mcp.list_tools()}
+    for name in ("bm_read", "bm_edit"):
+        input_schema = tools_by_name[name].to_mcp_tool().input_schema
+        description = input_schema["properties"]["section"]["description"]
+        assert '("A > B/C": "C" under "A > B"' in description, name
+        assert 'the location is then "> A > B/C"' in description, name
+
+
+@pytest.mark.asyncio
 async def test_mcp_tools_have_title_and_tags():
     """Every registered MCP tool must declare a human-readable title and at least one tag.
 

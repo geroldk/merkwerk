@@ -917,7 +917,9 @@ async def get_entity_by_id(
         "'Auth/Decisions' to disambiguate, bracket form 'Heading[1]' for duplicate "
         "headings, or location 'A > KI/ML' (full path from the top heading; '> Top' for "
         "a top heading). A heading whose own text equals the whole selector, '/' or "
-        "' > ' included ('KI/ML'), wins. Mutually exclusive with lines.",
+        "' > ' included ('KI/ML'), wins, as does a '/' path through a heading whose text "
+        "holds ' > ' ('A > B/C'; the location is then '> A > B/C'). Mutually exclusive "
+        "with lines.",
     ),
     lines: str | None = Query(
         None,

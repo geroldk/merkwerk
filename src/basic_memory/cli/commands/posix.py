@@ -104,7 +104,9 @@ def cat(
             "--section",
             help='Heading slice: "Decisions", "Auth/Decisions", "Heading[1]", or location '
             '"A > KI/ML" (full path from the top heading; "> Top" for a top heading); a '
-            'heading named exactly as given, "/" or " > " included ("KI/ML"), wins',
+            'heading named exactly as given, "/" or " > " included ("KI/ML"), wins, as does '
+            'a "/" path through a heading named with " > " ("A > B/C"; the location is then '
+            '"> A > B/C")',
         ),
     ] = None,
     max_tokens: Annotated[

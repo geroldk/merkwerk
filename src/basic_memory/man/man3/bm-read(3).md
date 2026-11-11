@@ -61,7 +61,7 @@ The shell counterpart is cat(1).
 
 - **identifier** (string, required) — The note or file: a file path ('notes/plan.md'), permalink, memory:// URL, exact title, external id, or '<project>/path'.
 - **project** (string, required) — Required project name, 'workspace/project', or project external id. Discover projects with bm_project(command='list'). Paths are relative to this project; a qualified path must agree with it.
-- **section** (string | null, optional, default: None) — A heading to read: "Decisions", "Auth/Decisions" for a heading under "Auth", "Decisions[1]" for the second "Decisions" heading, or the location "A > KI/ML" (full path from the top heading; "> Top" for a top heading). A heading whose own text is exactly the given text, "/" or " > " included ("KI/ML"), wins.
+- **section** (string | null, optional, default: None) — A heading to read: "Decisions", "Auth/Decisions" for a heading under "Auth", "Decisions[1]" for the second "Decisions" heading, or the location "A > KI/ML" (full path from the top heading; "> Top" for a top heading). A heading whose own text is exactly the given text, "/" or " > " included ("KI/ML"), wins, and so does a "/" path through a heading whose text holds " > " ("A > B/C": "C" under "A > B"; the location is then "> A > B/C").
 - **start_line** (integer | null, optional, default: None)
 - **end_line** (integer | null, optional, default: None)
 - **max_tokens** (integer | null, optional, default: None) — Approximate token budget. Longer content is cut at a section or paragraph boundary, and the result says which line to continue from.
@@ -150,7 +150,10 @@ bm_read(identifier="plans/missing.md", project="demo")
 - The `section` of a JSON section read is a selector that reads back to the
   same heading, so bm-edit(3) can take it as it is: usually the heading path
   (`Plan/Decisions`, `Plan/Log[1]`), else a heading's own text (`KI/ML`) or its
-  location (`A > KI/ML`). Error messages offer only such names. A heading none
+  location (`A > KI/ML`). Each heading in a selector may be written as a heading
+  line (`## Auth/### Decisions`) and loses one such `# ` prefix, so a heading
+  whose own text starts like one (`# x`) is named with one `# ` more
+  (`A/# # x`, `A > # # x`). Error messages offer only such names. A heading none
   reaches (an empty heading, or one whose own text holds " > " where a location
   needs it) is listed with its lines, `'' (lines 5-6)`; read it with
   `start_line`/`end_line`.
