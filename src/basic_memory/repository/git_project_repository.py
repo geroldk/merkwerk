@@ -23,6 +23,7 @@ from uuid import UUID, uuid4
 
 import anyio
 from anyio.lowlevel import checkpoint_if_cancelled
+from loguru import logger
 
 from basic_memory.runtime.call_publications import note_held_cancellation, note_publication
 from basic_memory.schemas.git_project import (
@@ -158,14 +159,24 @@ async def settle_atomic[T](operation: Coroutine[Any, Any, T]) -> T:
                 await asyncio.wait({task})
         except asyncio.CancelledError as error:
             cancelled = error
-    if not task.cancelled():
-        task.exception()  # retrieved: a cancellation below replaces the step's outcome
+    failure = None if task.cancelled() else task.exception()
     try:
         if cancelled is not None:
             raise cancelled
         # An anyio cancellation that arrived while the step ran is delivered now.
         await checkpoint_if_cancelled()
     except asyncio.CancelledError:
+        if failure is not None:
+            # Trigger: the step failed (SQL behind a publication, a locked branch ref)
+            #   while its caller was being cancelled.
+            # Why: the cancellation replaces the step's outcome, so no caller receives
+            #   the error and no error handler above logs it.
+            # Outcome: logged here with its traceback; the cancellation goes on.
+            logger.opt(exception=failure).warning(
+                "Atomic Git step failed after its caller was cancelled: {}: {}",
+                type(failure).__name__,
+                failure,
+            )
         note_held_cancellation()
         raise
     return task.result()

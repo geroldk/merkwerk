@@ -11,6 +11,7 @@ import time
 
 import anyio
 import pytest
+from loguru import logger
 
 from basic_memory.repository.git_project_repository import settle_atomic, settle_git_operation
 from basic_memory.runtime.call_publications import recording_publications
@@ -75,6 +76,34 @@ async def test_an_uncancelled_step_returns_its_result_or_raises_its_error():
         with pytest.raises(ValueError, match="refused"):
             await settle_atomic(failure())
     assert record.held == 0
+
+
+@pytest.mark.asyncio
+async def test_a_step_that_fails_while_its_caller_is_cancelled_is_logged():
+    """The cancellation replaces the step's error; nobody else would ever report it."""
+    started = asyncio.Event()
+    lines: list[str] = []
+    sink = logger.add(lambda message: lines.append(message.record["message"]), level="WARNING")
+
+    async def step() -> None:
+        started.set()
+        await asyncio.sleep(0.1)
+        raise RuntimeError("Git published; SQL pending. Check status before retry.")
+
+    async def caller() -> None:
+        await settle_atomic(step())
+
+    try:
+        async with anyio.create_task_group() as group:
+            group.start_soon(caller)
+            await started.wait()
+            group.cancel_scope.cancel()
+    finally:
+        logger.remove(sink)
+    assert lines == [
+        "Atomic Git step failed after its caller was cancelled: "
+        "RuntimeError: Git published; SQL pending. Check status before retry."
+    ]
 
 
 @pytest.mark.asyncio
