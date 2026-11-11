@@ -172,6 +172,60 @@ async def test_another_spelling_of_a_resource_path_changes_no_note(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("spelling", ["plain", "qualified", "memory"])
+@pytest.mark.parametrize("tool", ["edit", "delete", "move"])
+async def test_the_permalink_owner_beats_a_forgiving_file_spelling(
+    client, test_project, tool, spelling
+):
+    """`alias/fix-me.py` is the moved note's permalink; `alias/Fix_Me.py.md` only resembles it.
+
+    Before suffixed permalinks were routed, all three tools changed the resembling note.
+    """
+    project = test_project.name
+    permalink = f"{test_project.permalink}/alias/fix-me.py"
+    await bm_write(
+        identifier="archive/moved.md",
+        content=f"---\npermalink: {permalink}\n---\n# Moved\n\nBODY-A",
+        project=project,
+    )
+    await bm_write(
+        identifier="alias/Fix_Me.py.md",
+        content=f"---\npermalink: {test_project.permalink}/alias/fix-me-b.py\n---\n# B\n\nBODY-B",
+        project=project,
+    )
+    identifier = {
+        "plain": "alias/fix-me.py",
+        "qualified": permalink,
+        "memory": f"memory://{permalink}",
+    }[spelling]
+
+    if tool == "edit":
+        result = await bm_edit(
+            identifier=identifier,
+            command="append",
+            content="EDITED",
+            project=project,
+            output_format="json",
+        )
+        touched = result["file_path"] if isinstance(result, dict) else None
+    elif tool == "delete":
+        result = await bm_delete(identifier=identifier, project=project, output_format="json")
+        touched = result["file_path"] if isinstance(result, dict) else None
+    else:
+        result = await bm_move(
+            identifier=identifier,
+            destination="dest/moved-here.md",
+            project=project,
+            output_format="json",
+        )
+        touched = result["previous_file_path"] if isinstance(result, dict) else None
+
+    assert touched is not None and touched.endswith("archive/moved.md"), touched
+    untouched = await read_json("alias/Fix_Me.py.md", project)
+    assert untouched["content"].rstrip().endswith("BODY-B")
+
+
+@pytest.mark.asyncio
 async def test_workspace_permalink_reads_without_its_prefixes(client, test_project):
     project = test_project.name
     permalink = f"team-paul/{test_project.permalink}/threads/fix-in-tax-costs.py"
