@@ -201,19 +201,30 @@ def convert_wikilinks(
             resolved = title_targets.get(target)
         if not rooted and resolved is None:
             resolved = targets.get(target)
-        if not rooted and resolved is None and target not in ambiguous_aliases:
-            # Trigger: the target ends in a non-Markdown file suffix (`threads/fix.py`).
-            # Why: the graph tries such a target's routed permalink only after its exact
-            #   file paths, `<target>.md` included, so a resource keeps its name (#1629)
-            #   while a note whose permalink ends that way still links.
-            # Outcome: the exact `.md` file first, then the project-qualified permalink.
-            routed = build_permalink_candidates_after_file_paths(target, project, include_project)
-            if routed:
-                known_permalinks = permalinks or {}
-                resolved = targets.get(f"{target}.md") or next(
-                    (known_permalinks[name] for name in routed if name in known_permalinks),
-                    None,
-                )
+        # Trigger: the target ends in a non-Markdown file suffix (`threads/fix.py`).
+        # Why: the graph tries such a target's routed permalink only after its exact
+        #   file paths, `<target>.md` included, so a resource keeps its name (#1629)
+        #   while a note whose permalink ends that way still links. Like the graph, the
+        #   `.md` path stays exact past a shared title when the target has a folder; the
+        #   routed permalink never passes such a title, nor a file spelled like the target.
+        # Outcome: the exact `.md` file first, then the project-qualified permalink.
+        routed = (
+            build_permalink_candidates_after_file_paths(target, project, include_project)
+            if not rooted and resolved is None
+            else []
+        )
+        if routed and ("/" in target or target not in ambiguous_aliases):
+            resolved = targets.get(f"{target}.md")
+        if (
+            routed
+            and resolved is None
+            and target not in ambiguous_aliases
+            and file_path_alias(target) not in path_aliases
+        ):
+            known_permalinks = permalinks or {}
+            resolved = next(
+                (known_permalinks[name] for name in routed if name in known_permalinks), None
+            )
         if (
             not rooted
             and resolved is None

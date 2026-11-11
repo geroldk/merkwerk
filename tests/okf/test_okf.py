@@ -592,6 +592,65 @@ def test_file_suffixed_permalinks_link_after_exact_file_paths():
     ) in source
 
 
+def test_file_suffixed_spelling_of_a_resource_stays_broken_like_the_graph():
+    """`[[notes/Foo.txt]]` names the resource in another spelling, never the note (#1629)."""
+    snapshot = ExportSnapshot(
+        "p",
+        (
+            ExportFile("notes/foo.txt", b"resource"),
+            ExportFile("archive/Foo.md", b"---\ntitle: Foo\npermalink: p/notes/foo.txt\n---\n"),
+            ExportFile("source.md", b"[[notes/Foo.txt]] [[notes/foo.txt]]"),
+        ),
+    )
+    source = next(file.content for file in render_bundle(snapshot) if file.path == "source.md")
+    assert b"[notes/Foo.txt](/notes/Foo.txt) [notes/foo.txt](/notes/foo.txt)" in source
+
+
+def test_file_suffixed_md_path_stays_exact_past_a_shared_title_like_the_graph():
+    """A folder target's `<target>.md` file wins over a title two notes share, as in the graph."""
+    from basic_memory.models import Entity, Project
+    from basic_memory.services.bulk_link_resolver import ProjectEntityIdentityIndex
+
+    rows = [
+        ("one.md", "threads/dup.py", "p/one"),
+        ("two.md", "threads/dup.py", "p/two"),
+        ("threads/dup.py.md", "X", "p/x1"),
+        # Collides with the file above on the forgiving spelling, so only the exact path names it.
+        ("threads/Dup.py.md", "Y", "p/x2"),
+    ]
+    snapshot = ExportSnapshot(
+        "p",
+        tuple(
+            ExportFile(path, f"---\ntitle: {title}\npermalink: {permalink}\n---\n".encode())
+            for path, title, permalink in rows
+        )
+        + (ExportFile("source.md", b"[[threads/dup.py]]"),),
+    )
+    source = next(file.content for file in render_bundle(snapshot) if file.path == "source.md")
+    assert b"[threads/dup.py](/threads/dup.py.md)" in source
+
+    now = datetime.now(UTC)
+    project = Project(id=1, name="p", permalink="p", path="/p")
+    graph = ProjectEntityIdentityIndex.from_entities(
+        project,
+        [
+            Entity(
+                title=title,
+                note_type="note",
+                content_type="text/markdown",
+                file_path=path,
+                permalink=permalink,
+                external_id=f"00000000-0000-4000-8000-00000000000{number}",
+                created_at=now,
+                updated_at=now,
+                project_id=1,
+            )
+            for number, (path, title, permalink) in enumerate(rows)
+        ],
+    ).resolve_strict("threads/dup.py", include_project_permalinks=True, workspace_permalink=None)
+    assert graph.entity is not None and graph.entity.file_path == "threads/dup.py.md"
+
+
 @pytest.mark.parametrize(
     "yaml_title,target",
     [
