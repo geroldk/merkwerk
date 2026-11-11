@@ -284,11 +284,24 @@ def _is_written_as_location(heading: str) -> bool:
 
 
 def _location_segments(heading: str) -> tuple[str, ...] | None:
-    """Split a selector written as a location; None when it is not one or has a gap."""
-    if not _is_written_as_location(heading):
+    """Split a selector written as a location; None when it is not one or has a gap.
+
+    ``heading`` is the whole selector with one "## " prefix already dropped. Each
+    heading of the location loses exactly one such prefix, so "# # x > y" is
+    heading "y" under "# x", as "> # # x > y" is.
+    """
+    if heading.startswith(_LOCATION_ROOT):
+        first, *rest = heading.removeprefix(_LOCATION_ROOT).split(_LOCATION_SEPARATOR)
+        first = _selector_segment(first)
+    elif _LOCATION_SEPARATOR in heading:
+        # Trigger: no "> " in front, so the dropped prefix belonged to the first heading.
+        # Why: dropping one more read "# # x > y" as heading "y" under "x" (review B3 C).
+        # Outcome: the first heading is only trimmed; the others lose their own prefix.
+        first, *rest = heading.split(_LOCATION_SEPARATOR)
+        first = first.strip()
+    else:
         return None
-    text = heading.removeprefix(_LOCATION_ROOT)
-    segments = tuple(_selector_segment(part) for part in text.split(_LOCATION_SEPARATOR))
+    segments = (first, *(_selector_segment(part) for part in rest))
     return segments if all(segments) else None
 
 

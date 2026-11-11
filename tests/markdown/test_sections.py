@@ -1218,6 +1218,21 @@ def test_names_keep_a_heading_text_that_starts_like_a_heading_prefix():
     assert _read_section_ok(doc, "B > # # x").content == "## # x\nb"
 
 
+def test_each_heading_of_a_location_loses_one_heading_prefix():
+    """Review B3 C: "# # x > y" lost both "# " of its first heading, unlike "> # # x > y"."""
+    doc = "# # x\n## y\nhy\n# x\n## y\npy\n"
+
+    for selector in ("# # x > y", "> # # x > y"):
+        assert _selector(selector).location == ("# x", "y")
+        assert _read_section_ok(doc, selector).content == "## y\nhy"
+        span = locate_section(doc, _selector(selector))
+        assert isinstance(span, SectionSpan) and span.heading_start == 1, (selector, span)
+    # One prefix per heading, as before.
+    assert _read_section_ok(doc, "# x > y").content == "## y\npy"
+    assert _selector("## Top > ## Dec").location == ("Top", "Dec")
+    assert _selector("## > Top").location == ("Top",)
+
+
 def test_unreachable_sections_are_pointed_to_by_document_lines():
     """An empty heading has no name; the message gives the lines to read it by."""
     doc = "---\ntitle: E\n---\n# Top\n#\nempty\n"
