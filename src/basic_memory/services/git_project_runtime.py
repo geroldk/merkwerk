@@ -600,8 +600,12 @@ class GitProjectRuntime:
                     older_than=CANDIDATE_SWEEP_AGE,
                 )
             )
-        except GitTransactionError as error:
-            # A leftover ref is residue, never a reason to refuse the start.
+        except (GitTransactionError, subprocess.SubprocessError) as error:
+            # Trigger: Git refuses, or one of its calls hits the 30 s timeout (many old
+            #   refs on a slow disk); the transaction service passes a timeout through.
+            # Why: a leftover ref is residue, never a reason to refuse the start; a failed
+            #   start would only repeat under the service manager's restart policy.
+            # Outcome: a warning; the refs stay for the next start.
             logger.warning("Git candidate sweep failed in {}: {}", repository, error)
             return
         if removed:

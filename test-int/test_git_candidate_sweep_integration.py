@@ -5,6 +5,7 @@ write; a crash between a candidate commit and its cleanup still can. The start s
 them, but never one an open move intent may need.
 """
 
+import subprocess
 import time
 from uuid import uuid4
 
@@ -92,6 +93,33 @@ async def test_an_unreadable_move_intent_keeps_every_candidate(host_setup, monke
         f"Git candidate sweep skipped in {repository.path.name}: 1 unreadable move intent file(s)"
         in recorded.warnings
     )
+
+
+@pytest.mark.asyncio
+async def test_a_sweep_whose_git_call_times_out_does_not_stop_the_start(host_setup, monkeypatch):
+    """A slow Git (many old refs, a busy disk) must not turn the start into a restart loop."""
+    from basic_memory.api.app import app
+
+    repository = host_setup.repository
+    project_id = host_setup.project.external_id
+    leftover_candidates(repository, 1)
+
+    def timed_out(self: GitProjectRepository) -> None:
+        # What subprocess.run(timeout=30) raises for `git for-each-ref --merged=...`.
+        raise subprocess.TimeoutExpired(["git", "for-each-ref"], 30)
+
+    monkeypatch.setattr(GitProjectRepository, "candidate_refs", timed_out)
+    recorded = RecordedLogger()
+    monkeypatch.setattr(runtime_module, "logger", recorded)
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=ASGITransport(app), base_url="http://test") as client:
+            await ready(client, project_id)
+    # The ref stays for the next start; the start went on.
+    assert len(candidate_refs(repository)) == 1
+    assert recorded.warnings == [
+        f"Git candidate sweep failed in {repository.path.name}: "
+        "Command '['git', 'for-each-ref']' timed out after 30 seconds"
+    ]
 
 
 @pytest.mark.asyncio
