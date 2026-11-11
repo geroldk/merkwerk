@@ -27,8 +27,14 @@ mcp_server = _DeferredMcpServer()
 #   can wait several seconds for the project's write gate (5-23 s were measured with
 #   parallel moves), and a cancelled call still finishes its atomic Git step first.
 # Why 30 s: a call that reached its turn finishes well within it, and the rest of the stop
-#   (worker and index shutdown) still fits a service manager's limit (systemd's
-#   TimeoutStopSec=120 on the reference host) before it would kill the process mid-write.
+#   (worker and index shutdown) normally takes a second or two, within a service manager's
+#   limit (systemd's TimeoutStopSec=120 on the reference host).
+# Limit: this bounds the wait for requests, not the stop. A cancelled call still finishes
+#   the atomic step it is in, bounded only by the 30 s timeout of each of its Git calls; a
+#   Git that is slow on every call can push the stop past 120 s, and the process is then
+#   killed mid-step. Git and SQL stay consistent; an unpublished candidate ref is swept at
+#   a start an hour later. (A stop that hung after the server process finished was a
+#   separate aiosqlite cause, see db._stop_aiosqlite_worker_once.)
 # Outcome: uvicorn waits up to 30 s, then cancels what still runs; each such call logs
 #   one line (CancelledCallMiddleware) saying whether it published.
 HTTP_GRACEFUL_SHUTDOWN_SECONDS = 30

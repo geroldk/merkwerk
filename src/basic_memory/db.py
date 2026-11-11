@@ -265,6 +265,45 @@ def _configure_sqlite_connection(
         cursor.close()
 
 
+def _stop_aiosqlite_worker_once(connection: Any) -> None:
+    """Let an aiosqlite connection tell its worker thread to stop only once.
+
+    Constraint: aiosqlite 0.22's close() calls stop() again in its finally block and waits
+      for that call's future, but the worker thread ends at the first stop and never
+      answers a second one. SQLAlchemy calls stop() itself when a cancellation cuts the
+      graceful close of an invalidated connection (terminate(), SQLAlchemy #10717), while
+      that close() goes on in a shielded task, which then waits forever. A server stopped
+      with writes in flight hung on such a task until it was killed (B4 review, finding 1).
+    Outcome: a later stop() waits for the first stop to be done (or not at all once it
+      is), and the thread is told to stop exactly once. aiosqlite before 0.22 has no
+      stop() and never stops twice. The closure holds the connection: the cycle only
+      leaves its freeing to the garbage collector, whose finalizer still stops the thread.
+    """
+    first_stop = getattr(connection, "stop", None)
+    if first_stop is None:
+        return
+    stops: list[asyncio.Future[Any] | None] = []
+
+    def stop_once() -> asyncio.Future[Any] | None:
+        if not stops:
+            stops.append(first_stop())
+            return stops[0]
+        first = stops[0]
+        if first is None or first.done():
+            return None
+        # A future of its own: a waiter that is cancelled must not cancel the first stop.
+        waiter: asyncio.Future[Any] = first.get_loop().create_future()
+
+        def release(_: asyncio.Future[Any]) -> None:
+            if not waiter.done():
+                waiter.set_result(None)
+
+        first.add_done_callback(release)
+        return waiter
+
+    connection.stop = stop_once
+
+
 def _create_sqlite_engine(
     db_url: str, db_type: DatabaseType, config: Optional[BasicMemoryConfig] = None
 ) -> AsyncEngine:
@@ -332,6 +371,7 @@ def _create_sqlite_engine(
     @event.listens_for(engine.sync_engine, "connect")
     def enable_wal_mode(dbapi_conn, connection_record):
         """Apply WAL + tunable PRAGMAs on each connection."""
+        _stop_aiosqlite_worker_once(dbapi_conn.driver_connection)
         _configure_sqlite_connection(
             dbapi_conn,
             enable_wal=enable_wal,
