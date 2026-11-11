@@ -297,7 +297,11 @@ async def test_a_disconnect_leaves_the_write_whole_or_absent(
             engine, _ = await db.get_or_create_db(host_setup.config.database_path)
             await ready(client, project_id)
             assert isinstance(engine.pool, AsyncAdaptedQueuePool)
-            assert engine.pool.checkedout() == 0
+            # The worker may still hold a connection for a moment after it caught up; a
+            # connection the cancelled call never checked in stays out for good.
+            async with asyncio.timeout(10):
+                while engine.pool.checkedout():
+                    await asyncio.sleep(0.05)
     assert leaked_connection_warnings() == []
 
 
