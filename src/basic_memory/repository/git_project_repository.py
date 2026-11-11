@@ -1017,6 +1017,13 @@ class GitProjectRepository:
         # is resolved before classifying an ordinary stale-basis conflict.
         previous = self.transaction_status(prepared.transaction_id)
         if previous is not None:
+            # Trigger: update-ref failed, yet the transaction is published: Git applied
+            #   this update and then failed to answer (a signal to git after the ref
+            #   moved), or a competing commit of the same transaction got there first.
+            # Why: either way the change of this call is in effect; a log line saying
+            #   "not-published" would invite a retry that applies it twice.
+            # Outcome: recorded as this call's publication, like a clean update-ref.
+            note_publication(self.path.name, previous.commit_id)
             return previous
         actual = self.head()
         if actual != prepared.base_commit:
